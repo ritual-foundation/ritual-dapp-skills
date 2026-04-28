@@ -402,15 +402,23 @@ def poll_phase2(w3: Web3, consumer: str, tx_hash: str, from_block: int, timeout:
     sys.exit(1)
 
 
-def _http_json(method: str, url: str, body: dict | None = None) -> dict:
+def _http_json(method: str, url: str, body: dict | None = None) -> dict | None:
+    """Make an HTTP request and return parsed JSON, or None on any HTTP/network error.
+
+    Returns None on 4xx/5xx responses (HTTPError) and on network failures
+    (URLError), so callers in polling loops can treat None as "not ready yet".
+    """
     data = None
     headers = {}
     if body is not None:
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
     req = request.Request(url, method=method, data=data, headers=headers)
-    with request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except (error.HTTPError, error.URLError):
+        return None
 
 
 def verify_relay(relay_url: str, agent_address: str, timeout: int = 60):
@@ -419,6 +427,9 @@ def verify_relay(relay_url: str, agent_address: str, timeout: int = 60):
     start = time.time()
     while time.time() - start < timeout:
         health = _http_json("GET", f"{relay}/health")
+        if health is None:
+            time.sleep(2)
+            continue
         if any(a["id"].lower() == agent_address.lower() for a in health.get("agents", [])):
             break
         time.sleep(2)
@@ -433,6 +444,9 @@ def verify_relay(relay_url: str, agent_address: str, timeout: int = 60):
     start = time.time()
     while time.time() - start < timeout:
         replies = _http_json("GET", f"{relay}/replies/{agent_address}")
+        if replies is None:
+            time.sleep(2)
+            continue
         for msg in replies.get("messages", []):
             content = msg.get("content", "")
             if "HEARTBEAT_OK" in content:
