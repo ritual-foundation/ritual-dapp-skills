@@ -286,9 +286,14 @@ def build_persistent_request_input(
     if tg_token:
         secrets["TELEGRAM_BOT_TOKEN"] = tg_token
 
+    private_key = os.getenv("PRIVATE_KEY")
+    if not private_key:
+        print("ERROR: PRIVATE_KEY environment variable is required", file=sys.stderr)
+        sys.exit(1)
+
     secrets_json = json.dumps(secrets)
     encrypted_blob = ecies_encrypt(pub_key_bytes.hex(), secrets_json.encode())
-    secret_signature = create_secret_signature(encrypted_blob, os.environ["PRIVATE_KEY"])
+    secret_signature = create_secret_signature(encrypted_blob, private_key)
 
     runtime_config_json = build_runtime_config(args)
 
