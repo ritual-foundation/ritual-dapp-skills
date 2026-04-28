@@ -1,3 +1,5 @@
+> 🇹🇷 [Türkçe README](./README.tr.md) | 🇬🇧 English (this file)
+
 <p align="center">
   <img src="assets/system-flow.svg" alt="Ritual dApp Skills — System Architecture" width="800">
 </p>
