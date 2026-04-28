@@ -403,10 +403,13 @@ def poll_phase2(w3: Web3, consumer: str, tx_hash: str, from_block: int, timeout:
 
 
 def _http_json(method: str, url: str, body: dict | None = None) -> dict | None:
-    """Make an HTTP request and return parsed JSON, or None on any HTTP/network error.
+    """Make an HTTP request and return parsed JSON.
 
-    Returns None on 4xx/5xx responses (HTTPError) and on network failures
-    (URLError), so callers in polling loops can treat None as "not ready yet".
+    Returns None on errors only for GET requests (HTTPError/URLError), so
+    polling callers can treat None as "not ready yet".
+
+    Non-GET requests propagate HTTPError/URLError to the caller so failures
+    are visible immediately rather than silently swallowed.
     """
     data = None
     headers = {}
@@ -418,7 +421,9 @@ def _http_json(method: str, url: str, body: dict | None = None) -> dict | None:
         with request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode())
     except (error.HTTPError, error.URLError):
-        return None
+        if method.upper() == "GET":
+            return None
+        raise
 
 
 def verify_relay(relay_url: str, agent_address: str, timeout: int = 60):
