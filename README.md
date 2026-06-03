@@ -168,10 +168,10 @@ Progress is checkpointed to `.ritual-build/progress.json` after each phase.
 
 | Harness             | Integration                                                      |
 | ------------------- | ---------------------------------------------------------------- |
-| **Claude Code**     | Drop `skills/` into agent skill path. Native `SKILL.md` format.  |
-| **Cursor**          | Add to `.cursor/rules/` or reference as agent skills             |
-| **OpenClaw**        | Drop `skills/` into agent skill path. Native `SKILL.md` format.  |
-| **Hermes Agent**    | Copy to `skills/blockchain/ritual/` or sync via `skills_sync.py` |
+| **Claude Code**     | `python3 scripts/skills_sync.py --harness claude-code`           |
+| **Cursor**          | `python3 scripts/skills_sync.py --harness cursor`                |
+| **OpenClaw**        | `python3 scripts/skills_sync.py --harness openclaw`              |
+| **Hermes Agent**    | `python3 scripts/skills_sync.py --harness hermes`                |
 | **Codex / ChatGPT** | Point system prompt at `skills/ritual/SKILL.md`                  |
 
 ### Recommended Combinations
@@ -224,6 +224,8 @@ ritual-dapp-skills/
 │   ├── ritual-dapp-longrunning/        # α — Long-running HTTP (0x0805)
 │   ├── ritual-dapp-multimodal/         # α — Image/Audio/Video (0x0818-0x081A)
 │   ├── ritual-dapp-onnx/               # α — ONNX ML inference (0x0800)
+│   ├── ritual-dapp-block-time/         # α — Block time reads
+│   ├── ritual-dapp-da/                 # α — Data availability reads
 │   ├── ritual-dapp-ed25519/            # α — Ed25519 verification (0x0009)
 │   ├── ritual-dapp-scheduler/          # α — Scheduled operations
 │   ├── ritual-dapp-secrets/            # α — Secret management + PII redaction
