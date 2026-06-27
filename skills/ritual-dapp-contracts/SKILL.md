@@ -53,7 +53,7 @@ cast code "0xD4AA9D55215dc8149Af57605e70921Ea16b73591" --rpc-url "$RPC_URL"
 | `0x0802` | LLM Call | Async (short-running) | 30 | `ritual-dapp-llm` |
 | `0x0803` | JQ JSON Query | Synchronous | 3 | `ritual-dapp-http` §7 |
 | `0x0805` | Long-Running HTTP | Async (long-running) | 35 | `ritual-dapp-longrunning` |
-| `0x0806` | ZK Long-Running | Async (long-running) | 14 | — |
+| `0x0806` | ZK Long-Running | Async (long) | 14 | `ritual-dapp-zk` |
 | `0x0807` | FHE/CKKS Inference | Async (long-running) | 19 | — |
 | `0x080C` | Sovereign Agent | Async (long-running) | 23 | `ritual-dapp-agents` |
 | `0x0818` | Image Generation | Async (long-running) | 18 | `ritual-dapp-multimodal` |
