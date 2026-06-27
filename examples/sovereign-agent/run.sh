@@ -118,7 +118,8 @@ if [ -n "$CONSUMER_ADDRESS" ]; then
 else
     echo "Deploying SovereignAgentConsumer..."
     DEPLOY_OUT=$(forge create --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" \
-        --broadcast "$SCRIPT_DIR/SovereignAgentConsumer.sol:SovereignAgentConsumer" 2>&1)
+        --broadcast "$SCRIPT_DIR/SovereignAgentConsumer.sol:SovereignAgentConsumer" \
+        --constructor-args "$ASYNC_DELIVERY" 2>&1)
     CONSUMER=$(printf '%s\n' "$DEPLOY_OUT" | awk '/Deployed to:/ {print $3}' | tail -n1)
 fi
 if [ -z "$CONSUMER" ]; then
