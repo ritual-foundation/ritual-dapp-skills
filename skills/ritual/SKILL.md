@@ -195,6 +195,7 @@ For direct routing when the user names a specific topic:
 | Secrets & privacy | `ritual-dapp-skills:ritual-dapp-secrets` |
 | Fee management | `ritual-dapp-skills:ritual-dapp-wallet` |
 | X402 payments | `ritual-dapp-skills:ritual-dapp-x402` |
+| ZK proofs / verifiable computation | `ritual-dapp-skills:ritual-dapp-zk` |
 | Passkey auth | `ritual-dapp-skills:ritual-dapp-passkey` |
 
 ## Numbered Menu Routing (for Step 3)
