@@ -234,7 +234,7 @@ Each precompile type has a geometric icon. Green = data operations, pink = AI/in
 | LLM | `0x0802` | `◇` | pink |
 | JQ | `0x0803` | `{}` | green |
 | Long HTTP | `0x0805` | `⟳` | green |
-| ZK Long-Running | `0x0806` | `△` | lime |
+| ZK Long-Running | `0x0806` | `△` | lime | `ritual-dapp-zk` |
 | FHE | `0x0807` | `◈` | lime |
 | Sovereign Agent | `0x080C` | `▣` | pink |
 | Image | `0x0818` | `◐` | pink |
