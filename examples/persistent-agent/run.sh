@@ -134,6 +134,18 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${GE
     exit 1
 fi
 
+# Helper: like awk -F= but joins all fields after the first =
+awk_keyval() {
+    local prefix="$1"
+    while IFS= read -r line; do
+        case "$line" in
+            "$prefix="*)
+                echo "${line#*=}"
+                ;;
+        esac
+    done
+}
+
 # ── 1. Check for pending async job ──
 PENDING=$(cast call "$TRACKER" "hasPendingJobForSender(address)(bool)" "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')
 if [ "$PENDING" = "true" ]; then
@@ -173,7 +185,9 @@ if [ -n "$CONSUMER_ADDRESS" ]; then
 else
     echo "Deploying PersistentAgentConsumer..."
     DEPLOY_OUT=$(forge create --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" \
-        --broadcast "$SCRIPT_DIR/PersistentAgentConsumer.sol:PersistentAgentConsumer" 2>&1)
+        --broadcast "$SCRIPT_DIR/PersistentAgentConsumer.sol:PersistentAgentConsumer" \
+        --with-gas-price "$((MAX_FEE_GWEI * 1000000000))" \
+        --priority-gas-price "$((PRIORITY_FEE_GWEI * 1000000000))" 2>&1) || true
     CONSUMER=$(printf '%s\n' "$DEPLOY_OUT" | awk '/Deployed to:/ {print $3}' | tail -n1)
 fi
 if [ -z "$CONSUMER" ]; then
@@ -193,9 +207,9 @@ BUILD_DKMS_ARGS=(
 if [ -n "$EXECUTOR_TEE_ADDRESS" ]; then
     BUILD_DKMS_ARGS+=(--executor-tee-address "$EXECUTOR_TEE_ADDRESS")
 fi
-DKMS_BUILD=$("${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" build-dkms-request "${BUILD_DKMS_ARGS[@]}")
-EXECUTOR=$(printf '%s\n' "$DKMS_BUILD" | awk -F= '$1=="EXECUTOR"{print $2}')
-DKMS_INPUT=$(printf '%s\n' "$DKMS_BUILD" | awk -F= '$1=="REQUEST_INPUT"{print $2}')
+DKMS_BUILD=$("${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" build-dkms-request "${BUILD_DKMS_ARGS[@]}") || true
+EXECUTOR=$(printf '%s\n' "$DKMS_BUILD" | awk_keyval "EXECUTOR")
+DKMS_INPUT=$(printf '%s\n' "$DKMS_BUILD" | awk_keyval "REQUEST_INPUT")
 if [ -z "$EXECUTOR" ] || [ -z "$DKMS_INPUT" ]; then
     echo "ERROR: Failed to build DKMS request."
     printf '%s\n' "$DKMS_BUILD"
@@ -262,11 +276,11 @@ fi
 if [ -n "${HEARTBEAT_PROMPT:-}" ]; then
     BUILD_ARGS+=(--heartbeat-prompt "$HEARTBEAT_PROMPT")
 fi
-REQUEST_OUT=$("${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" build-persistent-request "${BUILD_ARGS[@]}")
-REQUEST_INPUT=$(printf '%s\n' "$REQUEST_OUT" | awk -F= '$1=="REQUEST_INPUT"{print $2}')
-LLM_PROVIDER=$(printf '%s\n' "$REQUEST_OUT" | awk -F= '$1=="LLM_PROVIDER"{print $2}')
-MODEL=$(printf '%s\n' "$REQUEST_OUT" | awk -F= '$1=="MODEL"{print $2}')
-SELECTED_AGENT_RUNTIME=$(printf '%s\n' "$REQUEST_OUT" | awk -F= '$1=="AGENT_RUNTIME"{print $2}')
+REQUEST_OUT=$("${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" build-persistent-request "${BUILD_ARGS[@]}") || true
+REQUEST_INPUT=$(printf '%s\n' "$REQUEST_OUT" | awk_keyval "REQUEST_INPUT")
+LLM_PROVIDER=$(printf '%s\n' "$REQUEST_OUT" | awk_keyval "LLM_PROVIDER")
+MODEL=$(printf '%s\n' "$REQUEST_OUT" | awk_keyval "MODEL")
+SELECTED_AGENT_RUNTIME=$(printf '%s\n' "$REQUEST_OUT" | awk_keyval "AGENT_RUNTIME")
 if [ -z "$REQUEST_INPUT" ]; then
     echo "ERROR: Failed to build persistent-agent request."
     printf '%s\n' "$REQUEST_OUT"

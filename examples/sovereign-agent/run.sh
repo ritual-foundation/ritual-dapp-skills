@@ -71,6 +71,7 @@ PHASE1_GAS_LIMIT="${PHASE1_GAS_LIMIT:-900000}"
 MIN_RITUAL_WALLET_WEI="${MIN_RITUAL_WALLET_WEI:-1000000000000000000}" # 1 RIT
 DEPOSIT_WEI="${DEPOSIT_WEI:-5000000000000000000}" # 5 RIT
 LOCK_BLOCKS="${LOCK_BLOCKS:-100000000}"
+MIN_LOCK_AHEAD_BLOCKS="${MIN_LOCK_AHEAD_BLOCKS:-10000}"
 EXECUTOR_TEE_ADDRESS="${EXECUTOR_TEE_ADDRESS:-}"
 CONSUMER_ADDRESS="${CONSUMER_ADDRESS:-}"
 
@@ -87,6 +88,18 @@ case "$CLI_TYPE" in
     ;;
 esac
 
+# Helper: like awk -F= but joins all fields after the first =
+awk_keyval() {
+    local prefix="$1"
+    while IFS= read -r line; do
+        case "$line" in
+            "$prefix="*)
+                echo "${line#*=}"
+                ;;
+        esac
+    done
+}
+
 # ── 1. Check for pending async job ──
 PENDING=$(cast call "$TRACKER" "hasPendingJobForSender(address)(bool)" "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')
 if [ "$PENDING" = "true" ]; then
@@ -94,15 +107,22 @@ if [ "$PENDING" = "true" ]; then
     exit 1
 fi
 
-# ── 2. Fund RitualWallet if needed ──
+# ── 2. Fund / refresh RitualWallet if needed ──
+CURRENT_BLOCK=$(cast block-number --rpc-url "$RPC_URL")
 WALLET_BAL=$(cast call "$WALLET" "balanceOf(address)(uint256)" "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')
-NEEDS_DEPOSIT=$("${PY[@]}" - "$WALLET_BAL" "$MIN_RITUAL_WALLET_WEI" <<'PY'
+LOCK_UNTIL=$(cast call "$WALLET" "lockUntil(address)(uint256)" "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')
+NEEDS_DEPOSIT=$("${PY[@]}" - "$WALLET_BAL" "$MIN_RITUAL_WALLET_WEI" "$LOCK_UNTIL" "$CURRENT_BLOCK" "$MIN_LOCK_AHEAD_BLOCKS" <<'PY'
 import sys
-print("1" if int(sys.argv[1]) < int(sys.argv[2]) else "0")
+bal = int(sys.argv[1])
+min_bal = int(sys.argv[2])
+lock_until = int(sys.argv[3])
+current_block = int(sys.argv[4])
+min_lock_ahead = int(sys.argv[5])
+print("1" if (bal < min_bal or lock_until < current_block + min_lock_ahead) else "0")
 PY
 )
 if [ "$NEEDS_DEPOSIT" = "1" ]; then
-    echo "Depositing RitualWallet balance (value=$DEPOSIT_WEI wei, lock=$LOCK_BLOCKS blocks)..."
+    echo "Depositing / refreshing RitualWallet (value=$DEPOSIT_WEI wei, lock=$LOCK_BLOCKS blocks)..."
     cast send "$WALLET" "deposit(uint256)" "$LOCK_BLOCKS" \
         --value "$DEPOSIT_WEI" \
         --private-key "$PRIVATE_KEY" \
@@ -110,6 +130,7 @@ if [ "$NEEDS_DEPOSIT" = "1" ]; then
     echo "Funded."
 fi
 echo "RitualWallet wei: $(cast call "$WALLET" "balanceOf(address)(uint256)" "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')"
+echo "RitualWallet lockUntil: $(cast call "$WALLET" "lockUntil(address)(uint256)" "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')"
 
 # ── 3. Deploy consumer contract ──
 if [ -n "$CONSUMER_ADDRESS" ]; then
@@ -117,8 +138,12 @@ if [ -n "$CONSUMER_ADDRESS" ]; then
     echo "Using existing consumer: $CONSUMER"
 else
     echo "Deploying SovereignAgentConsumer..."
+    ASYNC_DELIVERY="0x5A16214fF555848411544b005f7Ac063742f39F6"
     DEPLOY_OUT=$(forge create --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" \
-        --broadcast "$SCRIPT_DIR/SovereignAgentConsumer.sol:SovereignAgentConsumer" 2>&1)
+        --broadcast "$SCRIPT_DIR/SovereignAgentConsumer.sol:SovereignAgentConsumer" \
+        --constructor-args "$ASYNC_DELIVERY" \
+        --with-gas-price "$((MAX_FEE_GWEI * 1000000000))" \
+        --priority-gas-price "$((PRIORITY_FEE_GWEI * 1000000000))" 2>&1) || true
     CONSUMER=$(printf '%s\n' "$DEPLOY_OUT" | awk '/Deployed to:/ {print $3}' | tail -n1)
 fi
 if [ -z "$CONSUMER" ]; then
@@ -128,44 +153,24 @@ fi
 echo "Consumer: $CONSUMER"
 
 # ── 4. Detect LLM provider and key ──
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    LLM_KEY_NAME="ANTHROPIC_API_KEY"
-    SECRETS_JSON=$("${PY[@]}" - <<'PY'
-import json
-import os
-print(json.dumps({"ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
+# Secrets are read directly by helpers.py from environment variables
+# (not inlined in heredocs) to avoid exposing them in process listings.
+SECRETS_JSON=$("${PY[@]}" - <<'PY'
+import json, os
+provider_key = None
+for var in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"]:
+    if os.environ.get(var):
+        provider_key = var
+        break
+if not provider_key:
+    print("ERROR: Set one of ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY", file=__import__('sys').stderr)
+    __import__('sys').exit(1)
+secrets = {provider_key: os.environ[provider_key], "HF_TOKEN": os.environ["HF_TOKEN"]}
+print(json.dumps(secrets))
 PY
-)
-elif [ -n "${OPENAI_API_KEY:-}" ]; then
-    LLM_KEY_NAME="OPENAI_API_KEY"
-    SECRETS_JSON=$("${PY[@]}" - <<'PY'
-import json
-import os
-print(json.dumps({"LLM_PROVIDER": "openai", "OPENAI_API_KEY": os.environ["OPENAI_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
-PY
-)
-elif [ -n "${GEMINI_API_KEY:-}" ]; then
-    LLM_KEY_NAME="GEMINI_API_KEY"
-    SECRETS_JSON=$("${PY[@]}" - <<'PY'
-import json
-import os
-print(json.dumps({"LLM_PROVIDER": "gemini", "GEMINI_API_KEY": os.environ["GEMINI_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
-PY
-)
-elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
-    LLM_KEY_NAME="OPENROUTER_API_KEY"
-    SECRETS_JSON=$("${PY[@]}" - <<'PY'
-import json
-import os
-print(json.dumps({"LLM_PROVIDER": "openrouter", "OPENROUTER_API_KEY": os.environ["OPENROUTER_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
-PY
-)
-else
-    echo "ERROR: Set one of ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY"
-    exit 1
-fi
+) || true
 : "${MODEL:?Set MODEL to an exact provider model id (e.g. claude-sonnet-4-5-20250929, gpt-4o-mini, gemini-2.5-flash)}"
-echo "Provider key: $LLM_KEY_NAME → model=$MODEL cli_type=$CLI_TYPE"
+echo "Model: $MODEL cli_type=$CLI_TYPE"
 
 # ── 5. Get executor + encrypt secrets ──
 echo "Finding executor and encrypting secrets..."
@@ -182,9 +187,9 @@ BUILD_ARGS=(
 if [ -n "$EXECUTOR_TEE_ADDRESS" ]; then
     BUILD_ARGS+=(--executor-tee-address "$EXECUTOR_TEE_ADDRESS")
 fi
-RESULT=$("${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" "${BUILD_ARGS[@]}")
-EXECUTOR=$(printf '%s\n' "$RESULT" | awk -F= '$1=="EXECUTOR"{print $2}')
-REQUEST_INPUT=$(printf '%s\n' "$RESULT" | awk -F= '$1=="REQUEST_INPUT"{print $2}')
+RESULT=$("${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" "${BUILD_ARGS[@]}") || true
+EXECUTOR=$(printf '%s\n' "$RESULT" | awk_keyval "EXECUTOR")
+REQUEST_INPUT=$(printf '%s\n' "$RESULT" | awk_keyval "REQUEST_INPUT")
 if [ -z "$EXECUTOR" ] || [ -z "$REQUEST_INPUT" ]; then
     echo "ERROR: Failed to build sovereign agent request."
     printf '%s\n' "$RESULT"
