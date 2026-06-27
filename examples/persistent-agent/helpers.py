@@ -277,7 +277,7 @@ def build_persistent_request_input(
     args: argparse.Namespace,
 ) -> tuple[bytes, str, str]:
     provider_name, llm_key_ref, llm_key_value = choose_provider_and_key()
-    model = os.getenv("MODEL", default_model_for_provider(provider_name))
+    model = os.getenv("MODEL") or default_model_for_provider(provider_name)
 
     da_config, da_secrets = build_da_config(args.da_provider)
 
@@ -287,8 +287,17 @@ def build_persistent_request_input(
         secrets["TELEGRAM_BOT_TOKEN"] = tg_token
 
     secrets_json = json.dumps(secrets)
-    encrypted_blob = ecies_encrypt(pub_key_bytes.hex(), secrets_json.encode())
-    secret_signature = create_secret_signature(encrypted_blob, os.environ["PRIVATE_KEY"])
+    try:
+        encrypted_blob = ecies_encrypt(pub_key_bytes.hex(), secrets_json.encode())
+    except Exception as e:
+        print(f"ERROR: encryption failed — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    private_key = os.getenv("PRIVATE_KEY", "")
+    if not private_key:
+        print("ERROR: PRIVATE_KEY environment variable is required", file=sys.stderr)
+        sys.exit(1)
+    secret_signature = create_secret_signature(encrypted_blob, private_key)
 
     runtime_config_json = build_runtime_config(args)
 
@@ -363,6 +372,7 @@ def poll_dkms_result(w3: Web3, consumer: str, tx_hash: str, timeout: int = 300):
         time.sleep(1)
 
     print(f"ERROR: timeout waiting for DKMS result after {timeout}s", file=sys.stderr)
+    print("  The RPC endpoint may not support the 'spcCalls' transaction field (Ritual-specific extension).", file=sys.stderr)
     sys.exit(1)
 
 
@@ -426,7 +436,7 @@ def verify_relay(relay_url: str, agent_address: str, timeout: int = 60):
         print("ERROR: agent never appeared on relay", file=sys.stderr)
         sys.exit(1)
 
-    token = f"persistent-example-{uuid.uuid4().hex[:8]}"
+    token = f"persistent-example-{uuid.uuid4().hex}"
     message = f"Reply with the exact token {token} and also tell me your address."
     _http_json("POST", f"{relay}/send/{agent_address}", {"message": message})
 
@@ -437,7 +447,7 @@ def verify_relay(relay_url: str, agent_address: str, timeout: int = 60):
             content = msg.get("content", "")
             if "HEARTBEAT_OK" in content:
                 continue
-            if token in content:
+            if content == token or token in content.split():
                 print(f"RELAY_VERIFIED=1")
                 print(f"RELAY_REPLY={content}")
                 return

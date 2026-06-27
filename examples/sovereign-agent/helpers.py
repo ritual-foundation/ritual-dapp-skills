@@ -161,7 +161,11 @@ def build_request_input(
 
     hf_repo_id = _validate_hf_repo_id(hf_repo_id)
 
-    encrypted = ecies_encrypt(pub_key_bytes.hex(), secrets_json.encode())
+    try:
+        encrypted = ecies_encrypt(pub_key_bytes.hex(), secrets_json.encode())
+    except Exception as e:
+        print(f"ERROR: encryption failed — {e}", file=sys.stderr)
+        sys.exit(1)
     delivery_selector = Web3.keccak(text="onSovereignAgentResult(bytes32,bytes)")[:4]
 
     values = [
@@ -201,6 +205,9 @@ def build_consumer_calldata(request_input: bytes) -> bytes:
 def poll_phase2(w3: Web3, consumer: str, tx_hash: str, from_block: int, timeout: int = 300):
     """Poll SovereignAgentResultDelivered and decode response payload."""
     event_sig = Web3.keccak(text="SovereignAgentResultDelivered(bytes32,bytes)")
+    if not tx_hash or not isinstance(tx_hash, str) or len(tx_hash) < 10:
+        print(f"ERROR: invalid tx_hash: {tx_hash!r}", file=sys.stderr)
+        sys.exit(1)
     tx_hash = tx_hash[2:] if tx_hash.startswith("0x") else tx_hash
     job_topic = "0x" + tx_hash.rjust(64, "0")
     start = time.time()
@@ -217,7 +224,7 @@ def poll_phase2(w3: Web3, consumer: str, tx_hash: str, from_block: int, timeout:
         if logs:
             raw_data = bytes(logs[0]["data"])
             (result_bytes,) = decode(["bytes"], raw_data)
-            success, error, text, _, _, artifacts = decode(
+            success, error, text, extra_a, extra_b, artifacts = decode(
                 [
                     "bool",
                     "string",
@@ -234,6 +241,10 @@ def poll_phase2(w3: Web3, consumer: str, tx_hash: str, from_block: int, timeout:
             if error:
                 print(f"Error: {error}")
             print(f"Text response: {text if text else '(empty)'}")
+            if extra_a and any(extra_a):
+                print(f"Extra data A: {extra_a}")
+            if extra_b and any(extra_b):
+                print(f"Extra data B: {extra_b}")
             print(f"Artifacts: {len(artifacts)}")
             print(f"{'=' * 68}")
             if not success:
