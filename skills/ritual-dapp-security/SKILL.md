@@ -80,7 +80,7 @@ By default, agent prompts are stored in contract storage and readable by anyone:
 ```bash
 # Anyone can read your agent's prompt:
 cast call <AGENT_ADDRESS> <selector> --rpc-url https://rpc.ritualfoundation.org
-# Returns: plaintext prompt, model ID, financial parameters
+# Returns: plaintext configuration data
 ```
 
 This directly contradicts the privacy guarantee for agents with proprietary strategies.
