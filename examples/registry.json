@@ -9,15 +9,35 @@
       "name": "TweetRegistry",
       "address": "0x188c30510Ec32E6F00620b4f1c2E63925aA39ea2",
       "deploy_block": 2215742,
-      "features": ["Scheduler", "HTTP precompile", "Secrets/Delegation"],
+      "features": [
+        "Scheduler",
+        "HTTP precompile",
+        "Secrets/Delegation"
+      ],
       "github": null
     },
     {
       "name": "TweetRentManager",
       "address": "0xDb0f588a05F56aF801ED9e17241fa48706e8AE1f",
       "deploy_block": 2215742,
-      "features": ["Scheduler", "HTTP precompile", "Secrets/Delegation", "Contract-owned secrets"],
+      "features": [
+        "Scheduler",
+        "HTTP precompile",
+        "Secrets/Delegation",
+        "Contract-owned secrets"
+      ],
       "github": null
+    },
+    {
+      "name": "PriceAlert",
+      "address": "0x145822e5ca5B9BA4570CB9Ddd6a46Bc1234Db58B",
+      "deploy_block": 39892951,
+      "features": [
+        "HTTP precompile",
+        "On-chain JSON parsing",
+        "Price threshold alerts"
+      ],
+      "github": "examples/price-alert/PriceAlert.sol"
     }
   ]
 }
