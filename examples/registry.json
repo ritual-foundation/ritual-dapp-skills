@@ -9,15 +9,36 @@
       "name": "TweetRegistry",
       "address": "0x188c30510Ec32E6F00620b4f1c2E63925aA39ea2",
       "deploy_block": 2215742,
-      "features": ["Scheduler", "HTTP precompile", "Secrets/Delegation"],
+      "features": [
+        "Scheduler",
+        "HTTP precompile",
+        "Secrets/Delegation"
+      ],
       "github": null
     },
     {
       "name": "TweetRentManager",
       "address": "0xDb0f588a05F56aF801ED9e17241fa48706e8AE1f",
       "deploy_block": 2215742,
-      "features": ["Scheduler", "HTTP precompile", "Secrets/Delegation", "Contract-owned secrets"],
+      "features": [
+        "Scheduler",
+        "HTTP precompile",
+        "Secrets/Delegation",
+        "Contract-owned secrets"
+      ],
       "github": null
+    },
+    {
+      "name": "FactChecker",
+      "address": "0x70F3606e27a220b233eFCde64972609Eb4326f84",
+      "deploy_block": 40897387,
+      "features": [
+        "HTTP precompile",
+        "LLM precompile",
+        "Multi-precompile flow",
+        "On-chain fact verification"
+      ],
+      "github": "examples/fact-checker/FactChecker.sol"
     }
   ]
 }

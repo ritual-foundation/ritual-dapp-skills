@@ -21,3 +21,5 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+examples/fact-checker/out/
+examples/fact-checker/cache/
