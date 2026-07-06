@@ -9,15 +9,37 @@
       "name": "TweetRegistry",
       "address": "0x188c30510Ec32E6F00620b4f1c2E63925aA39ea2",
       "deploy_block": 2215742,
-      "features": ["Scheduler", "HTTP precompile", "Secrets/Delegation"],
+      "features": [
+        "Scheduler",
+        "HTTP precompile",
+        "Secrets/Delegation"
+      ],
       "github": null
     },
     {
       "name": "TweetRentManager",
       "address": "0xDb0f588a05F56aF801ED9e17241fa48706e8AE1f",
       "deploy_block": 2215742,
-      "features": ["Scheduler", "HTTP precompile", "Secrets/Delegation", "Contract-owned secrets"],
+      "features": [
+        "Scheduler",
+        "HTTP precompile",
+        "Secrets/Delegation",
+        "Contract-owned secrets"
+      ],
       "github": null
+    },
+    {
+      "name": "RagAgent",
+      "address": "0x62Fa5df1d73Ed8E2043F137b5D54dA941EDE1647",
+      "deploy_block": null,
+      "features": [
+        "HTTP precompile",
+        "LLM precompile",
+        "On-chain RAG",
+        "Document QA"
+      ],
+      "github": "examples/rag-agent/RagAgent.sol",
+      "note": "v2: keyword-based chunk selection, section markers, citation support"
     }
   ]
 }
