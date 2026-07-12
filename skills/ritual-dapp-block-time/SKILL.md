@@ -5,6 +5,25 @@ description: Block-time estimation and block-to-time conversion guidance for Rit
 
 # Ritual Block-Time Guidance
 
+## Timestamps Are Milliseconds
+
+`block.timestamp` on Ritual Chain is **milliseconds since epoch**, not unix seconds — sub-second blocks (~350ms) require sub-second resolution. Verify from any machine:
+
+```bash
+CHAIN_TS=$(curl -s https://rpc.ritualfoundation.org -X POST -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":1}' \
+  | python3 -c "import sys,json; print(int(json.load(sys.stdin)['result']['timestamp'],16))")
+echo "chain: $CHAIN_TS  local-seconds: $(date +%s)"
+# chain / local ≈ 1000 ⇒ milliseconds
+```
+
+Consequences for contract and client code:
+
+- Any deadline, expiry, or schedule field compared against `block.timestamp` must be in **milliseconds**. Passing unix seconds silently produces a timestamp ~56,000 years in the past — checks like `deadline > block.timestamp` revert with the contract's own error, nothing indicating a unit problem.
+- Client-side: `Date.now()` is already ms; do **not** divide by 1000 for values the chain will compare to `block.timestamp`, and pass chain timestamps to `new Date()` as-is when rendering.
+- Wall-clock durations must be scaled: one hour = `3_600_000`, one day = `86_400_000`.
+
+
 ## Baseline (Conservative)
 
 Use a conservative planning baseline of **~350ms per block** when you do not have fresh measurements from your target deployment.
