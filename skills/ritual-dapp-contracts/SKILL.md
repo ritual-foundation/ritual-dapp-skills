@@ -421,6 +421,7 @@ function test_walletDeposit() public {
 | Constraint | Value |
 |---|---|
 | Block time | ~350ms (conservative baseline) |
+| `block.timestamp` unit | **milliseconds** since epoch (not seconds) |
 | Chain ID | 1979 |
 | RPC | `https://rpc.ritualfoundation.org` |
 | Max TTL (async commitment) | 500 blocks (~175s, ~2.9m) |
