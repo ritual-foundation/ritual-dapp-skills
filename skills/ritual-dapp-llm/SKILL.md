@@ -930,6 +930,12 @@ contract LLMConsumer {
     address constant LLM_PRECOMPILE = 0x0000000000000000000000000000000000000802;
     address constant RITUAL_WALLET  = 0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948;
 
+    struct StorageRef {
+        string platform;
+        string path;
+        string keyRef;
+    }
+
     event InferenceCompleted(string model, bool hasError);
 
     function depositForFees() external payable {
@@ -989,8 +995,9 @@ contract LLMConsumer {
 
         bytes memory modelMeta;
         string memory errorMsg;
-        (hasError, completionData, modelMeta, errorMsg, ) =
-            abi.decode(actualOutput, (bool, bytes, bytes, string, (string, string, string)));
+        StorageRef memory updatedConvoHistory;
+        (hasError, completionData, modelMeta, errorMsg, updatedConvoHistory) =
+            abi.decode(actualOutput, (bool, bytes, bytes, string, StorageRef));
 
         emit InferenceCompleted(model, hasError);
     }
