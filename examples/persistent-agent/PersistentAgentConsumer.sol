@@ -9,27 +9,48 @@ contract PersistentAgentConsumer {
     address constant DKMS_KEY = address(0x081B);
     address constant ASYNC_DELIVERY = 0x5A16214fF555848411544b005f7Ac063742f39F6;
 
+    error UnauthorizedCaller();
+    error PrecompileCallFailed();
+
+    address public immutable owner;
     bytes32 public lastJobId;
     bytes public lastResult;
     bytes public lastDkmsResult;
 
     event PrecompileCalled(address indexed precompile, bytes input, bytes output);
+
     event PersistentAgentResultDelivered(bytes32 indexed jobId, bytes result);
     event DkmsKeyResult(bytes result);
 
-    function callPersistentAgent(bytes calldata input) external returns (bytes memory) {
-        (bool ok, bytes memory output) = PERSISTENT_AGENT.call(input);
-        require(ok, "persistent precompile call failed");
-        emit PrecompileCalled(PERSISTENT_AGENT, input, output);
+    constructor() {
+        owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert UnauthorizedCaller();
+        _;
+    }
+
+    function callPersistentAgent(bytes calldata input) external onlyOwner returns (bytes memory) {
+        return _callPrecompile(PERSISTENT_AGENT, input);
+    }
+
+    function callDKMSKey(bytes calldata input) external onlyOwner returns (bytes memory) {
+        bytes memory output = _callPrecompile(DKMS_KEY, input);
+        lastDkmsResult = output;
+        emit DkmsKeyResult(output);
         return output;
     }
 
-    function callDKMSKey(bytes calldata input) external returns (bytes memory) {
-        (bool ok, bytes memory output) = DKMS_KEY.call(input);
-        require(ok, "dkms precompile call failed");
-        lastDkmsResult = output;
-        emit PrecompileCalled(DKMS_KEY, input, output);
-        emit DkmsKeyResult(output);
+    function _callPrecompile(address precompile, bytes calldata input) internal returns (bytes memory) {
+        (bool ok, bytes memory output) = precompile.call(input);
+        if (!ok) {
+            if (output.length == 0) revert PrecompileCallFailed();
+            assembly {
+                revert(add(output, 0x20), mload(output))
+            }
+        }
+        emit PrecompileCalled(precompile, input, output);
         return output;
     }
 
