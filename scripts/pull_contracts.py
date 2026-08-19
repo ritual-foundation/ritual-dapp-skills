@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -60,6 +61,27 @@ DEFAULT_OUTPUT = REPO_ROOT / "examples" / "contracts"
 DEFAULT_RPC = "https://rpc.ritualfoundation.org"
 EXPLORER_API = "https://explorer.ritualfoundation.org/api/v2/smart-contracts"
 
+_VALID_CONTRACT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_VALID_CONTRACT_ADDRESS = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+def validate_contract_name(name: str) -> str:
+    """Validate a registry/output name as one safe filesystem component."""
+    if not isinstance(name, str) or not _VALID_CONTRACT_NAME.fullmatch(name):
+        raise ValueError(
+            "Contract names must be 1-128 characters of letters, digits, '.', '_', or '-'."
+        )
+    return name
+
+
+def validate_contract_address(address: str, *, allow_tbd: bool = False) -> str:
+    """Validate an EVM address before using it in RPC requests or output paths."""
+    if allow_tbd and address == "TBD":
+        return address
+    if not isinstance(address, str) or not _VALID_CONTRACT_ADDRESS.fullmatch(address):
+        raise ValueError(f"Invalid contract address: {address!r}")
+    return address
+
 
 # ---------------------------------------------------------------------------
 # RPC
@@ -73,7 +95,7 @@ class RPC:
         self.endpoints = endpoints
 
     def call(self, method: str, params: list) -> dict:
-        last_err = None
+        last_err: Exception | None = None
         for url in self.endpoints:
             try:
                 resp = requests.post(
@@ -83,12 +105,17 @@ class RPC:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                if not isinstance(data, dict):
+                    raise ValueError("RPC response is not a JSON object")
                 if "error" in data:
                     last_err = RuntimeError(f"RPC error ({url}): {data['error']}")
                     continue
+                if "result" not in data:
+                    last_err = RuntimeError(f"RPC response from {url} has no result field")
+                    continue
                 return data["result"]
-            except requests.RequestException as e:
-                last_err = e
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                last_err = exc
                 continue
         raise last_err or RuntimeError("All RPC endpoints failed")
 
@@ -144,8 +171,9 @@ def resolve_selectors(
                 resolved[sel] = results[0]["text_signature"] if results else f"unknown_0x{sel}"
             else:
                 resolved[sel] = f"unknown_0x{sel}"
-        except requests.RequestException:
+        except (requests.RequestException, ValueError, TypeError, KeyError, IndexError):
             resolved[sel] = f"unknown_0x{sel}"
+
     return resolved
 
 
@@ -168,8 +196,8 @@ def fetch_explorer_source(address: str) -> dict | None:
                     "name": data.get("name", "Unknown"),
                     "origin": "explorer",
                 }
-    except requests.RequestException:
-        pass
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        print(f"  warn: explorer fetch failed for {address}: {exc}", file=sys.stderr)
     return None
 
 
@@ -199,9 +227,9 @@ def fetch_github_file(repo: str, ref: str, path: str) -> str | None:
         )
         if result.returncode != 0:
             return None
-        return base64.b64decode(result.stdout.strip()).decode("utf-8")
-    except Exception as e:
-        print(f"  warn: GitHub fetch failed ({path}): {e}", file=sys.stderr)
+        return base64.b64decode(result.stdout.strip(), validate=True).decode("utf-8")
+    except (OSError, ValueError, UnicodeError, subprocess.SubprocessError) as exc:
+        print(f"  warn: GitHub fetch failed ({path}): {exc}", file=sys.stderr)
         return None
 
 
@@ -230,8 +258,10 @@ def discover_contracts_at_block(rpc: RPC, block_num: int) -> list[dict]:
                         "tx_hash": tx["hash"],
                         "deployer": tx.get("from", "unknown"),
                     })
-            except Exception:
+            except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+                print(f"  warn: receipt lookup failed for {tx.get('hash')}: {exc}", file=sys.stderr)
                 continue
+
     return contracts
 
 
@@ -255,8 +285,10 @@ def pull_one(
     print(f"  Address: {address}")
     print(f"{'='*60}")
 
-    safe_name = name or address
+    address = validate_contract_address(address)
+    safe_name = validate_contract_name(name) if name else address
     contract_dir = output_dir / safe_name
+
     contract_dir.mkdir(parents=True, exist_ok=True)
 
     result = {"name": name, "address": address}
@@ -279,9 +311,14 @@ def pull_one(
     # 2. Selectors
     print("\n[2/4] Extracting function selectors...")
     if bytecode and result.get("bytecode_size", 0) > 0:
-        selectors = extract_selectors(bytecode)
+        try:
+            selectors = extract_selectors(bytecode)
+        except ValueError as exc:
+            print(f"  Error: invalid bytecode returned by RPC: {exc}", file=sys.stderr)
+            selectors = []
         print(f"  {len(selectors)} selectors found")
         signatures = resolve_selectors(selectors, skip=skip_4byte)
+
         abi_list = [
             {"selector": f"0x{s}", "signature": sig}
             for s, sig in sorted(signatures.items(), key=lambda x: x[1])
@@ -339,8 +376,8 @@ def pull_one(
     try:
         slot0 = rpc.get_storage(address, "0x0")
         result["storage_slot_0"] = slot0
-    except Exception:
-        pass
+    except (RuntimeError, ValueError, TypeError) as exc:
+        print(f"  warn: storage slot lookup failed for {address}: {exc}", file=sys.stderr)
 
     return result
 
@@ -351,18 +388,41 @@ def pull_one(
 
 
 def load_registry() -> dict:
-    if REGISTRY_PATH.exists():
-        return json.loads(REGISTRY_PATH.read_text())
-    return {"chain_id": 1979, "rpc_endpoints": [DEFAULT_RPC], "explorer_api": EXPLORER_API, "contracts": []}
+    if not REGISTRY_PATH.exists():
+        return {"chain_id": 1979, "rpc_endpoints": [DEFAULT_RPC], "explorer_api": EXPLORER_API, "contracts": []}
+
+    try:
+        registry = json.loads(REGISTRY_PATH.read_text())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not read registry {REGISTRY_PATH}: {exc}") from exc
+
+    if not isinstance(registry, dict) or not isinstance(registry.get("contracts", []), list):
+        raise ValueError("Registry must be an object with a contracts list")
+    for entry in registry["contracts"]:
+        if not isinstance(entry, dict):
+            raise ValueError("Every registry contract must be an object")
+        validate_contract_name(entry.get("name", ""))
+        validate_contract_address(entry.get("address", ""), allow_tbd=True)
+    return registry
+
+
+def write_json_atomically(path: Path, payload: dict) -> None:
+    """Write JSON through a sibling temporary file to avoid partial output."""
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary_path.replace(path)
 
 
 def save_registry(reg: dict):
-    REGISTRY_PATH.write_text(json.dumps(reg, indent=2) + "\n")
+    write_json_atomically(REGISTRY_PATH, reg)
 
 
 def add_to_registry(reg: dict, name: str, address: str, block: int | None, features: list[str] | None):
     """Add or update a contract in the registry."""
+    name = validate_contract_name(name)
+    address = validate_contract_address(address)
     for c in reg["contracts"]:
+
         if c["address"].lower() == address.lower():
             c["name"] = name
             if block:
@@ -413,8 +473,20 @@ Examples:
 
     args = parser.parse_args()
 
+    if args.register:
+        try:
+            validate_contract_name(args.register)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.address:
+        try:
+            validate_contract_address(args.address)
+        except ValueError as exc:
+            parser.error(str(exc))
+
     # Build RPC client
     reg = load_registry()
+
     endpoints = [args.rpc] if args.rpc else reg.get("rpc_endpoints", [DEFAULT_RPC])
     if DEFAULT_RPC not in endpoints:
         endpoints.append(DEFAULT_RPC)
@@ -484,7 +556,7 @@ Examples:
         "contracts": results,
     }
     summary_path = args.output_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    write_json_atomically(summary_path, summary)
 
     print(f"\n{'='*60}")
     print(f"  Done — {len(results)} contract(s) pulled to {args.output_dir}/")
