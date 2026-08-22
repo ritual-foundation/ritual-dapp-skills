@@ -227,7 +227,10 @@ def fetch_github_file(repo: str, ref: str, path: str) -> str | None:
         )
         if result.returncode != 0:
             return None
-        return base64.b64decode(result.stdout.strip(), validate=True).decode("utf-8")
+        
+        # Clean newlines from base64 payload before validating and decoding
+        clean_b64 = result.stdout.strip().replace("\n", "").replace("\r", "")
+        return base64.b64decode(clean_b64, validate=True).decode("utf-8")
     except (OSError, ValueError, UnicodeError, subprocess.SubprocessError) as exc:
         print(f"  warn: GitHub fetch failed ({path}): {exc}", file=sys.stderr)
         return None
@@ -258,7 +261,8 @@ def discover_contracts_at_block(rpc: RPC, block_num: int) -> list[dict]:
                         "tx_hash": tx["hash"],
                         "deployer": tx.get("from", "unknown"),
                     })
-            except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            # Catch requests.RequestException to prevent network errors from aborting the scan
+            except (RuntimeError, ValueError, KeyError, TypeError, requests.RequestException) as exc:
                 print(f"  warn: receipt lookup failed for {tx.get('hash')}: {exc}", file=sys.stderr)
                 continue
 
@@ -376,7 +380,8 @@ def pull_one(
     try:
         slot0 = rpc.get_storage(address, "0x0")
         result["storage_slot_0"] = slot0
-    except (RuntimeError, ValueError, TypeError) as exc:
+    # Catch requests.RequestException to prevent network timeouts from aborting the pull
+    except (RuntimeError, ValueError, TypeError, requests.RequestException) as exc:
         print(f"  warn: storage slot lookup failed for {address}: {exc}", file=sys.stderr)
 
     return result
@@ -398,7 +403,9 @@ def load_registry() -> dict:
 
     if not isinstance(registry, dict) or not isinstance(registry.get("contracts", []), list):
         raise ValueError("Registry must be an object with a contracts list")
-    for entry in registry["contracts"]:
+    
+    # Safely iterate over the contracts list, falling back to an empty list if missing
+    for entry in registry.get("contracts", []):
         if not isinstance(entry, dict):
             raise ValueError("Every registry contract must be an object")
         validate_contract_name(entry.get("name", ""))
