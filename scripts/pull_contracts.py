@@ -231,7 +231,7 @@ def fetch_github_file(repo: str, ref: str, path: str) -> str | None:
         # Clean newlines from base64 payload before validating and decoding
         clean_b64 = result.stdout.strip().replace("\n", "").replace("\r", "")
         return base64.b64decode(clean_b64, validate=True).decode("utf-8")
-    except (OSError, ValueError, UnicodeError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, UnicodeError, subprocess.SubprocessError, KeyError, AttributeError, TypeError, IndexError) as exc:
         print(f"  warn: GitHub fetch failed ({path}): {exc}", file=sys.stderr)
         return None
 
