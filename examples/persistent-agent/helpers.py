@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import uuid
+import subprocess
 from urllib import error, request
 
 from ecies import encrypt as ecies_encrypt
@@ -158,10 +159,33 @@ def build_dkms_request_input(executor: str, owner: str, key_index: int, ttl: int
     return encode(DKMS_REQUEST_TYPES, values)
 
 
-def create_secret_signature(encrypted_blob: bytes, private_key: str) -> bytes:
-    message = encode_defunct(encrypted_blob)
-    account = Account.from_key(private_key)
-    return bytes(account.sign_message(message).signature)
+def create_secret_signature(encrypted_blob: bytes) -> bytes:
+    """
+    Sign the encrypted secrets blob securely.
+    Supports FOUNDRY_ACCOUNT (via cast shellout) to prevent raw PRIVATE_KEY exposure and signature divergence,
+    or falls back to the raw PRIVATE_KEY for compatibility.
+    """
+    foundry_account = os.getenv("FOUNDRY_ACCOUNT")
+    if foundry_account:
+        # Securely sign via Foundry keystore to avoid raw private key exposure
+        hex_blob = "0x" + encrypted_blob.hex()
+        try:
+            # cast wallet sign automatically applies the EIP-191 prefix
+            cmd = ["cast", "wallet", "sign", "--account", foundry_account, hex_blob]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            sig_hex = result.stdout.strip()
+            return bytes.fromhex(sig_hex[2:] if sig_hex.startswith("0x") else sig_hex)
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: Failed to sign secrets with FOUNDRY_ACCOUNT. {e.stderr}", file=sys.stderr)
+            sys.exit(1)
+
+    private_key = os.getenv("PRIVATE_KEY")
+    if private_key:
+        message = encode_defunct(encrypted_blob)
+        account = Account.from_key(private_key)
+        return bytes(account.sign_message(message).signature)
+        
+    raise ValueError("Must provide either FOUNDRY_ACCOUNT or PRIVATE_KEY for signing")
 
 
 def choose_provider_and_key() -> tuple[str, str, str]:
@@ -288,7 +312,9 @@ def build_persistent_request_input(
 
     secrets_json = json.dumps(secrets)
     encrypted_blob = ecies_encrypt(pub_key_bytes.hex(), secrets_json.encode())
-    secret_signature = create_secret_signature(encrypted_blob, os.environ["PRIVATE_KEY"])
+    
+    # Correctly call the refactored signature generation function
+    secret_signature = create_secret_signature(encrypted_blob)
 
     runtime_config_json = build_runtime_config(args)
 

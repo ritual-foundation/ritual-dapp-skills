@@ -5,7 +5,9 @@
 # Required environment (this script will fail fast if any are missing or look
 # like unfilled placeholders):
 #   RPC_URL        — e.g. https://rpc.ritualfoundation.org
-#   PRIVATE_KEY    — 0x-prefixed funded key
+#   FOUNDRY_ACCOUNT — preferred: imported Foundry keystore account
+#   PRIVATE_KEY    — compatibility fallback; avoid in shared shells
+
 #   HF_TOKEN       — HuggingFace token for DA storage (hf_...)
 #   HF_REPO_ID     — HuggingFace dataset ID in "user/repo" form that YOU own
 #                    (e.g. alice/my-agent-workspace). Stores convo history,
@@ -44,8 +46,19 @@ require_real_value() {
 }
 
 require_real_value RPC_URL "${RPC_URL:-}" "e.g. https://rpc.ritualfoundation.org"
-require_real_value PRIVATE_KEY "${PRIVATE_KEY:-}" "0x-prefixed funded key"
+if [ -n "${FOUNDRY_ACCOUNT:-}" ]; then
+    SIGNER_ARGS=(--account "$FOUNDRY_ACCOUNT")
+    SENDER=$(cast wallet address --account "$FOUNDRY_ACCOUNT")
+elif [ -n "${PRIVATE_KEY:-}" ]; then
+    require_real_value PRIVATE_KEY "$PRIVATE_KEY" "0x-prefixed funded key"
+    SIGNER_ARGS=(--private-key "$PRIVATE_KEY")
+    SENDER=$(cast wallet address "$PRIVATE_KEY")
+else
+    echo "ERROR: Set FOUNDRY_ACCOUNT to an imported keystore account or PRIVATE_KEY as a compatibility fallback." >&2
+    exit 2
+fi
 require_real_value HF_TOKEN "${HF_TOKEN:-}" "HuggingFace token (hf_...) with write access to HF_REPO_ID"
+
 require_real_value HF_REPO_ID "${HF_REPO_ID:-}" "HuggingFace dataset ID in 'user/repo' form, e.g. alice/my-agent-workspace"
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -74,8 +87,8 @@ LOCK_BLOCKS="${LOCK_BLOCKS:-100000000}"
 EXECUTOR_TEE_ADDRESS="${EXECUTOR_TEE_ADDRESS:-}"
 CONSUMER_ADDRESS="${CONSUMER_ADDRESS:-}"
 
-SENDER=$(cast wallet address "$PRIVATE_KEY")
 echo "Sender: $SENDER"
+
 echo "Chain:  $(cast chain-id --rpc-url "$RPC_URL")"
 
 case "$CLI_TYPE" in
@@ -105,7 +118,7 @@ if [ "$NEEDS_DEPOSIT" = "1" ]; then
     echo "Depositing RitualWallet balance (value=$DEPOSIT_WEI wei, lock=$LOCK_BLOCKS blocks)..."
     cast send "$WALLET" "deposit(uint256)" "$LOCK_BLOCKS" \
         --value "$DEPOSIT_WEI" \
-        --private-key "$PRIVATE_KEY" \
+        "${SIGNER_ARGS[@]}" \
         --rpc-url "$RPC_URL" >/dev/null
     echo "Funded."
 fi
@@ -117,7 +130,7 @@ if [ -n "$CONSUMER_ADDRESS" ]; then
     echo "Using existing consumer: $CONSUMER"
 else
     echo "Deploying SovereignAgentConsumer..."
-    DEPLOY_OUT=$(forge create --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" \
+    DEPLOY_OUT=$(forge create --rpc-url "$RPC_URL" "${SIGNER_ARGS[@]}" \
         --broadcast "$SCRIPT_DIR/SovereignAgentConsumer.sol:SovereignAgentConsumer" 2>&1)
     CONSUMER=$(printf '%s\n' "$DEPLOY_OUT" | awk '/Deployed to:/ {print $3}' | tail -n1)
 fi
@@ -128,7 +141,19 @@ fi
 echo "Consumer: $CONSUMER"
 
 # ── 4. Detect LLM provider and key ──
+LLM_KEY_COUNT=0
+for key_name in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY; do
+    if [ -n "${!key_name:-}" ]; then
+        LLM_KEY_COUNT=$((LLM_KEY_COUNT + 1))
+    fi
+done
+if [ "$LLM_KEY_COUNT" -ne 1 ]; then
+    echo "ERROR: Set exactly one of ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY" >&2
+    exit 2
+fi
+
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+
     LLM_KEY_NAME="ANTHROPIC_API_KEY"
     SECRETS_JSON=$("${PY[@]}" - <<'PY'
 import json
@@ -173,7 +198,8 @@ BUILD_ARGS=(
     --rpc "$RPC_URL"
     --registry "$REGISTRY"
     --consumer "$CONSUMER"
-    --secrets "$SECRETS_JSON"
+        --secrets-stdin
+
     --cli-type "$CLI_TYPE"
     --model "$MODEL"
     --prompt "$PROMPT"
@@ -182,7 +208,8 @@ BUILD_ARGS=(
 if [ -n "$EXECUTOR_TEE_ADDRESS" ]; then
     BUILD_ARGS+=(--executor-tee-address "$EXECUTOR_TEE_ADDRESS")
 fi
-RESULT=$("${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" "${BUILD_ARGS[@]}")
+RESULT=$(printf '%s' "$SECRETS_JSON" | "${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" "${BUILD_ARGS[@]}")
+
 EXECUTOR=$(printf '%s\n' "$RESULT" | awk -F= '$1=="EXECUTOR"{print $2}')
 REQUEST_INPUT=$(printf '%s\n' "$RESULT" | awk -F= '$1=="REQUEST_INPUT"{print $2}')
 if [ -z "$EXECUTOR" ] || [ -z "$REQUEST_INPUT" ]; then
@@ -197,7 +224,7 @@ FROM_BLOCK=$(cast block-number --rpc-url "$RPC_URL")
 echo "Submitting sovereign agent call (from_block=$FROM_BLOCK)..."
 TX_HASH=$(cast send "$CONSUMER" 'callSovereignAgent(bytes)' "$REQUEST_INPUT" \
     --rpc-url "$RPC_URL" \
-    --private-key "$PRIVATE_KEY" \
+    "${SIGNER_ARGS[@]}" \
     --gas-limit "$PHASE1_GAS_LIMIT" \
     --async)
 echo "Phase 1 tx: $TX_HASH"

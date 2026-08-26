@@ -7,6 +7,7 @@ Called by run.sh for:
 """
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -141,7 +142,19 @@ def get_executor(w3: Web3, registry_addr: str, explicit_executor: str = ""):
     return Web3.to_checksum_address(node[1]), bytes(node[3])
 
 
+def canonicalize_secrets_json(raw: str) -> str:
+    """Validate and compact a JSON object before encrypting it for the executor."""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--secrets must be valid JSON: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("--secrets must contain a JSON object")
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+
 def build_request_input(
+
     executor: str,
     pub_key_bytes: bytes,
     consumer: str,
@@ -206,15 +219,24 @@ def poll_phase2(w3: Web3, consumer: str, tx_hash: str, from_block: int, timeout:
     start = time.time()
 
     while time.time() - start < timeout:
-        logs = w3.eth.get_logs(
-            {
-                "address": Web3.to_checksum_address(consumer),
-                "topics": [event_sig, job_topic],
-                "fromBlock": int(from_block),
-                "toBlock": "latest",
-            }
-        )
+        try:
+            logs = w3.eth.get_logs(
+                {
+                    "address": Web3.to_checksum_address(consumer),
+                    "topics": [event_sig, job_topic],
+                    "fromBlock": int(from_block),
+                    "toBlock": "latest",
+                }
+            )
+        except Exception as exc:
+            print(
+                f"WARN: Phase 2 log polling failed ({type(exc).__name__}); retrying.",
+                file=sys.stderr,
+            )
+            time.sleep(1)
+            continue
         if logs:
+
             raw_data = bytes(logs[0]["data"])
             (result_bytes,) = decode(["bytes"], raw_data)
             success, error, text, _, _, artifacts = decode(
@@ -250,7 +272,14 @@ if __name__ == "__main__":
     parser.add_argument("--rpc", required=True)
     parser.add_argument("--registry", default="")
     parser.add_argument("--consumer", default="")
-    parser.add_argument("--secrets", default="")
+    secrets_group = parser.add_mutually_exclusive_group()
+    secrets_group.add_argument("--secrets")
+    secrets_group.add_argument(
+        "--secrets-stdin",
+        action="store_true",
+        help="Read the secrets JSON from stdin instead of exposing it in process arguments.",
+    )
+
     parser.add_argument("--executor-tee-address", default="")
     parser.add_argument("--cli-type", type=int, default=5, help="0=claude_code, 5=crush, 6=zeroclaw")
     parser.add_argument("--model", default="")
@@ -278,20 +307,31 @@ if __name__ == "__main__":
     if not args.model:
         print("ERROR: --model is required when building request input", file=sys.stderr)
         sys.exit(1)
-    # Fail-fast: --hf-repo-id must be a real user/repo, not unset or a placeholder.
-    # Without this, the previously-present literal "<YOUR_HF_USER>/<YOUR_HF_REPO>"
-    # strings would be ABI-encoded into the on-chain request and the job would
-    # fail only inside the executor, long after submission.
+    if args.secrets is None and not args.secrets_stdin:
+        print("ERROR: provide --secrets or --secrets-stdin", file=sys.stderr)
+        sys.exit(2)
+    raw_secrets = sys.stdin.read() if args.secrets_stdin else args.secrets
+    try:
+        secrets_json = canonicalize_secrets_json(raw_secrets)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    # Fail-fast: --hf-repo-id must be a real user/repo, not a placeholder.
+    # Otherwise the invalid value would be ABI-encoded and fail only inside the executor.
     _validate_hf_repo_id(args.hf_repo_id)
 
     w3 = Web3(Web3.HTTPProvider(args.rpc))
+
     executor, pub_key = get_executor(w3, args.registry, args.executor_tee_address)
     request_input = build_request_input(
         executor=executor,
+
         pub_key_bytes=pub_key,
         consumer=args.consumer,
-        secrets_json=args.secrets,
+        secrets_json=secrets_json,
         cli_type=args.cli_type,
+
         model=args.model,
         prompt=args.prompt,
         hf_repo_id=args.hf_repo_id,

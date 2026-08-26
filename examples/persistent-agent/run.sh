@@ -7,13 +7,15 @@
 # code 2 if any required variable is unset or still contains an unfilled
 # placeholder like "<YOUR_GCS_BUCKET>" or "YOUR_TOKEN"):
 #   export RPC_URL=https://rpc.ritualfoundation.org
-#   export PRIVATE_KEY=0x...                           # funded 0x-prefixed key
-#   export ANTHROPIC_API_KEY=sk-ant-...                # or OPENAI_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY
-#   export DA_PROVIDER=gcs                             # one of: hf, gcs, pinata
+#   export FOUNDRY_ACCOUNT=my-agent                      # preferred: imported Foundry keystore account
+#   export PRIVATE_KEY=0x...                             # compatibility fallback; avoid in shared shells
+
+#   export ANTHROPIC_API_KEY=sk-ant-...                  # or OPENAI_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY
+#   export DA_PROVIDER=gcs                               # one of: hf, gcs, pinata
 #   export GCS_DA_SERVICE_ACCOUNT_JSON="$(cat sa.json)"
-#   export GCS_DA_BUCKET=my-agent-workspace-bucket     # a GCS bucket YOU own
+#   export GCS_DA_BUCKET=my-agent-workspace-bucket       # a GCS bucket YOU own
 #   export GCS_DA_PREFIX=agents/demo
-#   export RELAY_URL=https://my-relay.example.com      # optional; omit to skip relay verify
+#   export RELAY_URL=https://my-relay.example.com        # optional; omit to skip relay verify
 #   export VERIFY_RELAY=1
 #   bash run.sh
 #
@@ -28,10 +30,10 @@ set -euo pipefail
 # to the literal string "<YOUR_GCS_BUCKET>" in many shells.
 #
 # IMPORTANT (for agents running this example on behalf of a user):
-# Elicit all required values (RPC_URL, PRIVATE_KEY, DA provider credentials,
-# LLM credentials) from the user BEFORE invoking this script. There are no
-# sensible defaults for credentials and placeholder values will abort with
-# exit code 2.
+# Elicit all required values (RPC_URL, signer credentials, DA provider credentials, and
+# LLM credentials) from the user BEFORE invoking this script. There are no sensible
+# defaults for credentials and placeholder values will abort with exit code 2.
+
 require_real_value() {
     local name="$1"
     local value="${2-}"
@@ -49,7 +51,30 @@ require_real_value() {
 }
 
 require_real_value RPC_URL "${RPC_URL:-}" "e.g. https://rpc.ritualfoundation.org"
-require_real_value PRIVATE_KEY "${PRIVATE_KEY:-}" "0x-prefixed funded key"
+
+if [ -n "${FOUNDRY_ACCOUNT:-}" ]; then
+    SIGNER_ARGS=(--account "$FOUNDRY_ACCOUNT")
+    SENDER=$(cast wallet address --account "$FOUNDRY_ACCOUNT")
+    
+    # SECURITY FIX: Request construction (helpers.py) still requires the raw PRIVATE_KEY from the environment
+    # to sign the encrypted secrets blob. We enforce its presence here to prevent Python panics during spawn,
+    # and strictly assert that both keys derive to the exact same address to prevent signature divergence.
+    require_real_value PRIVATE_KEY "${PRIVATE_KEY:-}" "0x-prefixed private key corresponding to FOUNDRY_ACCOUNT (required for secrets payload signature)"
+    
+    PK_SENDER=$(cast wallet address "$PRIVATE_KEY")
+    if [ "$SENDER" != "$PK_SENDER" ]; then
+        echo "ERROR: Diverging credentials! FOUNDRY_ACCOUNT address ($SENDER) does not match PRIVATE_KEY address ($PK_SENDER)." >&2
+        exit 2
+    fi
+elif [ -n "${PRIVATE_KEY:-}" ]; then
+    require_real_value PRIVATE_KEY "$PRIVATE_KEY" "0x-prefixed funded key"
+    SIGNER_ARGS=(--private-key "$PRIVATE_KEY")
+    SENDER=$(cast wallet address "$PRIVATE_KEY")
+else
+    echo "ERROR: Set FOUNDRY_ACCOUNT (and its matching PRIVATE_KEY) or just PRIVATE_KEY as a compatibility fallback." >&2
+    exit 2
+fi
+
 : "${DA_PROVIDER:?Set DA_PROVIDER to one of: hf, gcs, pinata}"
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -92,12 +117,12 @@ CHILD_FUND_WEI="${CHILD_FUND_WEI:-100000000000000000000000}"             # 100,0
 
 EXECUTOR_TEE_ADDRESS="${EXECUTOR_TEE_ADDRESS:-}"
 CONSUMER_ADDRESS="${CONSUMER_ADDRESS:-}"
-TELEGRAM_DM_POLICY="${TELEGRAM_DM_POLICY:-open}"
+TELEGRAM_DM_POLICY="${TELEGRAM_DM_POLICY:-pairing}"
 VERIFY_RELAY="${VERIFY_RELAY:-0}"
 RELAY_URL="${RELAY_URL:-}"
 
-SENDER=$(cast wallet address "$PRIVATE_KEY")
 echo "Sender: $SENDER"
+
 echo "Chain:  $(cast chain-id --rpc-url "$RPC_URL")"
 echo "DA:     $DA_PROVIDER"
 echo "Runtime: $AGENT_RUNTIME"
@@ -159,7 +184,7 @@ if [ "$NEEDS_DEPOSIT" = "1" ]; then
     echo "Depositing / refreshing RitualWallet (value=$DEPOSIT_WEI wei, lock=$LOCK_BLOCKS blocks)..."
     cast send "$WALLET" "deposit(uint256)" "$LOCK_BLOCKS" \
         --value "$DEPOSIT_WEI" \
-        --private-key "$PRIVATE_KEY" \
+        "${SIGNER_ARGS[@]}" \
         --rpc-url "$RPC_URL" >/dev/null
     echo "Updated RitualWallet."
 fi
@@ -172,7 +197,7 @@ if [ -n "$CONSUMER_ADDRESS" ]; then
     echo "Using existing consumer: $CONSUMER"
 else
     echo "Deploying PersistentAgentConsumer..."
-    DEPLOY_OUT=$(forge create --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" \
+    DEPLOY_OUT=$(forge create --rpc-url "$RPC_URL" "${SIGNER_ARGS[@]}" \
         --broadcast "$SCRIPT_DIR/PersistentAgentConsumer.sol:PersistentAgentConsumer" 2>&1)
     CONSUMER=$(printf '%s\n' "$DEPLOY_OUT" | awk '/Deployed to:/ {print $3}' | tail -n1)
 fi
@@ -207,7 +232,7 @@ echo "Executor: $EXECUTOR"
 echo "Deriving child DKMS heartbeat/payment address..."
 DKMS_TX_HASH=$(cast send "$CONSUMER" 'callDKMSKey(bytes)' "$DKMS_INPUT" \
     --rpc-url "$RPC_URL" \
-    --private-key "$PRIVATE_KEY" \
+    "${SIGNER_ARGS[@]}" \
     --gas-limit "$DKMS_GAS_LIMIT" \
     --async)
 echo "DKMS tx: $DKMS_TX_HASH"
@@ -236,7 +261,7 @@ if [ "$NEEDS_CHILD_FUND" = "1" ]; then
     echo "Funding child DKMS address with native balance for heartbeat registration..."
     cast send "$CHILD_DKMS_ADDRESS" \
         --value "$CHILD_FUND_WEI" \
-        --private-key "$PRIVATE_KEY" \
+        "${SIGNER_ARGS[@]}" \
         --rpc-url "$RPC_URL" >/dev/null
     echo "Funded child DKMS address."
 fi
@@ -281,7 +306,7 @@ FROM_BLOCK_PHASE2=$(cast block-number --rpc-url "$RPC_URL")
 echo "Submitting persistent agent call (from_block=$FROM_BLOCK_PHASE2)..."
 SPAWN_TX_HASH=$(cast send "$CONSUMER" 'callPersistentAgent(bytes)' "$REQUEST_INPUT" \
     --rpc-url "$RPC_URL" \
-    --private-key "$PRIVATE_KEY" \
+    "${SIGNER_ARGS[@]}" \
     --gas-limit "$PHASE1_GAS_LIMIT" \
     --async)
 echo "Phase 1 tx: $SPAWN_TX_HASH"
