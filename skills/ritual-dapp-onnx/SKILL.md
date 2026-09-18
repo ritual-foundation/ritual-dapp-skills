@@ -90,7 +90,7 @@ function int32ToFloat(i: number): number {
 ## TypeScript: Encoding an ONNX Request
 
 ```typescript
-import { encodeAbiParameters } from 'viem';
+import { encodeAbiParameters, bytesToHex } from 'viem';
 
 const ONNX_PRECOMPILE = '0x0000000000000000000000000000000000000800';
 
@@ -117,7 +117,7 @@ function encodeOnnxRequest(
       { type: 'uint8' },   // rounding
     ],
     [
-      new TextEncoder().encode(modelId) as unknown as `0x${string}`,
+      bytesToHex(new TextEncoder().encode(modelId)),
       tensorData,
       opts?.inputArithmetic ?? 2,  // 2 = IEEE 754 float
       0,                            // not used for float
