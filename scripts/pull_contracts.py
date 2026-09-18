@@ -115,11 +115,14 @@ def extract_selectors(bytecode: str) -> list[str]:
     selectors = set()
     i = 0
     while i < len(raw) - 4:
-        if raw[i] == 0x63:  # PUSH4
+        op = raw[i]
+        if op == 0x63:  # PUSH4
             sel = raw[i + 1 : i + 5].hex()
             if sel not in ("00000000", "ffffffff"):
                 selectors.add(sel)
             i += 5
+        elif 0x60 <= op <= 0x7f:  # PUSH1..PUSH32 — skip immediate data
+            i += 1 + (op - 0x5f)
         else:
             i += 1
     return sorted(selectors)
