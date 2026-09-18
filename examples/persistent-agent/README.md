@@ -49,6 +49,8 @@ Always set:
   - `OPENROUTER_API_KEY`
 - `DA_PROVIDER` — one of: `hf`, `gcs`, `pinata`
 
+Provider-specific credentials are listed in [DA Provider Inputs](#da-provider-inputs) below.
+
 ## Persistent-Agent Preflight (Hard Requirements)
 
 Do **not** continue unless these are true:
