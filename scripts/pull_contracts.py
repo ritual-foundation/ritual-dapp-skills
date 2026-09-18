@@ -365,7 +365,7 @@ def add_to_registry(reg: dict, name: str, address: str, block: int | None, featu
     for c in reg["contracts"]:
         if c["address"].lower() == address.lower():
             c["name"] = name
-            if block:
+            if block is not None:
                 c["deploy_block"] = block
             if features:
                 c["features"] = features
