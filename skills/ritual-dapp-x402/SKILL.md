@@ -126,7 +126,7 @@ const encrypted = encrypt(executorPublicKey.slice(2), Buffer.from(x402Payload));
 const encryptedHex = `0x${Buffer.from(encrypted).toString('hex')}`;
 
 // 3. Sign the encrypted blob
-const signature = await account.signMessage({ message: { raw: encrypted } });
+const signature = await account.signMessage({ message: { raw: encryptedHex } });
 
 // 4. These go into ABI parameter slots 1 and 3:
 //    encryptedSecrets: [encryptedHex]
