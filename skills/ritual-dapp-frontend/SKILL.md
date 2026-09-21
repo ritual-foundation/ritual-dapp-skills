@@ -245,7 +245,7 @@ export interface AsyncTxSettled {
   result: unknown;
   settlementTxHash: `0x${string}`;
   settledBlock: number;
-  gasUsed: bigint;
+  gasUsed: number;
 }
 
 export interface AsyncTxFailed {
@@ -341,7 +341,7 @@ export const useAsyncTxStore = create<AsyncTxStore>()(
         set((s) => {
           const existing = s.transactions[id];
           if (!existing) return s;
-          return { transactions: { ...s.transactions, [id]: { ...existing, state: newState, updatedAt: Date.now() } } };
+          return { transactions: { ...s.transactions, [id]: { ...existing, state: { ...existing.state, ...newState }, updatedAt: Date.now() } } };
         }),
       getTransaction: (id) => get().transactions[id],
       getActiveTransactions: () => Object.values(get().transactions).filter((tx) => !isTerminalState(tx.state.status)),
@@ -385,7 +385,7 @@ function decodeHTTPResponse(output: `0x${string}`) {
   return {
     statusCode,
     headers: Object.fromEntries(headerKeys.map((k, i) => [k, headerValues[i]])),
-    body: new TextDecoder().decode(body as Uint8Array),
+    body: new TextDecoder().decode(Buffer.from((body as string).slice(2), 'hex')),
     error: errorMessage || null,
   };
 }
@@ -525,6 +525,7 @@ export function useAsyncJobEvents({ txId, enabled = true }: { txId: string; enab
       for (const log of logs) {
         const tx = getTransaction(txId);
         if (!tx) continue;
+        if (tx.state.jobId && log.args.jobId !== tx.state.jobId) continue;
         if (tx.state.status === "COMMITTED" || tx.state.status === "EXECUTOR_PROCESSING") {
           updateState(txId, {
             status: "RESULT_READY",
@@ -546,6 +547,7 @@ export function useAsyncJobEvents({ txId, enabled = true }: { txId: string; enab
       for (const log of logs) {
         const tx = getTransaction(txId);
         if (!tx || tx.state.status !== "RESULT_READY") continue;
+        if (tx.state.jobId && log.args.jobId !== tx.state.jobId) continue;
         updateState(txId, {
           status: log.args.success ? "SETTLED" : "FAILED",
           txHash: tx.state.txHash,
@@ -748,9 +750,9 @@ export function decodeHTTPCallResponse(data: Hex) {
   headerKeys.forEach((k, i) => { headers[k] = headerValues[i]; });
   return {
     statusCode, headers,
-    body: new TextDecoder().decode(body as Uint8Array),
+    body: new TextDecoder().decode(Buffer.from((body as string).slice(2), 'hex')),
     error: errorMessage || null,
-    get jsonBody() { return JSON.parse(new TextDecoder().decode(body as Uint8Array)); },
+    get jsonBody() { return JSON.parse(new TextDecoder().decode(Buffer.from((body as string).slice(2), 'hex'))); },
   };
 }
 ```
