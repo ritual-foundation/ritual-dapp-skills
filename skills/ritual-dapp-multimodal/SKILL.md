@@ -879,8 +879,9 @@ contract MediaConsumer {
     }
 
     /// @dev Builds the ABI-encoded input for multimodal precompiles.
-    ///      The executor expects exactly 18 ABI fields where fields 15-17 are
-    ///      ModalInput[] (tuple[]), OutputConfig (tuple), and StorageRef (tuple).
+    ///      The executor expects exactly 19 ABI fields where fields 15-17 are
+    ///      ModalInput[] (tuple[]), OutputConfig (tuple), and StorageRef (tuple),
+    ///      and field 19 is encryptedSecrets (bytes[]) for storage credentials.
     function _buildMultiModalInput(
         address executor,
         uint256 ttl,
@@ -937,7 +938,8 @@ contract MediaConsumer {
             model,
             inputs,             // ModalInput[] — tuple array, NOT flat bytes
             output,             // OutputConfig — tuple, NOT flat scalars
-            outputStorageRef    // StorageRef: (platform, path, keyRef)
+            outputStorageRef,   // StorageRef: (platform, path, keyRef)
+            encryptedSecrets    // ECIES-encrypted JSON with storage credentials keyed by keyRef
         );
     }
 
