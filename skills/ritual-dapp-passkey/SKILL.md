@@ -812,17 +812,22 @@ function join32ByteParts(a: Uint8Array, b: Uint8Array): `0x${string}` {
   return toHex(combined);
 }
 
+function rlpUint(value: bigint | number): `0x${string}` {
+  if (value === 0n || value === 0) return '0x';
+  return toHex(value);
+}
+
 function encodeTxPasskeySigningPayload(tx: TxPasskeyBase): `0x${string}` {
   return concatHex([
     '0x77',
     toRlp([
-      tx.chainId,
-      tx.nonce,
-      tx.maxPriorityFeePerGas,
-      tx.maxFeePerGas,
-      tx.gasLimit,
+      rlpUint(tx.chainId),
+      rlpUint(tx.nonce),
+      rlpUint(tx.maxPriorityFeePerGas),
+      rlpUint(tx.maxFeePerGas),
+      rlpUint(tx.gasLimit),
       tx.to ?? '0x',
-      tx.value,
+      rlpUint(tx.value),
       tx.data,
       tx.accessList,
     ]),
