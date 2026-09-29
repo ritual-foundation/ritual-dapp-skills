@@ -342,12 +342,12 @@ def poll_dkms_result(w3: Web3, consumer: str, tx_hash: str, timeout: int = 300):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            tx = w3.eth.get_transaction(tx_hash)
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
         except Exception:
             time.sleep(1)
             continue
 
-        spc_calls = tx.get("spcCalls") or []
+        spc_calls = receipt.get("spcCalls") or []
         for spc_call in spc_calls:
             if (spc_call.get("address") or "").lower() != "0x000000000000000000000000000000000000081b":
                 continue
