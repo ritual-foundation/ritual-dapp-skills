@@ -133,7 +133,7 @@ if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     SECRETS_JSON=$("${PY[@]}" - <<'PY'
 import json
 import os
-print(json.dumps({"ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
+print(json.dumps({"LLM_PROVIDER": "anthropic", "ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
 PY
 )
 elif [ -n "${OPENAI_API_KEY:-}" ]; then
