@@ -1857,7 +1857,7 @@ const secretsJson = JSON.stringify({
   LLM_PROVIDER: 'anthropic',
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_KEY,
 });
-const encryptedSecrets = encrypt(executorPublicKey, Buffer.from(secretsJson));
+const encryptedSecrets = encrypt(executorPublicKey.slice(2), Buffer.from(secretsJson));
 
 const deliverySelector = toFunctionSelector('onSovereignAgentResult(bytes32,bytes)');
 
