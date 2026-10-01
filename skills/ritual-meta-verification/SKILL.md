@@ -175,8 +175,11 @@ For checks with deterministic fixes, the protocol specifies the exact transforma
 | 2 | ABI field count = 30 | T1 | MEDIUM | Count type parameters in LLM encoding block (must be 30 including convoHistory tuple) | Consult precompiles skill for correct fields |
 | 3 | Float scaling ×1000 | T1 | LOW | Grep for temperature/topP values — warn if decimal found | Multiply by 1000 |
 | 4 | Executor availability | T2 | HIGH | `cast call 0x9644...Bf47F "getServicesByCapability(uint8,bool)" 1 true --rpc-url $RITUAL_RPC_URL` | Wait or use different capability |
+| 5 | Empty completion handled | T1 | MEDIUM | In each `.sol` file that decodes `choicesData` / message `content`, check that a zero `choicesCount` **and** an empty or whitespace-only `content` (after stripping `<think>…</think>`) lead to an explicit error branch. Flag code that passes the decoded content straight into parsing, storage or a verdict. | Insert a blank check right after extracting content, e.g. `if (_isBlank(bytes(content))) { /* record as error, do not parse */ }` |
 
-**Pass condition:** Checks 1 and 4 must pass (at T2). Check 2 is medium. Check 3 is low.
+**Pass condition:** Checks 1 and 4 must pass (at T2). Check 2 is medium. Check 3 is low. Check 5 is medium.
+
+> **Why check 5:** GLM-4.7-FP8 can spend its whole `maxCompletionTokens` budget inside `<think>` and return empty `content` with `finish_reason: "length"` (see `ritual-dapp-llm`, "Reasoning-budget exhaustion"). `hasError` is `false` in that case, so a consumer that only checks `hasError` will treat an empty string as a real answer: a blank value gets stored, or a verdict or parser silently falls back to its default.
 
 ---
 
