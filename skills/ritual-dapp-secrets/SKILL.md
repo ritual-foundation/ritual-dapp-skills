@@ -203,7 +203,7 @@ import { parseAbiParameters } from 'viem';
 
 const HTTP_CALL_ABI = parseAbiParameters([
   'address, bytes[], uint256, bytes[], bytes,',
-  'string, uint8, string[], string[], bytes, bool',
+  'string, uint8, string[], string[], bytes, uint256, uint8, bool',
 ].join(''));
 ```
 
@@ -238,6 +238,8 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
     model: 'gpt-4',
     messages: [{ role: 'user', content: 'Hello' }],
   })),
+  0n,                                              // dkmsKeyIndex (disabled)
+  0,                                               // dkmsKeyFormat (disabled)
   false,                                           // piiEnabled (independent from substitution)
 ]);
 
@@ -257,6 +259,8 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   1,                                                // GET
   [], [],                                           // no extra headers
   new Uint8Array(0),                                // no body
+  0n,                                               // dkmsKeyIndex (disabled)
+  0,                                                // dkmsKeyFormat (disabled)
   false,                                            // piiEnabled (optional, unrelated)
 ]);
 ```
@@ -278,6 +282,8 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
     secret: 'WEBHOOK_SECRET',      // Multiple templates supported
     data: { message: 'Hello from Ritual' },
   })),
+  0n,                                               // dkmsKeyIndex (disabled)
+  0,                                                // dkmsKeyFormat (disabled)
   false,                                            // piiEnabled (optional, unrelated)
 ]);
 ```
@@ -311,6 +317,8 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   ['Authorization', 'X-Pinecone-Api-Key', 'X-Custom'],
   ['Bearer OPENAI_KEY', 'PINECONE_KEY', 'CUSTOM_HEADER'],
   new TextEncoder().encode(JSON.stringify({ query: 'Find similar documents' })),
+  0n,                                             // dkmsKeyIndex (disabled)
+  0,                                              // dkmsKeyFormat (disabled)
   false,                                          // piiEnabled (optional, unrelated)
 ]);
 ```
@@ -400,7 +408,7 @@ const input = encodeAbiParameters(
     [signature],              // signatures array
     '0x',                     // userPublicKey (empty if no response encryption)
     'https://api.example.com/data',
-    0,                        // GET
+    1,                        // GET
     ['Authorization'],
     ['Bearer API_KEY'],        // key-name placeholder
     '0x',                     // empty body for GET
@@ -482,6 +490,8 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   1,               // GET
   [], [],          // no extra headers
   new Uint8Array(0),
+  0n,              // dkmsKeyIndex (disabled)
+  0,               // dkmsKeyFormat (disabled)
   false,           // piiEnabled — set to true only for PII redaction
 ]);
 
@@ -556,6 +566,8 @@ async function getPrivateHoroscope(zodiacSign: string) {
     ['Authorization'],
     ['Bearer HOROSCOPE_API_KEY'],
     new Uint8Array(0),
+    0n,              // dkmsKeyIndex (disabled)
+    0,               // dkmsKeyFormat (disabled)
     false,           // piiEnabled (optional, unrelated)
   ]);
 
@@ -886,6 +898,8 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   ['Authorization'],
   ['Bearer API_KEY'],
   new Uint8Array(0),
+  0n,                        // dkmsKeyIndex (disabled)
+  0,                         // dkmsKeyFormat (disabled)
   false,                     // piiEnabled (optional, unrelated)
 ]);
 
