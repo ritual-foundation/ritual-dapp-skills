@@ -61,6 +61,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY=(uv run --quiet python3)
 PY_HELPER=(uv run --quiet --with eciespy --with eth-abi --with web3 python3)
+OUTPUT_PRIVATE_KEY_FILE=$(mktemp "${TMPDIR:-/tmp}/ritual-persistent-output-key.XXXXXX")
+chmod 600 "$OUTPUT_PRIVATE_KEY_FILE"
+trap 'rm -f "$OUTPUT_PRIVATE_KEY_FILE"' EXIT
 
 WALLET="0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948"
 TRACKER="0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5"
@@ -255,6 +258,7 @@ BUILD_ARGS=(
     --heartbeat-chain-interval-blocks "$HEARTBEAT_CHAIN_INTERVAL_BLOCKS"
     --heartbeat-chain-timeout-blocks "$HEARTBEAT_CHAIN_TIMEOUT_BLOCKS"
     --agent-runtime "$AGENT_RUNTIME"
+    --output-private-key-file "$OUTPUT_PRIVATE_KEY_FILE"
 )
 if [ -n "${HEARTBEAT_INTERVAL:-}" ]; then
     BUILD_ARGS+=(--heartbeat-interval "$HEARTBEAT_INTERVAL")
@@ -293,6 +297,7 @@ PHASE2_OUT=$("${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" poll-phase2 \
     --consumer "$CONSUMER" \
     --tx-hash "$SPAWN_TX_HASH" \
     --from-block "$FROM_BLOCK_PHASE2" \
+    --output-private-key-file "$OUTPUT_PRIVATE_KEY_FILE" \
     --timeout "$PHASE2_TIMEOUT")
 printf '%s\n' "$PHASE2_OUT"
 

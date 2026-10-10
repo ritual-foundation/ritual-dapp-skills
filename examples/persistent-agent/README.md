@@ -183,6 +183,11 @@ bash run.sh
 6. Phase 2 callback is delivered and decoded from `PersistentAgentResultDelivered`
 7. If `VERIFY_RELAY=1`, the spawned agent appears on the relay and replies to a test message
 
+The Phase 2 spawn payload includes a gateway bearer token. `run.sh` generates a
+one-time ECIES keypair, submits only its public key, and deletes the mode-`0600`
+private-key file on exit. The callback therefore contains ciphertext on-chain;
+the helper decrypts it locally and never prints the token itself.
+
 ## Files
 
 | File | Purpose |

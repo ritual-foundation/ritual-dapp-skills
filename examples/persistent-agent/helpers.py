@@ -19,6 +19,8 @@ import time
 import uuid
 from urllib import error, request
 
+from ecies import PrivateKey
+from ecies import decrypt as ecies_decrypt
 from ecies import encrypt as ecies_encrypt
 from ecies.config import ECIES_CONFIG
 from eth_abi.abi import decode, encode
@@ -292,6 +294,16 @@ def build_persistent_request_input(
 
     runtime_config_json = build_runtime_config(args)
 
+    # The spawn response contains a bearer gateway token. Encrypt the complete
+    # Phase 2 payload to a one-time user key instead of exposing that credential
+    # in callback calldata and event logs.
+    output_private_key = PrivateKey("secp256k1")
+    output_private_key_path = os.path.abspath(args.output_private_key_file)
+    with open(output_private_key_path, "w", encoding="ascii") as key_file:
+        key_file.write(output_private_key.to_hex())
+    os.chmod(output_private_key_path, 0o600)
+    user_public_key = output_private_key.public_key.to_bytes(compressed=False)
+
     soul = os.getenv("SOUL", "You are a helpful persistent agent on Ritual Chain.")
     agents_doc = os.getenv("AGENTS_DOC", "")
     user_doc = os.getenv("USER_DOC", "")
@@ -307,7 +319,7 @@ def build_persistent_request_input(
         [encrypted_blob],
         500,  # ttl
         [secret_signature],
-        b"",  # user_public_key
+        user_public_key,  # encrypt Phase 2 output (includes gateway token)
         6000,  # max_spawn_block
         Web3.to_checksum_address(consumer),
         delivery_selector,
@@ -366,7 +378,14 @@ def poll_dkms_result(w3: Web3, consumer: str, tx_hash: str, timeout: int = 300):
     sys.exit(1)
 
 
-def poll_phase2(w3: Web3, consumer: str, tx_hash: str, from_block: int, timeout: int = 300):
+def poll_phase2(
+    w3: Web3,
+    consumer: str,
+    tx_hash: str,
+    from_block: int,
+    output_private_key_file: str,
+    timeout: int = 300,
+):
     event_sig = Web3.keccak(text="PersistentAgentResultDelivered(bytes32,bytes)")
     tx_hash_hex = tx_hash[2:] if tx_hash.startswith("0x") else tx_hash
     job_topic = "0x" + tx_hash_hex.rjust(64, "0")
@@ -382,7 +401,10 @@ def poll_phase2(w3: Web3, consumer: str, tx_hash: str, from_block: int, timeout:
             }
         )
         if logs:
-            result_bytes = decode_outer_bytes(bytes(logs[-1]["data"]))
+            encrypted_result = decode_outer_bytes(bytes(logs[-1]["data"]))
+            with open(output_private_key_file, "r", encoding="ascii") as key_file:
+                output_private_key = key_file.read().strip()
+            result_bytes = ecies_decrypt(output_private_key, encrypted_result)
             instance_id, gateway_url, container_id, checkpoint_cid, error_message, gateway_token = decode(
                 PERSISTENT_RESPONSE_TYPES, result_bytes
             )
@@ -392,7 +414,7 @@ def poll_phase2(w3: Web3, consumer: str, tx_hash: str, from_block: int, timeout:
             print(f"CONTAINER_ID={container_id}")
             print(f"CHECKPOINT_CID={checkpoint_cid}")
             print(f"ERROR_MESSAGE={error_message}")
-            print(f"GATEWAY_TOKEN={gateway_token}")
+            print(f"GATEWAY_TOKEN_RECEIVED={bool(gateway_token)}")
             if error_message:
                 sys.exit(1)
             return
@@ -477,12 +499,14 @@ def main():
     p3.add_argument("--heartbeat-interval", default="")
     p3.add_argument("--heartbeat-prompt", default="")
     p3.add_argument("--agent-runtime", choices=["zeroclaw", "hermes"], default="zeroclaw")
+    p3.add_argument("--output-private-key-file", required=True)
 
     p4 = sub.add_parser("poll-phase2")
     p4.add_argument("--rpc", required=True)
     p4.add_argument("--consumer", required=True)
     p4.add_argument("--tx-hash", required=True)
     p4.add_argument("--from-block", required=True)
+    p4.add_argument("--output-private-key-file", required=True)
     p4.add_argument("--timeout", type=int, default=300)
 
     p5 = sub.add_parser("verify-relay")
@@ -526,7 +550,14 @@ def main():
         return
 
     if args.cmd == "poll-phase2":
-        poll_phase2(w3, args.consumer, args.tx_hash, int(args.from_block), timeout=args.timeout)
+        poll_phase2(
+            w3,
+            args.consumer,
+            args.tx_hash,
+            int(args.from_block),
+            args.output_private_key_file,
+            timeout=args.timeout,
+        )
         return
 
 
