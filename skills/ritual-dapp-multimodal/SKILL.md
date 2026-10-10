@@ -623,6 +623,7 @@ contract MediaConsumer {
     address constant VIDEO_PRECOMPILE = 0x000000000000000000000000000000000000081A;
     address constant RITUAL_WALLET    = 0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948;
     address constant ASYNC_DELIVERY_SENDER = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+    address constant TX_HASH_PRECOMPILE = address(0x0830);
 
     modifier onlyAsyncSystem() {
         require(msg.sender == ASYNC_DELIVERY_SENDER, "unauthorized callback");
@@ -662,6 +663,7 @@ contract MediaConsumer {
     }
 
     mapping(bytes32 => MediaResult) public results;
+    mapping(bytes32 => bool) public pendingJobs;
     bytes32[] public resultIds;
 
     event ImageRequested(bytes32 indexed taskId);
@@ -689,6 +691,7 @@ contract MediaConsumer {
         StorageRef calldata outputStorageRef,
         bytes[] calldata encryptedSecrets
     ) external {
+        bytes32 jobId = _trackCurrentJob();
         bytes memory input = _buildMultiModalInput(
             executor, ttl, prompt, model,
             width, height, 0,  // no duration for images
@@ -700,13 +703,10 @@ contract MediaConsumer {
         );
 
         // Use .call() not staticcall — async precompiles require a state-mutating call
-        (bool ok, bytes memory result) = IMAGE_PRECOMPILE.call(input);
+        (bool ok,) = IMAGE_PRECOMPILE.call(input);
         require(ok, "Image precompile call failed");
 
-        // NOTE: The callback jobId is the ORIGINAL TX HASH, not keccak256(result).
-        // Do not use keccak256(result) as a key for pending request lookup —
-        // it will not match the jobId delivered in the callback.
-        emit ImageRequested(keccak256(result));
+        emit ImageRequested(jobId);
     }
 
     /// @notice Request audio generation
@@ -720,6 +720,7 @@ contract MediaConsumer {
         StorageRef calldata outputStorageRef,
         bytes[] calldata encryptedSecrets
     ) external {
+        bytes32 jobId = _trackCurrentJob();
         bytes memory input = _buildMultiModalInput(
             executor, ttl, prompt, model,
             maxDurationMs, 0, 0,
@@ -730,12 +731,10 @@ contract MediaConsumer {
             2  // outputType: AUDIO
         );
 
-        (bool ok, bytes memory result) = AUDIO_PRECOMPILE.call(input);
+        (bool ok,) = AUDIO_PRECOMPILE.call(input);
         require(ok, "Audio precompile call failed");
 
-        // NOTE: keccak256(result) is a local identifier only.
-        // The Phase 2 callback jobId is the original TX hash, not this value.
-        emit AudioRequested(keccak256(result));
+        emit AudioRequested(jobId);
     }
 
     /// @notice Request video generation
@@ -751,6 +750,7 @@ contract MediaConsumer {
         StorageRef calldata outputStorageRef,
         bytes[] calldata encryptedSecrets
     ) external {
+        bytes32 jobId = _trackCurrentJob();
         bytes memory input = _buildMultiModalInput(
             executor, ttl, prompt, model,
             width, height, durationMs,
@@ -761,12 +761,10 @@ contract MediaConsumer {
             3  // outputType: VIDEO
         );
 
-        (bool ok, bytes memory result) = VIDEO_PRECOMPILE.call(input);
+        (bool ok,) = VIDEO_PRECOMPILE.call(input);
         require(ok, "Video precompile call failed");
 
-        // NOTE: keccak256(result) is a local identifier only.
-        // The Phase 2 callback jobId is the original TX hash, not this value.
-        emit VideoRequested(keccak256(result));
+        emit VideoRequested(jobId);
     }
 
     /// @notice Phase 2 callback for image results
@@ -775,6 +773,7 @@ contract MediaConsumer {
     ///      The AsyncDelivery system calls: target.call(abi.encodeWithSelector(selector, jobId, result))
     ///      Both parameters are required. Registering a single-param selector will never match.
     function onImageReady(bytes32 jobId, bytes calldata responseData) external onlyAsyncSystem {
+        _consumePendingJob(jobId);
         (
             bool hasError,
             ,
@@ -810,6 +809,7 @@ contract MediaConsumer {
 
     /// @notice Phase 2 callback for audio results
     function onAudioReady(bytes32 jobId, bytes calldata responseData) external onlyAsyncSystem {
+        _consumePendingJob(jobId);
         (
             bool hasError,
             ,
@@ -844,6 +844,7 @@ contract MediaConsumer {
 
     /// @notice Phase 2 callback for video results
     function onVideoReady(bytes32 jobId, bytes calldata responseData) external onlyAsyncSystem {
+        _consumePendingJob(jobId);
         (
             bool hasError,
             ,
@@ -876,6 +877,19 @@ contract MediaConsumer {
         resultIds.push(taskId);
 
         emit MediaReady(taskId, outputUri);
+    }
+
+    function _trackCurrentJob() private returns (bytes32 jobId) {
+        (bool ok, bytes memory output) = TX_HASH_PRECOMPILE.staticcall("");
+        require(ok && output.length == 32, "tx hash unavailable");
+        jobId = abi.decode(output, (bytes32));
+        require(!pendingJobs[jobId], "job already pending");
+        pendingJobs[jobId] = true;
+    }
+
+    function _consumePendingJob(bytes32 jobId) private {
+        require(pendingJobs[jobId], "unknown or fulfilled job");
+        delete pendingJobs[jobId];
     }
 
     /// @dev Builds the ABI-encoded input for multimodal precompiles.

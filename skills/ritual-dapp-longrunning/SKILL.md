@@ -383,6 +383,7 @@ contract LongRunningHTTPConsumer {
     address public constant LONG_RUNNING_HTTP_PRECOMPILE = address(0x0805);
     // AsyncDelivery proxy — msg.sender for all async callbacks
     address constant ASYNC_DELIVERY_SENDER = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+    address constant TX_HASH_PRECOMPILE = address(0x0830);
 
     struct JobResult {
         uint16 statusCode;
@@ -392,14 +393,19 @@ contract LongRunningHTTPConsumer {
     }
 
     mapping(bytes32 => JobResult) public results;
+    mapping(bytes32 => bool) public pendingJobs;
 
-    event JobSubmitted(string taskId, uint256 blockNumber);
+    event JobSubmitted(bytes32 indexed jobId, string taskId, uint256 blockNumber);
     event JobCompleted(bytes32 indexed jobId, uint16 statusCode, uint256 dataLength);
     event JobFailed(bytes32 indexed jobId, string reason);
 
     /// @notice Submit a long-running HTTP job
     /// @param encodedRequest ABI-encoded LongRunningHTTPCallRequest
     function initiateJob(bytes calldata encodedRequest) external payable {
+        // Add application-specific access control here if processing the result
+        // can change privileged state.
+        bytes32 jobId = _trackCurrentJob();
+
         (bool ok, bytes memory rawOutput) = LONG_RUNNING_HTTP_PRECOMPILE.call(
             encodedRequest
         );
@@ -408,7 +414,7 @@ contract LongRunningHTTPConsumer {
         // Async precompiles return (bytes simmedInput, bytes actualOutput)
         (, bytes memory actualOutput) = abi.decode(rawOutput, (bytes, bytes));
         string memory taskId = abi.decode(actualOutput, (string));
-        emit JobSubmitted(taskId, block.number);
+        emit JobSubmitted(jobId, taskId, block.number);
     }
 
     /// @notice Callback from AsyncDelivery when the job completes
@@ -417,6 +423,8 @@ contract LongRunningHTTPConsumer {
     ///      Your callback must accept BOTH parameters: (bytes32 jobId, bytes result).
     function onLongRunningResult(bytes32 jobId, bytes calldata result) external {
         require(msg.sender == ASYNC_DELIVERY_SENDER, "unauthorized callback");
+        require(pendingJobs[jobId], "unknown or fulfilled job");
+        delete pendingJobs[jobId];
 
         // Result is an HTTPCallResponse: (statusCode, headerKeys, headerValues, body, errorMessage)
         (uint16 statusCode, , , bytes memory body, string memory errorMessage) =
@@ -447,8 +455,20 @@ contract LongRunningHTTPConsumer {
         return results[jobId];
     }
 
+    function _trackCurrentJob() internal returns (bytes32 jobId) {
+        (bool ok, bytes memory output) = TX_HASH_PRECOMPILE.staticcall("");
+        require(ok && output.length == 32, "tx hash unavailable");
+        jobId = abi.decode(output, (bytes32));
+        require(!pendingJobs[jobId], "job already pending");
+        pendingJobs[jobId] = true;
+    }
+
 }
 ```
+
+`encodedRequest` must set `deliveryTarget = address(this)` and use
+`this.onLongRunningResult.selector`. Checking AsyncDelivery alone is insufficient because another caller
+can put this contract and selector into its own delivery configuration.
 
 ### Specialized Consumer: AI Research Assistant
 

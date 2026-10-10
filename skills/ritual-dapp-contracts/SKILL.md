@@ -274,22 +274,44 @@ HTTP (0x0801) and Long-Running HTTP (0x0805) append these fields after the core 
 
 ## Callback Security
 
-All long-running async callbacks are delivered by the AsyncDelivery contract. Always verify `msg.sender`.
+All long-running async callbacks are delivered by the AsyncDelivery contract. Always verify `msg.sender`,
+but do not stop there: that check authenticates the delivery transport, not the job. A caller can choose a
+`deliveryTarget` and `deliverySelector` in its own request, so a contract that accepts every callback from
+AsyncDelivery can still process a result for a job it never submitted.
+
+Record the current transaction hash before calling the long-running precompile. The callback `jobId` is that
+hash, so the contract can reject unknown jobs and consume each expected callback exactly once.
 
 ```solidity
 address constant ASYNC_DELIVERY = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+address constant TX_HASH_PRECOMPILE = address(0x0830);
+
+mapping(bytes32 => bool) public pendingJobs;
 
 modifier onlyAsyncDelivery() {
     require(msg.sender == ASYNC_DELIVERY, "only async delivery");
     _;
 }
 
+function _trackCurrentJob() internal returns (bytes32 jobId) {
+    (bool ok, bytes memory output) = TX_HASH_PRECOMPILE.staticcall("");
+    require(ok && output.length == 32, "tx hash unavailable");
+    jobId = abi.decode(output, (bytes32));
+    require(!pendingJobs[jobId], "job already pending");
+    pendingJobs[jobId] = true;
+}
+
 function onResult(bytes32 jobId, bytes calldata result) external onlyAsyncDelivery {
-    require(!fulfilled[jobId], "already fulfilled");
-    fulfilled[jobId] = true;
+    require(pendingJobs[jobId], "unknown or fulfilled job");
+    delete pendingJobs[jobId]; // effects before processing or external calls
     // process result
 }
 ```
+
+Call `_trackCurrentJob()` immediately before the long-running precompile call, and encode
+`address(this)` plus the matching callback selector into the delivery configuration. Also apply the
+application's access control to the submission function; pending-job tracking proves that the job passed
+through this contract, not that every caller was authorized to create it.
 
 ### Escape Hatch for Stuck State
 
