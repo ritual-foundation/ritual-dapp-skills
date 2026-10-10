@@ -994,15 +994,24 @@ The passkey controls the address. The deposit funds the precompile. These are in
 
 ---
 
-## 11. Recovery Pattern
+## 11. Application-Level Recovery (Not Native EOA Rotation)
 
-When a user loses all devices in their passkey sync ecosystem, they lose access. This contract allows a secondary secp256k1 key to rotate the passkey:
+A native TxPasskey address is derived from the P256 public key. Changing the key therefore produces a
+different address; no registry contract can replace the key that validates transactions for the original
+EOA. If a user loses every copy of that passkey, the native passkey-derived EOA is not recoverable.
+
+Recovery must be designed before funds are deposited. Put assets and permissions behind a smart account or
+application contract whose authorization logic reads a mutable passkey registry. A secondary secp256k1 key
+can then rotate the key used by that contract. The following example is such an **application-level
+registry**; it does not rotate a native TxPasskey EOA:
 
 ```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-contract PasskeyWithRecovery {
+/// @notice Application-level key registry for a contract-managed account.
+/// @dev Updating this registry does not change a native TxPasskey EOA's key.
+contract PasskeyRecoveryRegistry {
     address constant SECP256R1 = address(0x100);
 
     struct Account {
@@ -1057,7 +1066,14 @@ contract PasskeyWithRecovery {
 }
 ```
 
-The recovery address is a standard secp256k1 EOA (MetaMask, hardware wallet). The delay gives the legitimate owner time to cancel a malicious recovery attempt using their passkey.
+The recovery address is a standard secp256k1 EOA (MetaMask or a hardware wallet). The delay gives the
+legitimate owner time to cancel a malicious recovery attempt. To make the rotation effective, the smart
+account or application must verify future actions against `accounts[account].passkeyX/passkeyY`; this
+standalone registry only stores the policy.
+
+Do not present this pattern as recovery for funds held directly by the passkey-derived EOA. For native EOA
+funds, use passkey-provider device sync and backup procedures, or transfer funds into a recoverable smart
+account while the original passkey is still available.
 
 ---
 
