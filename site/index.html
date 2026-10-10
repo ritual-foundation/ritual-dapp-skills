@@ -2038,60 +2038,71 @@ var fpGo, exitSlideMode;
       document.head.appendChild(s);
     }
 
+    let replayPromise = null;
+
     async function runReplay() {
-      el.innerHTML = '';
+      while (true) {
+        el.innerHTML = '';
 
-      const teaserDiv = document.createElement('div');
-      teaserDiv.style.color = '#555';
-      teaserDiv.style.minHeight = '1.7em';
-      el.appendChild(teaserDiv);
-
-      const spinner = createSpinner();
-      teaserDiv.appendChild(spinner.el);
-      const teaserText = document.createElement('span');
-      teaserDiv.appendChild(teaserText);
-      const cursor = createCursor();
-      teaserDiv.appendChild(cursor);
-
-      // Type "jestermaxxing..."
-      await streamText(teaserText, 'jestermaxxing...', 9);
-      await new Promise(r => setTimeout(r, 600));
-      // Delete it
-      await deleteText(teaserText, 25);
-      await new Promise(r => setTimeout(r, 300));
-
-      // Remove teaser line, spinner, cursor
-      spinner.stop();
-      cursor.remove();
-      teaserDiv.remove();
-
-      for (const line of lines) {
-        if (line.break) {
-          el.appendChild(document.createElement('br'));
-          await new Promise(r => setTimeout(r, 100));
-          continue;
-        }
-        const div = document.createElement('div');
-        div.style.color = line.color;
-        div.style.minHeight = '1.7em';
-        el.appendChild(div);
+        const teaserDiv = document.createElement('div');
+        teaserDiv.style.color = '#555';
+        teaserDiv.style.minHeight = '1.7em';
+        el.appendChild(teaserDiv);
 
         const spinner = createSpinner();
-        div.appendChild(spinner.el);
+        teaserDiv.appendChild(spinner.el);
+        const teaserText = document.createElement('span');
+        teaserDiv.appendChild(teaserText);
+        const cursor = createCursor();
+        teaserDiv.appendChild(cursor);
 
-        await new Promise(r => setTimeout(r, line.think));
+        // Type "jestermaxxing..."
+        await streamText(teaserText, 'jestermaxxing...', 9);
+        await new Promise(r => setTimeout(r, 600));
+        // Delete it
+        await deleteText(teaserText, 25);
+        await new Promise(r => setTimeout(r, 300));
 
-        const span = document.createElement('span');
-        div.appendChild(span);
-        await streamText(span, line.text, 9);
-
+        // Remove teaser line, spinner, cursor
         spinner.stop();
-        await new Promise(r => setTimeout(r, 40));
+        cursor.remove();
+        teaserDiv.remove();
+
+        for (const line of lines) {
+          if (line.break) {
+            el.appendChild(document.createElement('br'));
+            await new Promise(r => setTimeout(r, 100));
+            continue;
+          }
+          const div = document.createElement('div');
+          div.style.color = line.color;
+          div.style.minHeight = '1.7em';
+          el.appendChild(div);
+
+          const spinner = createSpinner();
+          div.appendChild(spinner.el);
+
+          await new Promise(r => setTimeout(r, line.think));
+
+          const span = document.createElement('span');
+          div.appendChild(span);
+          await streamText(span, line.text, 9);
+
+          spinner.stop();
+          await new Promise(r => setTimeout(r, 40));
+        }
+        await new Promise(r => setTimeout(r, 3000));
       }
-      await new Promise(r => setTimeout(r, 3000));
-      runReplay();
     }
-    window._startAgentReplay = runReplay;
+
+    window._startAgentReplay = () => {
+      if (!replayPromise) {
+        replayPromise = runReplay()
+          .catch(error => { console.error('Agent replay stopped:', error); })
+          .finally(() => { replayPromise = null; });
+      }
+      return replayPromise;
+    };
   })();
 
   // Nav links — once in normal scroll mode, just scroll to target
