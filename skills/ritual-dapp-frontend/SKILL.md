@@ -97,22 +97,66 @@ Frontend frameworks make JSON-RPC calls **from the user's browser**. If the Ritu
 
 **Symptoms:** `useReadContract` returns `undefined`. dApp works server-side but shows nothing in browser. Network tab shows failed RPC requests.
 
-**Fix:** Proxy through a Next.js API route:
+**Fix:** Proxy through a hardened Next.js API route. Do not forward arbitrary JSON-RPC: a public route
+without validation turns a private or quota-limited upstream into an open relay.
 
 ```typescript
 // app/api/rpc/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
 const RPC_URL = process.env.RITUAL_RPC_URL ?? "https://rpc.ritualfoundation.org";
+const MAX_BODY_BYTES = 100_000;
+const ALLOWED_METHODS = new Set([
+  "eth_blockNumber", "eth_call", "eth_chainId", "eth_estimateGas",
+  "eth_feeHistory", "eth_gasPrice", "eth_getBalance", "eth_getBlockByHash",
+  "eth_getBlockByNumber", "eth_getCode", "eth_getLogs",
+  "eth_getTransactionByHash", "eth_getTransactionCount",
+  "eth_getTransactionReceipt", "eth_maxPriorityFeePerGas",
+]);
+
+function rpcError(status: number, code: number, message: string, id: unknown = null) {
+  return NextResponse.json(
+    { jsonrpc: "2.0", error: { code, message }, id },
+    { status, headers: { "Cache-Control": "no-store" } },
+  );
+}
 
 export async function POST(req: NextRequest) {
-  const body = await req.json();
-  const res = await fetch(RPC_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return NextResponse.json(await res.json());
+  const declaredLength = Number(req.headers.get("content-length") ?? "0");
+  if (declaredLength > MAX_BODY_BYTES) return rpcError(413, -32600, "Request too large");
+
+  const raw = await req.text();
+  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) {
+    return rpcError(413, -32600, "Request too large");
+  }
+
+  let body: unknown;
+  try { body = JSON.parse(raw); } catch { return rpcError(400, -32700, "Parse error"); }
+  if (
+    !body || Array.isArray(body) || typeof body !== "object" ||
+    (body as any).jsonrpc !== "2.0" || typeof (body as any).method !== "string"
+  ) {
+    return rpcError(400, -32600, "Invalid JSON-RPC request");
+  }
+
+  const { method, id = null } = body as { method: string; id?: unknown };
+  if (!ALLOWED_METHODS.has(method)) return rpcError(403, -32601, "Method not allowed", id);
+
+  try {
+    const res = await fetch(RPC_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: raw,
+      cache: "no-store",
+      signal: AbortSignal.timeout(10_000),
+    });
+    return new NextResponse(await res.text(), {
+      status: res.status,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  } catch {
+    return rpcError(504, -32000, "RPC upstream unavailable", id);
+  }
 }
 ```
 
@@ -132,6 +176,9 @@ export const wagmiConfig = createConfig({
 ```
 
 Use the proxy when the RPC is not browser-accessible. The public `https://rpc.ritualfoundation.org` endpoint is browser-accessible.
+Keep batch requests disabled unless each item is validated and the batch size is capped. Add per-IP or
+per-session rate limiting at your CDN/edge layer, and extend `ALLOWED_METHODS` only for methods the UI
+actually needs. Never expose `admin_*`, `debug_*`, `personal_*`, or unlocked-account methods.
 
 ---
 
