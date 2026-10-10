@@ -222,12 +222,15 @@ function WalletBalance() {
 
   return (
     <div>
-      <p>Balance: {balance ? formatEther(balance) : '...'} RITUAL</p>
+      <p>Balance: {balance !== undefined ? formatEther(balance) : '...'} RITUAL</p>
       <p>Lock expires: block {lockExpiry?.toString() ?? '...'}</p>
     </div>
   );
 }
 ```
+
+Check for `undefined` rather than truthiness: `0n` is a successfully loaded zero balance, but it is
+falsy and would otherwise leave a newly funded account showing the loading placeholder.
 
 ## How Funds Flow
 
