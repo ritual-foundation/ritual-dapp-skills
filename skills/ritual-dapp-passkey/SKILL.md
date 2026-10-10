@@ -192,7 +192,8 @@ function extractP256PublicKey(attestation: AuthenticatorAttestationResponse): Ui
 ```typescript
 import { toHex } from 'viem';
 
-// Sign a transaction hash with the user's passkey
+// Request a WebAuthn assertion whose signed client data contains the transaction hash as its challenge.
+// The returned ECDSA signature covers authenticatorData || SHA-256(clientDataJSON), not txHash directly.
 async function signWithPasskey(
   txHash: Uint8Array,
   credentialId: string
@@ -456,7 +457,7 @@ import { encodeAbiParameters, decodeAbiParameters } from 'viem';
 ### 4b. Full Passkey Login Flow
 
 ```typescript
-import { keccak256, concat, toHex, toBytes, getAddress } from 'viem';
+import { keccak256, sha256, concat, toHex, toBytes, getAddress } from 'viem';
 
 async function passkeyLogin() {
   // 1. Request WebAuthn assertion
@@ -469,6 +470,20 @@ async function passkeyLogin() {
   }) as PublicKeyCredential;
 
   const response = assertion.response as AuthenticatorAssertionResponse;
+
+  // A WebAuthn signature is NOT a signature over `challenge` directly. First
+  // validate the signed client data, then reconstruct the message defined by
+  // WebAuthn: authenticatorData || SHA-256(clientDataJSON).
+  const clientDataJSON = new Uint8Array(response.clientDataJSON);
+  const clientData = JSON.parse(new TextDecoder().decode(clientDataJSON));
+  const returnedChallenge = new Uint8Array(base64UrlToBuffer(clientData.challenge));
+  const challengeMatches =
+    returnedChallenge.length === challenge.length &&
+    returnedChallenge.every((byte, index) => byte === challenge[index]);
+
+  if (clientData.type !== 'webauthn.get') throw new Error('Unexpected WebAuthn ceremony type');
+  if (clientData.origin !== window.location.origin) throw new Error('WebAuthn origin mismatch');
+  if (!challengeMatches) throw new Error('WebAuthn challenge mismatch');
 
   // 2. Extract signature components
   const { r, s } = parseDerSignature(new Uint8Array(response.signature));
@@ -486,9 +501,13 @@ async function passkeyLogin() {
 
   // 4. Verify signature on-chain (optional — the chain verifies TxPasskey natively)
   const pubkeyUncompressed = concat([toBytes('0x04'), toBytes(x), toBytes(y)]);
+  const webAuthnSignedMessage = concat([
+    new Uint8Array(response.authenticatorData),
+    toBytes(sha256(clientDataJSON)),
+  ]);
   const isValid = await verifyP256OnChain(
     toHex(pubkeyUncompressed),
-    toHex(challenge),
+    toHex(webAuthnSignedMessage),
     toHex(concat([r, normalizedS]))
   );
 
