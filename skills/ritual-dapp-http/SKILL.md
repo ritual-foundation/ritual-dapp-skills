@@ -1,6 +1,6 @@
 ---
 name: ritual-dapp-http
-description: HTTP call precompile patterns for Ritual dApps. Use when building dApps that fetch external data, call APIs, or interact with web services on-chain.
+description: HTTP call precompile patterns for Ritual dApps. Use when building dApps that fetch external data, call APIs, hydrate public or encrypted JSON from DA, route public or encrypted outputs, or stream upstream SSE.
 ---
 
 # HTTP Call Precompile — Ritual dApp Patterns
@@ -18,16 +18,17 @@ The HTTP Call precompile (`0x0801`) lets smart contracts on Ritual Chain make ex
 See `ritual-dapp-overview` for the full async lifecycle.
 
 **Constraints:**
-- **One short-running async call per transaction.** You cannot make two async precompile calls in one tx. Batch multiple HTTP needs into a single request (e.g., JSON-RPC batch). You CAN combine one HTTP call with synchronous precompiles (JQ, ONNX) in the same tx.
+- **One short-running async call per transaction.** You cannot make two async precompile calls in one tx. Batch multiple HTTP needs into a single request (e.g., JSON-RPC batch). You CAN combine one HTTP call with synchronous precompiles (JQ) in the same tx.
 - **Current network policy: one async commitment per sender per block.** If you submit two async transactions in the same block, only the first is included. Wait for receipt before sending the next.
 - **Use EIP-1559 fee fields in all examples.** Submit with `maxFeePerGas` and `maxPriorityFeePerGas`. If a legacy tx fails with `transaction type not supported`, switch to Type-2 fields.
 
 **Priority path for dApp agents (recommended order):**
 1. Plain HTTP (`0x0801`) GET/POST.
-2. HTTP result + JQ filter (`0x0803`) for deterministic extraction.
-3. Secret injection (request credentials).
-4. Response encryption (`userPublicKey`).
-5. dKMS payment path (x402 flows only).
+2. RITHTTP1 when the request needs DA hydration, post-hydration secrets, contract projection, storage fan-out, or selected SSE. For encrypted DA, per-pipe encryption, or private streams, read both RITHTTP1 references.
+3. HTTP result + JQ filter (`0x0803`) only for legacy calls that need deterministic extraction.
+4. Secret injection (request credentials).
+5. Response encryption (`userPublicKey`).
+6. dKMS payment path (x402 flows only).
 
 ```
 ┌──────────┐    call(0x0801)    ┌──────────────┐    HTTP request    ┌─────────────┐
@@ -49,14 +50,14 @@ Complete these steps before submitting any HTTP call transaction.
 
 ### Step 1: Find an Executor
 
-Query the `TEEServiceRegistry` for executors with `HTTP_CALL` capability. The `teeAddress` is what you pass as the `executor` field. The `publicKey` is needed if you encrypt secrets.
+Query the `TEEServiceRegistry` for executors with `HTTP_CALL` capability. The `teeAddress` is what you pass as the `executor` field. The `executorSecretsAuthPublicKey` is needed if you encrypt secrets.
 
 ```typescript
 import { createPublicClient, http, defineChain } from 'viem';
 import type { Address, Hex } from 'viem';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL || 'https://rpc.ritualfoundation.org'] } },
@@ -64,7 +65,7 @@ const ritualChain = defineChain({
 
 const publicClient = createPublicClient({ chain: ritualChain, transport: http() });
 
-const TEE_SERVICE_REGISTRY = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F' as const;
+const TEE_SERVICE_REGISTRY = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839' as const;
 const TEE_SERVICE_REGISTRY_ABI = [
   {
     inputs: [
@@ -79,9 +80,9 @@ const TEE_SERVICE_REGISTRY_ABI = [
           { name: 'paymentAddress', type: 'address' },
           { name: 'teeAddress', type: 'address' },
           { name: 'teeType', type: 'uint8' },
-          { name: 'publicKey', type: 'bytes' },
+          { name: 'executorSecretsAuthPublicKey', type: 'bytes' },
           { name: 'endpoint', type: 'string' }, // infra metadata only; not part of HTTPCallRequest payload
-          { name: 'certPubKeyHash', type: 'bytes32' },
+          { name: 'mTlsSpkiHash', type: 'bytes32' },
           { name: 'capability', type: 'uint8' },
         ]},
         { name: 'isValid', type: 'bool' },
@@ -105,7 +106,7 @@ const services = await publicClient.readContract({
 if (services.length === 0) throw new Error('No HTTP executors available');
 
 const executorAddress: Address = services[0].node.teeAddress;
-const executorPublicKey: Hex = services[0].node.publicKey as Hex;
+const executorPublicKey: Hex = services[0].node.executorSecretsAuthPublicKey as Hex;
 ```
 
 **Important:**
@@ -119,32 +120,32 @@ The executor charges a fee deducted from your `RitualWallet` balance. Deposit be
 ```typescript
 import { parseEther, formatEther } from 'viem';
 
-const RITUAL_WALLET = '0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948' as const;
+const RITUAL_WALLET = '0xF04076756d8129Baec46Dc0F1c526Baec490C393' as const;
 const RITUAL_WALLET_ABI = [
-  { inputs: [{ name: 'user', type: 'address' }], name: 'balanceOf', outputs: [{ type: 'uint256' }], stateMutability: 'view', type: 'function' },
-  { inputs: [{ name: 'lockDuration', type: 'uint256' }], name: 'deposit', outputs: [], stateMutability: 'payable', type: 'function' },
+  { inputs: [{ name: 'account', type: 'address' }], name: 'availableBalance', outputs: [{ type: 'uint256' }], stateMutability: 'view', type: 'function' },
+  { inputs: [], name: 'deposit', outputs: [], stateMutability: 'payable', type: 'function' },
 ] as const;
 
 const balance = await publicClient.readContract({
   address: RITUAL_WALLET,
   abi: RITUAL_WALLET_ABI,
-  functionName: 'balanceOf',
+  functionName: 'availableBalance',
   args: [account.address],
 });
 
-if (balance < parseEther('0.01')) {
+if (balance < parseEther('0.02')) {
   const hash = await walletClient.writeContract({
     address: RITUAL_WALLET,
     abi: RITUAL_WALLET_ABI,
     functionName: 'deposit',
-    args: [5000n],              // lock duration in blocks
+    args: [],
     value: parseEther('0.05'),
   });
   await publicClient.waitForTransactionReceipt({ hash });
 }
 ```
 
-**How much to deposit:** The executor fee formula is `BASE_FEE + (input_bytes × 0.35 gwei) + (output_bytes × 0.35 gwei)` where `BASE_FEE ≈ 0.0000025 RITUAL`. Start with `0.01` as a bootstrap example only. Real usage depends on payload/response sizes and endpoint behavior.
+**How much to deposit:** Keep at least ~0.02 RITUAL of `availableBalance` per call: admission reserves `BASE_FEE` (0.01 RIT, `1e16` wei) plus 0.35 gwei × (input bytes + 5,120 worst-case output bytes) plus the commitment/inclusion fees, so exactly 0.01 is rejected; the `0.05` deposit above is a bootstrap example. Real usage depends on payload/response sizes and endpoint behavior.
 
 ### Step 3: TTL Rules
 
@@ -156,11 +157,13 @@ The `ttl` field sets how many blocks the executor has to fulfill the request.
 
 ### Step 4: Understand Async Output
 
-Async precompile results are wrapped in an envelope: `(bytes simmedInput, bytes actualOutput)`.
+The Solidity precompile CALL return is wrapped as `(bytes simmedInput, bytes actualOutput)`. RPC receipt `spcCalls[i].output` already contains the bare `actualOutput`; do not unwrap it again.
 
 - **During `eth_call` simulation:** `actualOutput` is empty (`0x`). This is expected — the executor hasn't run yet.
-- **In a settled transaction receipt:** `actualOutput` contains the full HTTP response ABI.
-- **Always decode the envelope first**, then decode the inner response.
+- **In a settled transaction receipt (inline path, default):** when `output_storage_ref` is empty, `actualOutput` contains the full HTTP response ABI (the 5-field `HTTP_RESPONSE_ABI` below).
+- **In a settled transaction receipt (DA-output path):** when the request sets a non-empty `output_storage_ref`, the executor uploads the (ECIES-encrypted) ABI-encoded `HTTPCallResponse` off-chain and `actualOutput` is instead a **DA result envelope** `(bool has_error, string output_uri, bytes32 output_content_hash, uint64 output_size_bytes, string error_message)`. The consumer must decode the envelope, fetch the bytes from `output_uri`, verify the stored hash and size, ABI-decode the downloaded bytes as a single `bytes` value to extract the ciphertext, ECIES-decrypt it with the user private key, and ABI-decode the plaintext `HTTPCallResponse`.
+- **For a Solidity CALL return**, decode the envelope first. **For receipt `spcCalls[i].output`**, decode the response directly.
+- **RITHTTP1 is a third inner-result shape.** When `body` starts with `RITHTTP1`, keep the legacy outer `output_storage_ref` empty and decode settled `actualOutput` as the self-describing `RITOUT1` result. Do not try the legacy inline or DA-result decoder first.
 
 ---
 
@@ -200,14 +203,16 @@ const HTTP_METHOD = {
 Method code `0` is invalid and rejected by the chain.
 For bodyless methods, pass `body: '0x'`.
 
-### Request ABI (13 fields)
+### Request ABI (16 fields)
 
 ```typescript
 const HTTP_REQUEST_ABI = [
   { type: 'address' },   // executor — from TEEServiceRegistry.node.teeAddress
+  { type: 'address' },   // sponsor — RitualWallet account whose balance/escrow backs this async job (must be non-zero)
+  { type: 'address[]' }, // secretOwners — one non-zero owner per encrypted blob (parallel to encryptedSecrets/secretSignatures; all empty when [])
   { type: 'bytes[]' },   // encryptedSecrets — ECIES-encrypted secret blobs (or [])
   { type: 'uint256' },   // ttl — blocks until expiry (1–500)
-  { type: 'bytes[]' },   // secretSignatures — EIP-191 signatures over raw encrypted bytes (or [])
+  { type: 'bytes[]' },   // secretSignatures — EIP-191 owner signatures over the domain-separated secret authorization payload (not raw bytes), one per blob (or [])
   { type: 'bytes' },     // userPublicKey — for encrypted responses (or 0x)
   { type: 'string' },    // url — target URL (https:// required; supports SECRET_NAME templates)
   { type: 'uint8' },     // method — HTTP method code (1–7, see table above)
@@ -217,13 +222,39 @@ const HTTP_REQUEST_ABI = [
   { type: 'uint256' },   // dkmsKeyIndex — dKMS key derivation index (0 = not using dKMS)
   { type: 'uint8' },     // dkmsKeyFormat — dKMS key format (0 = default)
   { type: 'bool' },      // piiEnabled (independent executor-side service flag)
+  { type: 'tuple', components: [{ type: 'string' }, { type: 'string' }, { type: 'string' }] }, // output_storage_ref — DA output ref (platform, path, keyRef); ['','',''] = inline response
 ] as const;
 ```
 
-This skill uses the 13-field HTTP request layout shown above.
+This skill uses the single canonical 16-field HTTP request layout shown above. Decoders read the top-level field count and accept ONLY 16 fields.
+`output_storage_ref` is a `StorageRef` tuple `(platform, path, keyRef)`: `['','','']` returns the response inline (default), and a non-empty value routes the response off-chain as a DA result envelope (see below) and requires a valid 65-byte `userPublicKey` (`0x04` prefix). The RPC rejects a **partial ref** (`PartialStorageRef`): the tuple must be either fully empty or have **both** `platform` and `path` set (`keyRef` is optional; a `keyRef`-only or single-field tuple is rejected). Supported platforms: `gcs`, `hf`, `pinata` (plus `['','','']` for inline). Platform is enforced by the executor, not the RPC: any value other than `gcs`, `hf`, `pinata` is not a fallback to inline — the executor returns a DA error result (`hasError=true`, `errorMessage` containing `unsupported storage platform for client creation: <platform>`) and the call still settles at the normal byte-based executor fee (`BASE_FEE` + input bytes + the error envelope's bytes).
 `piiEnabled` is independent of both secret injection (`encryptedSecrets` + `secretSignatures`) and response encryption (`userPublicKey`).
 
-### Response ABI (5 fields)
+### RITHTTP1 body extension
+
+RITHTTP1 keeps this exact 16-field ABI and places a versioned envelope only in field 11, `body`. Use it to splice GCS/Hugging Face/Pinata JSON into any JSON node, expand `http:*` secrets after hydration, select a small contract result, fan out selected response fragments to storage, or relay upstream SSE.
+
+Read [`references/rithttp1.md`](references/rithttp1.md) before encoding one. It contains the `RITHTTP1`/`RITOUT1` layouts, a complete OpenAI-compatible DA-slot request, storage and secret alias rules, bounds, held-response behavior, and the compatibility gate.
+
+Also read [`references/rithttp1-private-io.md`](references/rithttp1-private-io.md) when any input artifact, buffered sink, or SSE stream must be private. It defines the multi-recipient input artifact, the four-field output-pipe schema, RITPIPE1 bindings and stream commitments, executor and user key roles, and the integrity work an untrusted application relay cannot perform for the user.
+
+For RITHTTP1, set `piiEnabled=false` and `output_storage_ref=['','','']`. The envelope's `outputs` explicitly route independent CONTRACT, STREAM and DA selections; selectors receive strings, so use `fromjson?` before JSON field lookup. Output privacy/encoding are per pipe. RITOUT1 encoding 4 returns indexed pipe results; inspect each success even when another pipe makes the aggregate result an error. Legacy bodies remain valid and keep every behavior documented below.
+
+### Private I/O decision path
+
+| Requirement | Use |
+|---|---|
+| Executor alone must read a DA input | Encrypt the artifact to the verified executor recipient key |
+| User also needs to recover that input | Add the user recipient key to the same artifact |
+| A user reads selected collected output | Set that CONTRACT/DA pipe's `recipientPublicKey` to the verified user key |
+| Outputs have different recipients or public metadata | Set each pipe's recipient key independently; empty bytes explicitly mean plaintext |
+| User receives a private stream before callback | Add a STREAM pipe with its recipient key, set `STREAM_RESPONSE` for upstream SSE, and verify its settled frame commitment before accepting content |
+
+When a relay submits on a user's behalf, encrypt large request fields as separate input artifacts, bind their ciphertext hashes and lengths in the signed request, and verify the route and executor key before upload. Use Long HTTP with `AWAIT_RESPONSE` for a held call, then verify the submitted transaction and `RITOUT1` settlement through an independent chain view.
+
+### Response ABI (5 fields) — inline path (default)
+
+Applies only when `output_storage_ref` is empty (the default). `actualOutput` decodes directly as:
 
 ```typescript
 const HTTP_RESPONSE_ABI = [
@@ -234,6 +265,22 @@ const HTTP_RESPONSE_ABI = [
   { type: 'string' },    // errorMessage — empty on success; set on executor/chain errors
 ] as const;
 ```
+
+### DA Result Envelope (5 fields) — DA-output path
+
+Applies when the request sets a non-empty `output_storage_ref`. The executor uploads `abi.encode(ciphertext)`, where the ECIES ciphertext encrypts the ABI-encoded `HTTPCallResponse` (the 5-field layout above), off-chain, and `actualOutput` decodes as this envelope instead:
+
+```typescript
+const DA_RESULT_ABI = [
+  { type: 'bool' },      // hasError — true if the executor could not produce/store the response
+  { type: 'string' },    // outputUri — where the stored bytes live (e.g. gs://..., hf://...)
+  { type: 'bytes32' },   // outputContentHash — sha256 of the stored encoded bytes (verify after fetch)
+  { type: 'uint64' },    // outputSizeBytes — size of the stored encoded bytes
+  { type: 'string' },    // errorMessage — set when hasError is true
+] as const;
+```
+
+To consume DA output: decode `actualOutput` with `DA_RESULT_ABI`, fetch the bytes from `outputUri`, verify their sha256 and length against `outputContentHash` and `outputSizeBytes`, ABI-decode the stored object as a single `bytes` value (`decodeAbiParameters([{ type: 'bytes' }], toHex(storedBytes))[0]`), ECIES-decrypt that ciphertext with the user private key, then decode the plaintext as `HTTP_RESPONSE_ABI`. DA output is fail-closed: it requires a valid 65-byte `userPublicKey` (uncompressed, `0x04` prefix).
 
 ---
 
@@ -249,6 +296,8 @@ import type { Address, Hex } from 'viem';
 
 interface HTTPRequestParams {
   executor: Address;
+  sponsor: Address;
+  secretOwners?: Address[];
   url: string;
   method: number;
   headerKeys?: string[];
@@ -261,11 +310,14 @@ interface HTTPRequestParams {
   dkmsKeyIndex?: bigint;
   dkmsKeyFormat?: number;
   piiEnabled?: boolean;
+  outputStorageRef?: [string, string, string];
 }
 
 function encodeHTTPRequest(params: HTTPRequestParams): Hex {
   return encodeAbiParameters(HTTP_REQUEST_ABI, [
     params.executor,
+    params.sponsor,
+    params.secretOwners ?? [],
     params.encryptedSecrets ?? [],
     params.ttl ?? 100n,
     params.secretSignatures ?? [],
@@ -278,13 +330,14 @@ function encodeHTTPRequest(params: HTTPRequestParams): Hex {
     params.dkmsKeyIndex ?? 0n,
     params.dkmsKeyFormat ?? 0,
     params.piiEnabled ?? false,
+    params.outputStorageRef ?? ['', '', ''],
   ]);
 }
 ```
 
 ### Decode Response
 
-Handles both simulation (`actualOutput` empty) and settled results:
+Decode receipt `spcCalls[i].output` directly. Pass `'call-return'` explicitly only when decoding the wrapped Solidity CALL return, including a simulation with empty `actualOutput`:
 
 ```typescript
 import { decodeAbiParameters } from 'viem';
@@ -301,16 +354,27 @@ type HTTPResult =
       errorMessage: string;
     };
 
-function decodeHTTPResponse(raw: Hex): HTTPResult {
-  const [simmedInput, actualOutput] = decodeAbiParameters(
-    [{ type: 'bytes' }, { type: 'bytes' }],
-    raw,
-  );
+function decodeHTTPResponse(
+  raw: Hex,
+  source: 'receipt' | 'call-return' = 'receipt',
+): HTTPResult {
+  let simmedInput: Hex = '0x';
+  let actualOutput: Hex = raw;
+  if (source === 'call-return') {
+    [simmedInput, actualOutput] = decodeAbiParameters(
+      [{ type: 'bytes' }, { type: 'bytes' }],
+      raw,
+    );
+  }
 
   if ((actualOutput as Hex) === '0x') {
     return { mode: 'simulation', simmedInput: simmedInput as Hex };
   }
 
+  // This helper handles the inline path only (output_storage_ref empty).
+  // If the request set a non-empty output_storage_ref, actualOutput is the DA
+  // result envelope (decode with DA_RESULT_ABI, fetch+verify, ABI-unpack the
+  // ciphertext bytes, then ECIES-decrypt the off-chain HTTPCallResponse) — not the inline 5-field response below.
   const [statusCode, headerKeys, headerValues, body, errorMessage] =
     decodeAbiParameters(HTTP_RESPONSE_ABI, actualOutput as Hex);
 
@@ -336,7 +400,7 @@ function parseResponseBody(body: Hex): string {
 
 ### Submit Request
 
-Wraps encoding + transaction submission so callers don't repeat fee fields:
+Wraps encoding + transaction submission so callers don't repeat fee fields. Supply a wallet client with its account and selected chain configured:
 
 ```typescript
 import type { WalletClient } from 'viem';
@@ -346,7 +410,10 @@ async function submitHTTPRequest(
   params: HTTPRequestParams,
   gas?: bigint,
 ): Promise<Hex> {
+  if (!walletClient.account) throw new Error('Wallet client must have an account configured');
   return walletClient.sendTransaction({
+    account: walletClient.account,
+    chain: walletClient.chain,
     to: HTTP_PRECOMPILE,
     data: encodeHTTPRequest(params),
     maxFeePerGas: 30_000_000_000n,
@@ -373,6 +440,7 @@ const walletClient = createWalletClient({ account, chain: ritualChain, transport
 
 const hash = await submitHTTPRequest(walletClient, {
   executor: executorAddress,
+  sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
   url: 'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd',
   method: HTTP_METHOD.GET,
   headerKeys: ['Accept'],
@@ -387,6 +455,7 @@ const receipt = await publicClient.waitForTransactionReceipt({ hash });
 ```typescript
 const hash = await submitHTTPRequest(walletClient, {
   executor: executorAddress,
+  sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
   url: 'https://api.example.com/data',
   method: HTTP_METHOD.POST,
   headerKeys: ['Content-Type'],
@@ -427,12 +496,19 @@ A single contract that handles GET and POST requests with short-running async re
 pragma solidity ^0.8.20;
 
 interface IRitualWallet {
-    function deposit(uint256 lockDuration) external payable;
+    function deposit() external payable;
+}
+
+// DA output reference appended to the HTTP request; empty ("","","") = inline response.
+struct StorageRef {
+    string platform;
+    string path;
+    string keyRef;
 }
 
 contract HTTPConsumer {
     address constant HTTP_PRECOMPILE = 0x0000000000000000000000000000000000000801;
-    address constant RITUAL_WALLET = 0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948;
+    address constant RITUAL_WALLET = 0xF04076756d8129Baec46Dc0F1c526Baec490C393;
 
     struct HTTPResponse {
         uint16 status;
@@ -446,7 +522,7 @@ contract HTTPConsumer {
     event RequestFailed(string error);
 
     function depositForFees() external payable {
-        IRitualWallet(RITUAL_WALLET).deposit{value: msg.value}(5000);
+        IRitualWallet(RITUAL_WALLET).deposit{value: msg.value}();
     }
 
     function _makeHTTPCall(bytes memory input)
@@ -456,7 +532,12 @@ contract HTTPConsumer {
         (bool success, bytes memory rawOutput) = HTTP_PRECOMPILE.call(input);
         require(success, "Precompile call failed");
         (, bytes memory actualOutput) = abi.decode(rawOutput, (bytes, bytes));
-        return abi.decode(actualOutput, (HTTPResponse));
+        // Inline-output path only: when output_storage_ref is set, actualOutput is the
+        // DA result envelope (bool,string,bytes32,uint64,string) — not an HTTPResponse.
+        HTTPResponse memory response;
+        (response.status, response.headerKeys, response.headerValues, response.body, response.errorMessage) =
+            abi.decode(actualOutput, (uint16, string[], string[], bytes, string));
+        return response;
     }
 
     function _emitResult(HTTPResponse memory resp)
@@ -473,20 +554,23 @@ contract HTTPConsumer {
 
     function fetchGET(
         address executor,
+        address sponsor,
         uint256 ttl,
         string calldata url
     ) external returns (uint16, bytes memory) {
         bytes memory input = abi.encode(
-            executor, new bytes[](0), ttl, new bytes[](0), bytes(""),
+            executor, sponsor, new address[](0), new bytes[](0), ttl, new bytes[](0), bytes(""),
             url, uint8(1),
             new string[](0), new string[](0), bytes(""),
-            uint256(0), uint8(0), false
+            uint256(0), uint8(0), false,
+            StorageRef("", "", "")
         );
         return _emitResult(_makeHTTPCall(input));
     }
 
     function fetchPOST(
         address executor,
+        address sponsor,
         uint256 ttl,
         string calldata url,
         string calldata jsonBody
@@ -497,10 +581,11 @@ contract HTTPConsumer {
         hv[0] = "application/json";
 
         bytes memory input = abi.encode(
-            executor, new bytes[](0), ttl, new bytes[](0), bytes(""),
+            executor, sponsor, new address[](0), new bytes[](0), ttl, new bytes[](0), bytes(""),
             url, uint8(2),
             hk, hv, bytes(jsonBody),
-            uint256(0), uint8(0), false
+            uint256(0), uint8(0), false,
+            StorageRef("", "", "")
         );
         return _emitResult(_makeHTTPCall(input));
     }
@@ -520,28 +605,67 @@ Use this when you need API keys/tokens inside URL/headers/body without exposing 
 
 ```typescript
 import { encrypt, ECIES_CONFIG } from 'eciesjs';
-import { hexToBytes } from 'viem';
+import { toHex, hexToBytes, concat, toBytes, pad, keccak256, stringToBytes, getAddress } from 'viem';
 
 ECIES_CONFIG.symmetricNonceLength = 12; // see ritual-dapp-secrets
 
-function encryptSecret(secretValue: string, executorPubKey: Hex): Hex {
+// Encrypt the owner-bound envelope, NOT the bare value. The executor json-parses the
+// decrypted bytes and rejects any blob whose secret_owner != the secret_owners[i] you
+// declare in the request (see ritual-dapp-secrets buildSecretEnvelope; executor-go
+// secretEnvelope in internal/utils/ecies.go: {version, secret_owner, secrets}).
+function encryptSecret(key: string, value: string, owner: Address, executorPubKey: Hex): Hex {
+  const envelope = JSON.stringify({ secret_owner: getAddress(owner), secrets: { [key]: value }, version: 1 });
   const pubKeyBytes = Buffer.from(executorPubKey.slice(2), 'hex');
-  return toHex(encrypt(pubKeyBytes, Buffer.from(secretValue)));
+  return toHex(encrypt(pubKeyBytes, Buffer.from(envelope)));
 }
 
-const encryptedApiKey = encryptSecret('sk-live-abc123', executorPublicKey);
+const ownerAddress = account.address; // the secret owner whose signature authorizes this blob
+const encryptedApiKey = encryptSecret('API_KEY', 'sk-live-abc123', ownerAddress, executorPublicKey);
 
-// Sign raw encrypted bytes (NOT hash). Executor verifies EIP-191 over raw bytes.
-const signature = await walletClient.signMessage({
-  message: { raw: hexToBytes(encryptedApiKey) },
-});
+// Sign the domain-separated secret-authorization payload (NOT the raw encrypted bytes).
+// The executor verifies EIP-191 over THIS payload and matches the signer to secret_owners[i].
+// Layout: domain || uint16(len(useContext)) || useContext || uint256(chainId)
+//         || executor(20) || owner(20) || keccak256(encryptedSecrets)
+const SECRET_AUTHORIZATION_DOMAIN = 'RITUAL_SECRET_AUTHORIZATION_V1';
+const HTTP_USE_CONTEXT = 'precompile:0x0000000000000000000000000000000000000801';
+
+function buildSecretAuthorizationPayload(
+  chainId: bigint,
+  useContext: string,
+  executor: Address,
+  owner: Address,
+  encryptedSecrets: Hex,
+): Uint8Array {
+  const ctxBytes = stringToBytes(useContext);
+  const ctxLen = new Uint8Array([(ctxBytes.length >> 8) & 0xff, ctxBytes.length & 0xff]);
+  return concat([
+    stringToBytes(SECRET_AUTHORIZATION_DOMAIN),
+    ctxLen,
+    ctxBytes,
+    pad(toBytes(chainId), { size: 32 }),
+    hexToBytes(executor),
+    hexToBytes(owner),
+    keccak256(hexToBytes(encryptedSecrets), 'bytes'),
+  ]);
+}
+
+const payload = buildSecretAuthorizationPayload(
+  BigInt(ritualChain.id),
+  HTTP_USE_CONTEXT,
+  executorAddress,
+  ownerAddress,
+  encryptedApiKey,
+);
+const signature = await walletClient.signMessage({ message: { raw: payload } });
 
 const hash = await submitHTTPRequest(walletClient, {
   executor: executorAddress,
+  sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
   url: 'https://api.openai.com/v1/models',
   method: HTTP_METHOD.GET,
   headerKeys: ['Authorization'],
   headerValues: ['Bearer API_KEY'],
+  secretOwners: [ownerAddress],
   encryptedSecrets: [encryptedApiKey],
   secretSignatures: [signature],
 });
@@ -562,6 +686,7 @@ Use this when you want the HTTP response encrypted before being returned from ex
 ```typescript
 const hash = await submitHTTPRequest(walletClient, {
   executor: executorAddress,
+  sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
   url: 'https://api.example.com/private',
   method: HTTP_METHOD.GET,
   userPublicKey: myPublicKey, // 65-byte uncompressed key (0x04...)
@@ -572,7 +697,7 @@ const hash = await submitHTTPRequest(walletClient, {
 
 ## 7. JQ Post-Processing
 
-Combine an HTTP call with the JQ precompile (`0x0803`) to filter JSON responses on-chain.
+Combine an HTTP call with the JQ precompile (`0x0803`) to filter JSON responses on-chain. Check the [JQ query compatibility notes](../ritual-dapp-precompiles/SKILL.md#query-compatibility-and-silent-failures) before choosing filters: some operations return empty output without reverting.
 
 ### Pattern: HTTP → JQ
 
@@ -580,6 +705,7 @@ Combine an HTTP call with the JQ precompile (`0x0803`) to filter JSON responses 
 // Step 1: Submit the HTTP call (async — returns after settlement)
 const hash = await submitHTTPRequest(walletClient, {
   executor: executorAddress,
+  sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
   url: 'https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=usd,eur',
   method: HTTP_METHOD.GET,
   headerKeys: ['Accept'],
@@ -599,20 +725,31 @@ contract HTTPWithJQ {
     address constant HTTP_PRECOMPILE = 0x0000000000000000000000000000000000000801;
     address constant JQ_PRECOMPILE   = 0x0000000000000000000000000000000000000803;
 
+    // DA output reference appended to the HTTP request; empty ("","","") = inline response.
+    struct StorageRef {
+        string platform;
+        string path;
+        string keyRef;
+    }
+
     function fetch(
         address executor,
+        address sponsor,
         string calldata url
     ) external returns (bytes memory body) {
         bytes memory input = abi.encode(
-            executor, new bytes[](0), uint256(100),
+            executor, sponsor, new address[](0), new bytes[](0), uint256(100),
             new bytes[](0), bytes(""),
             url, uint8(1),
             new string[](0), new string[](0), bytes(""),
-            uint256(0), uint8(0), false
+            uint256(0), uint8(0), false,
+            StorageRef("", "", "")
         );
         (bool ok, bytes memory rawOutput) = HTTP_PRECOMPILE.call(input);
         require(ok, "HTTP call failed");
         (, bytes memory actualOutput) = abi.decode(rawOutput, (bytes, bytes));
+        // Inline-output path only: this 5-field decode is valid when output_storage_ref is empty.
+        // For DA-output requests actualOutput is the DA result envelope (bool,string,bytes32,uint64,string).
         (, , , body, ) = abi.decode(actualOutput, (uint16, string[], string[], bytes, string));
     }
 }
@@ -636,10 +773,11 @@ For complete dKMS and payment flows, see `ritual-dapp-x402` and `ritual-dapp-pre
 ```typescript
 const hash = await submitHTTPRequest(walletClient, {
   executor: executorAddress,
+  sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
   url: 'https://api.example.com/paywalled-resource',
   method: HTTP_METHOD.GET,
   dkmsKeyIndex: 1n,
-  dkmsKeyFormat: 1, // use actual chain-supported format for your deployment
+  dkmsKeyFormat: 1, // 1 = secp256k1 (the supported format)
   ttl: 100n,
 });
 ```
@@ -660,6 +798,7 @@ All examples use the `encodeHTTPRequest` helper from section 3.
 async function fetchTokenPrice(tokenId: string) {
   return submitHTTPRequest(walletClient, {
     executor: executorAddress,
+    sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
     url: `https://api.coingecko.com/api/v3/simple/price?ids=${tokenId}&vs_currencies=usd`,
     method: HTTP_METHOD.GET,
     headerKeys: ['Accept'],
@@ -675,11 +814,13 @@ async function fetchTokenPrice(tokenId: string) {
 async function triggerSlackWebhook(payload: Record<string, unknown>) {
   return submitHTTPRequest(walletClient, {
     executor: executorAddress,
+    sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
     url: 'https://hooks.slack.com/services/SLACK_TOKEN',
     method: HTTP_METHOD.POST,
     headerKeys: ['Content-Type'],
     headerValues: ['application/json'],
     body: toHex(JSON.stringify(payload)),
+    secretOwners: [slackTokenOwner], // non-zero owner, one per blob (parallel to encryptedSecrets/secretSignatures)
     encryptedSecrets: [encryptedSlackToken],
     secretSignatures: [slackTokenSignature],
     ttl: 50n,
@@ -693,8 +834,10 @@ async function triggerSlackWebhook(payload: Record<string, unknown>) {
 async function verifyEtherscanBalance(contractAddress: string) {
   return submitHTTPRequest(walletClient, {
     executor: executorAddress,
+    sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
     url: `https://api.etherscan.io/api?module=account&action=balance&address=${contractAddress}&apikey=ETHERSCAN_KEY`,
     method: HTTP_METHOD.GET,
+    secretOwners: [etherscanKeyOwner], // non-zero owner, one per blob (parallel to encryptedSecrets/secretSignatures)
     encryptedSecrets: [encryptedEtherscanKey],
     secretSignatures: [etherscanKeySignature],
     ttl: 100n,
@@ -712,6 +855,7 @@ async function aggregatePrices(urls: string[]) {
     urls.map((url) =>
       submitHTTPRequest(walletClient, {
         executor: executorAddress,
+        sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
         url,
         method: HTTP_METHOD.GET,
         ttl: 100n,
@@ -773,6 +917,7 @@ async function httpCallWithRetry(url: string, maxRetries = 3) {
     try {
       return await submitHTTPRequest(walletClient, {
         executor: executorAddress,
+        sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
         url,
         method: HTTP_METHOD.GET,
         ttl: BigInt(100 + attempt * 50),
@@ -804,9 +949,11 @@ async function httpCallWithRetry(url: string, maxRetries = 3) {
 executor_fee = BASE_FEE + (input_bytes × INPUT_RATE) + (estimated_output_bytes × OUTPUT_RATE)
 
 Where (from chain source):
-  BASE_FEE    = 2,500,000,000,000 wei  (0.0000025 RITUAL)
+  BASE_FEE    = 10,000,000,000,000,000 wei  (0.01 RITUAL)
   INPUT_RATE  = 350,000,000 wei/byte    (0.35 gwei/byte)
   OUTPUT_RATE = 350,000,000 wei/byte    (0.35 gwei/byte)
+
+Wallet admission reserves the worst case (HTTP_CALL_MAX_OUTPUT_BYTES = 5,120 output bytes); settlement charges actual bytes.
 ```
 
 The fee is deducted from your `RitualWallet` balance, not from the transaction's gas payment.
@@ -823,7 +970,9 @@ A `gas: 2_000_000n` limit is sufficient for all standard HTTP calls.
 
 ### Output Size Limits
 
-> **Version-sensitive note:** Some network versions use a higher runtime output cap (for execution) than fee-estimation cap (for deposit sizing). Plan deposits conservatively for large responses.
+> Size deposits against the fee-estimation cap (5 KiB, `HTTP_CALL_MAX_OUTPUT_BYTES`); the runtime execution cap can differ per deployment, so plan deposits conservatively for large responses.
+
+> **DA upload cap:** When an HTTP response is stored via DA (`output_storage_ref` set), the executor rejects encoded outputs larger than `HTTPDAMaxOutputBytes = 10 * 1024 * 1024` (10 MiB) before upload, failing with `"HTTP response size %d exceeds executor DA upload cap %d"`. If you expect responses near this ceiling, keep them under 10 MiB or chunk the request.
 
 ### Deposit Workflow
 
@@ -849,6 +998,7 @@ type HTTPCallState =
 
 interface UseHTTPCallOptions {
   executor: Address;
+  sponsor: Address;
   ttl?: bigint;
   gasLimit?: bigint;
 }
@@ -883,6 +1033,7 @@ export function useHTTPCall(options: UseHTTPCallOptions) {
           to: HTTP_PRECOMPILE,
           data: encodeHTTPRequest({
             executor: options.executor,
+            sponsor: options.sponsor,
             url,
             method: HTTP_METHOD[method],
             headerKeys: Object.keys(headers),
@@ -919,8 +1070,8 @@ export function useHTTPCall(options: UseHTTPCallOptions) {
 ### Usage
 
 ```tsx
-function PriceFetcher({ executor }: { executor: Address }) {
-  const { state, execute, reset } = useHTTPCall({ executor, ttl: 100n });
+function PriceFetcher({ executor, sponsor }: { executor: Address; sponsor: Address }) {
+  const { state, execute, reset } = useHTTPCall({ executor, sponsor, ttl: 100n });
 
   return (
     <div>
@@ -959,17 +1110,18 @@ Brings together executor lookup, deposit, secret encryption, request submission,
 ```typescript
 import {
   createPublicClient, createWalletClient, http, defineChain,
-  parseEther, toHex, hexToBytes,
+  parseEther, toHex, hexToBytes, concat, toBytes, pad, keccak256, stringToBytes, getAddress,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { encrypt, ECIES_CONFIG } from 'eciesjs';
 import type { Hex, Address } from 'viem';
 
 ECIES_CONFIG.symmetricNonceLength = 12; // see ritual-dapp-secrets
+// buildSecretAuthorizationPayload is defined in section 6.1 (signs the domain-separated secret-authorization payload).
 
 async function main() {
   const ritualChain = defineChain({
-    id: 1979,
+    id: 784,
     name: 'Ritual',
     nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
     rpcUrls: { default: { http: ['https://rpc.ritualfoundation.org'] } },
@@ -981,7 +1133,7 @@ async function main() {
 
   // 1. Find executor (see section 1 for full TEE_SERVICE_REGISTRY_ABI)
   const services = await publicClient.readContract({
-    address: '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F',
+    address: '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839',
     abi: TEE_SERVICE_REGISTRY_ABI,
     functionName: 'getServicesByCapability',
     args: [0, true],
@@ -989,32 +1141,53 @@ async function main() {
   if (services.length === 0) throw new Error('No HTTP executors available');
 
   const executorAddress = services[0].node.teeAddress;
-  const executorPublicKey = services[0].node.publicKey as Hex;
+  const executorPublicKey = services[0].node.executorSecretsAuthPublicKey as Hex;
 
   // 2. Deposit fees
-  const RITUAL_WALLET = '0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948' as const;
+  const RITUAL_WALLET = '0xF04076756d8129Baec46Dc0F1c526Baec490C393' as const;
   const depositHash = await walletClient.writeContract({
     address: RITUAL_WALLET,
-    abi: [{ inputs: [{ name: 'lockDuration', type: 'uint256' }], name: 'deposit', outputs: [], stateMutability: 'payable', type: 'function' }],
+    abi: [{ inputs: [], name: 'deposit', outputs: [], stateMutability: 'payable', type: 'function' }],
     functionName: 'deposit',
-    args: [5000n],
-    value: parseEther('0.01'),
+    args: [],
+    value: parseEther('0.05'),
   });
   await publicClient.waitForTransactionReceipt({ hash: depositHash });
 
   // 3. Encrypt API key
-  function encryptSecret(secret: string, pubKey: Hex): Hex {
-    return toHex(encrypt(Buffer.from(pubKey.slice(2), 'hex'), Buffer.from(secret)));
+  // Encrypt the owner-bound envelope, NOT the bare value. The executor json-parses the
+  // decrypted bytes and rejects any blob whose secret_owner != the secret_owners[i] you
+  // declare in the request (executor-go secretEnvelope in internal/utils/ecies.go:
+  // {version, secret_owner, secrets}). secret_owner must equal ownerAddress below.
+  function encryptSecret(key: string, value: string, owner: Address, pubKey: Hex): Hex {
+    const envelope = JSON.stringify({ secret_owner: getAddress(owner), secrets: { [key]: value }, version: 1 });
+    return toHex(encrypt(Buffer.from(pubKey.slice(2), 'hex'), Buffer.from(envelope)));
   }
 
-  const encryptedKey = encryptSecret(process.env.API_KEY!, executorPublicKey);
-  const sig = await walletClient.signMessage({ message: { raw: hexToBytes(encryptedKey) } });
+  const encryptedKey = encryptSecret('API_KEY', process.env.API_KEY!, account.address, executorPublicKey);
+
+  // Sign the domain-separated secret-authorization payload (NOT the raw encrypted bytes):
+  // domain('RITUAL_SECRET_AUTHORIZATION_V1') || uint16(len(ctx)) || ctx || uint256(chainId)
+  //   || executor(20) || owner(20) || keccak256(encryptedKey)
+  // ctx = 'precompile:0x0000000000000000000000000000000000000801' (the HTTP precompile use-context).
+  // The executor verifies EIP-191 over this payload and matches the signer to secret_owners[i].
+  const ownerAddress = account.address;
+  const sigPayload = buildSecretAuthorizationPayload(
+    BigInt(ritualChain.id),
+    'precompile:0x0000000000000000000000000000000000000801',
+    executorAddress,
+    ownerAddress,
+    encryptedKey,
+  );
+  const sig = await walletClient.signMessage({ message: { raw: sigPayload } });
 
   // 4. Submit HTTP request with secrets
   const hash = await submitHTTPRequest(walletClient, {
     executor: executorAddress,
+    sponsor: account.address, // RitualWallet account backing async fees (often the caller itself; must be non-zero)
     url: 'https://pro-api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd&x_cg_pro_api_key=API_KEY',
     method: HTTP_METHOD.GET,
+    secretOwners: [ownerAddress],
     encryptedSecrets: [encryptedKey],
     secretSignatures: [sig],
     ttl: 100n,
@@ -1035,11 +1208,11 @@ main().catch(console.error);
 | Item | Value |
 |------|-------|
 | Precompile address | `0x0000000000000000000000000000000000000801` |
-| RitualWallet | `0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948` |
-| TEEServiceRegistry | `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` |
-| Chain ID | 1979 |
+| RitualWallet | `0xF04076756d8129Baec46Dc0F1c526Baec490C393` |
+| TEEServiceRegistry | `0xf4495DC72143D44A93AB0ecE4d6D63a216b27839` |
+| Chain ID | 784 |
 | Transaction submission | Use EIP-1559 fee fields (`maxFeePerGas`, `maxPriorityFeePerGas`) |
-| Executor fee (base) | 0.0000025 RITUAL (2.5e12 wei) |
+| Executor fee (base) | 0.01 RITUAL (1e16 wei) |
 | Executor fee (per byte) | 0.35 gwei/byte input + 0.35 gwei/byte output |
 | Gas formula | 33,000 + (input_bytes × 16) + (output_bytes × 16) |
 | Recommended gas limit | 2,000,000 |

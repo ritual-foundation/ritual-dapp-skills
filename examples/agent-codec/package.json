@@ -1,0 +1,6 @@
+{
+  "name": "ritual-documented-agent-codec-tests",
+  "private": true,
+  "scripts": { "test": "bun test" },
+  "dependencies": { "eciesjs": "^0.5.0", "viem": "^2.21.0" }
+}

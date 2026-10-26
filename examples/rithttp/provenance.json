@@ -1,0 +1,29 @@
+[
+  {
+    "file": "RITHTTP1.sol",
+    "role": "Consumer ABI codec adapted locally to executor output-pipe interface",
+    "protocol_repository": "ritual-net/executor-go-internal",
+    "protocol_commit": "75c04e3423933887aec74ceea378ce214f01f95c",
+    "protocol_paths": [
+      "internal/rithttp/protocol.go",
+      "internal/rithttp/output.go",
+      "internal/rithttp/pipes.go"
+    ],
+    "sha256": "520a09dae9572d7d22c3646e45e907ca7cf27ca1f11477661f04ac4badfa0479"
+  },
+  {
+    "file": "testdata/private_io_vectors.json",
+    "upstream_repository": "ritual-go-common",
+    "upstream_commit": "ed73a3f765d8f3762013b32cb8b373d9009fb204",
+    "upstream_path": "rithttp/testdata/private_io_vectors.json",
+    "sha256": "b5ff13a0a263a42b009d66a71d91fcf85d0908922f5e4c97004207b61e2b3dac"
+  },
+  {
+    "file": "testdata/output_pipe_vectors.json",
+    "upstream_repository": "ritual-net/executor-go-internal",
+    "upstream_commit": "75c04e3423933887aec74ceea378ce214f01f95c",
+    "common_commit": "ed73a3f765d8f3762013b32cb8b373d9009fb204",
+    "generator": "testdata/generate-executor-vectors_test.go",
+    "sha256": "8f7a83c01f5212de7c8a04f670d2a1789263c5a9a8c2044c076793f4718fcdca"
+  }
+]

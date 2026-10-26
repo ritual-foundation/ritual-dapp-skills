@@ -16,7 +16,7 @@ Ritual Chain has **native passkey support** at two levels:
 This enables passwordless wallets, biometric authentication, and hardware security key flows — all settled natively on Ritual Chain with no ERC-4337 overhead.
 
 **Precompile address**: `0x0000000000000000000000000000000000000100`
-**Chain ID**: 1979 (Ritual Chain)
+**Chain ID**: 784 (Ritual Chain)
 **Transaction type**: Synchronous (native, single-block, gas-only)
 
 ### How It Works
@@ -204,7 +204,7 @@ async function signWithPasskey(
 }> {
   const assertion = await navigator.credentials.get({
     publicKey: {
-      challenge: txHash,  // the EIP-191/EIP-712 hash to sign
+      challenge: new Uint8Array(txHash), // owned ArrayBuffer for WebAuthn BufferSource
       allowCredentials: [{
         id: base64UrlToBuffer(credentialId),
         type: 'public-key',
@@ -322,14 +322,15 @@ function verifyP256(
 
 **Key difference from RIP-7212**: The production precompile takes a **raw message** (internally hashed with SHA-256 by the precompile), NOT a pre-hashed message. The pubkey can be compressed (33 bytes) or uncompressed (65 bytes with `0x04` prefix).
 
-### 3b. PrecompileConsumer Helper
+### 3b. Self-Contained Registered-Key Verifier
 
-The `PrecompileConsumer` base contract provides a convenience wrapper:
+This complete contract calls the native precompile directly and has no imported dependencies:
 
 ```solidity
-import {PrecompileConsumer} from "ritual-sc/utils/PrecompileConsumer.sol";
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
 
-contract PasskeyVerifier is PrecompileConsumer {
+contract PasskeyVerifier {
     mapping(address => bytes) public registeredKeys; // address → compressed pubkey
 
     function registerKey(bytes calldata compressedPubkey) external {
@@ -341,81 +342,21 @@ contract PasskeyVerifier is PrecompileConsumer {
         address user,
         bytes calldata message,
         bytes calldata signature
-    ) external returns (bool) {
+    ) external view returns (bool) {
         bytes memory pubkey = registeredKeys[user];
         require(pubkey.length > 0, "No key registered");
 
         bytes memory input = abi.encode(pubkey, message, signature);
-        bytes memory result = callSECP256R1SigVer(input);
+        (bool ok, bytes memory result) = address(0x0100).staticcall(input);
+        if (!ok || result.length != 32) return false;
         return abi.decode(result, (uint256)) == 1;
     }
 }
 ```
 
-### 3c. Using Solady P256 Library
+### 3c. Solady Compatibility
 
-Ritual's smart contract repo vendors Solady's `P256.sol` which wraps the RIP-7212 precompile at `0x0100` with malleability protection:
-
-```solidity
-import {P256} from "solady/utils/P256.sol";
-
-contract PasskeyGate {
-    struct PasskeyCredential {
-        uint256 pubKeyX;
-        uint256 pubKeyY;
-    }
-
-    mapping(address => PasskeyCredential) public credentials;
-
-    function register(uint256 x, uint256 y) external {
-        credentials[msg.sender] = PasskeyCredential(x, y);
-    }
-
-    function verify(bytes32 hash, bytes32 r, bytes32 s) external view returns (bool) {
-        PasskeyCredential memory cred = credentials[msg.sender];
-        // verifySignature enforces low-s (malleability protection)
-        return P256.verifySignature(hash, uint256(r), uint256(s), cred.pubKeyX, cred.pubKeyY);
-    }
-}
-```
-
-**Note**: Solady's `P256.verifySignature` expects a **pre-hashed** message (bytes32), matching the RIP-7212 spec. If you need raw-message verification, use the ABI-encoded sigver precompile directly (Section 3a).
-
-### 3d. Using Solady WebAuthn Library
-
-For full WebAuthn assertion verification on-chain:
-
-```solidity
-import {WebAuthn} from "solady/utils/WebAuthn.sol";
-
-contract WebAuthnVerifier {
-    struct StoredCredential {
-        uint256 pubKeyX;
-        uint256 pubKeyY;
-    }
-
-    mapping(bytes32 => StoredCredential) public credentials; // credentialId → key
-
-    function registerCredential(bytes32 credentialId, uint256 x, uint256 y) external {
-        credentials[credentialId] = StoredCredential(x, y);
-    }
-
-    function verifyAssertion(
-        bytes32 credentialId,
-        bytes32 challenge,
-        WebAuthn.WebAuthnAuth calldata auth
-    ) external view returns (bool) {
-        StoredCredential memory cred = credentials[credentialId];
-        return WebAuthn.verify(
-            abi.encodePacked(challenge), // expected challenge bytes
-            true,                        // requireUserVerification
-            auth,
-            cred.pubKeyX,
-            cred.pubKeyY
-        );
-    }
-}
-```
+Solady's `P256` and `WebAuthn` helpers call `0x0100` using the raw 160-byte RIP-7212 format. Ritual's `0x0100` accepts ABI-encoded `(bytes pubkey, bytes message, bytes signature)` instead, so those helpers cannot be used directly. For P256 verification, use the native ABI helper in Section 3a or the registered-key example in Section 3b. Native transaction passkey/WebAuthn authentication is a separate path from calling this precompile.
 
 ---
 
@@ -470,6 +411,15 @@ async function passkeyLogin() {
 
   const response = assertion.response as AuthenticatorAssertionResponse;
 
+  const clientData = JSON.parse(new TextDecoder().decode(response.clientDataJSON));
+  const returnedChallenge = new Uint8Array(base64UrlToBuffer(clientData.challenge));
+  if (clientData.type !== 'webauthn.get') throw new Error('Unexpected WebAuthn ceremony type');
+  if (clientData.origin !== window.location.origin) throw new Error('WebAuthn origin mismatch');
+  if (returnedChallenge.length !== challenge.length ||
+      !returnedChallenge.every((byte, index) => byte === challenge[index])) {
+    throw new Error('WebAuthn challenge mismatch');
+  }
+
   // 2. Extract signature components
   const { r, s } = parseDerSignature(new Uint8Array(response.signature));
   const normalizedS = normalizeS(s);
@@ -486,9 +436,13 @@ async function passkeyLogin() {
 
   // 4. Verify signature on-chain (optional — the chain verifies TxPasskey natively)
   const pubkeyUncompressed = concat([toBytes('0x04'), toBytes(x), toBytes(y)]);
+  const clientDataHash = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', response.clientDataJSON)
+  );
+  const signedMessage = concat([new Uint8Array(response.authenticatorData), clientDataHash]);
   const isValid = await verifyP256OnChain(
     toHex(pubkeyUncompressed),
-    toHex(challenge),
+    toHex(signedMessage),
     toHex(concat([r, normalizedS]))
   );
 
@@ -632,6 +586,8 @@ contract HybridMultisig {
 
 ### 7a. Foundry Unit Test
 
+From the skills repository root, run `python3 scripts/test_passkey_example.py` with `forge` on `PATH` to compile the literal registered-key example in Section 3b and check valid, invalid, empty, malformed and reverting responses, missing registration and key length. This uses controlled native-precompile responses; live verification still requires your selected Ritual RPC.
+
 ```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
@@ -692,7 +648,7 @@ contract PasskeyPrecompileTest is Test {
 import { describe, it, expect } from 'vitest';
 import { createPublicClient, http, defineChain, encodeAbiParameters, decodeAbiParameters } from 'viem';
 
-// Use ritualChain from @/lib/chain (Chain ID 1979, RPC: https://rpc.ritualfoundation.org)
+// Use ritualChain from @/lib/chain (Chain ID 784, RPC: https://rpc.ritualfoundation.org)
 
 describe('SECP256R1 Precompile', () => {
   const client = createPublicClient({ chain: ritualChain, transport: http() });
@@ -812,17 +768,22 @@ function join32ByteParts(a: Uint8Array, b: Uint8Array): `0x${string}` {
   return toHex(combined);
 }
 
+// RLP integers use minimal big-endian bytes; zero is the empty byte string.
+function rlpInteger(value: bigint | number): `0x${string}` {
+  return BigInt(value) === 0n ? '0x' : toHex(value);
+}
+
 function encodeTxPasskeySigningPayload(tx: TxPasskeyBase): `0x${string}` {
   return concatHex([
     '0x77',
     toRlp([
-      tx.chainId,
-      tx.nonce,
-      tx.maxPriorityFeePerGas,
-      tx.maxFeePerGas,
-      tx.gasLimit,
+      rlpInteger(tx.chainId),
+      rlpInteger(tx.nonce),
+      rlpInteger(tx.maxPriorityFeePerGas),
+      rlpInteger(tx.maxFeePerGas),
+      rlpInteger(tx.gasLimit),
       tx.to ?? '0x',
-      tx.value,
+      rlpInteger(tx.value),
       tx.data,
       tx.accessList,
     ]),
@@ -844,16 +805,16 @@ function encodeSignedWebAuthnTxPasskey(
   return concatHex([
     '0x77',
     toRlp([
-      tx.chainId,
-      tx.nonce,
-      tx.maxPriorityFeePerGas,
-      tx.maxFeePerGas,
-      tx.gasLimit,
+      rlpInteger(tx.chainId),
+      rlpInteger(tx.nonce),
+      rlpInteger(tx.maxPriorityFeePerGas),
+      rlpInteger(tx.maxFeePerGas),
+      rlpInteger(tx.gasLimit),
       tx.to ?? '0x',
-      tx.value,
+      rlpInteger(tx.value),
       tx.data,
       tx.accessList,
-      sig.sigType,
+      rlpInteger(sig.sigType),
       signatureRs,
       publicKeyXy,
       toHex(sig.authenticatorData),
@@ -946,7 +907,7 @@ The complete user journey from zero to passkey-controlled Ritual address:
 8. Display address to user — "Your Ritual address is 0x..."
        │
        ▼
-9. User funds address (faucet, bridge, or transfer from another wallet)
+9. User funds address (bridge or transfer from another wallet)
        │
        ▼
 10. User can now sign TxPasskey (0x77) transactions with biometric
@@ -975,7 +936,7 @@ async function onboardWithPasskey(username: string) {
 
 ### SECP256R1 is Synchronous — No useRitualWrite Needed
 
-The SECP256R1 precompile at `0x0100` is synchronous — like Ed25519 (`0x0009`, see `ritual-dapp-ed25519`), JQ, and ONNX. It executes inline in a single block. This means you can verify signatures for free via `eth_call` without a transaction. It also means:
+The SECP256R1 precompile at `0x0100` is synchronous — like Ed25519 (`0x0009`, see `ritual-dapp-ed25519`) and JQ. It executes inline in a single block. This means you can verify signatures for free via `eth_call` without a transaction. It also means:
 
 - `writeContractAsync` works normally for contracts that call SECP256R1
 - No `useRitualWrite` bypass needed (the `eth_call` simulation succeeds)
@@ -994,15 +955,24 @@ The passkey controls the address. The deposit funds the precompile. These are in
 
 ---
 
-## 11. Recovery Pattern
+## 11. Application-Level Recovery (Not Native EOA Rotation)
 
-When a user loses all devices in their passkey sync ecosystem, they lose access. This contract allows a secondary secp256k1 key to rotate the passkey:
+A native TxPasskey address is derived from the P256 public key. Changing the key therefore produces a
+different address; no registry contract can replace the key that validates transactions for the original
+EOA. If a user loses every copy of that passkey, the native passkey-derived EOA is not recoverable.
+
+Recovery must be designed before funds are deposited. Put assets and permissions behind a smart account or
+application contract whose authorization logic reads a mutable passkey registry. A secondary secp256k1 key
+can then rotate the key used by that contract. The following example is such an **application-level
+registry**; it does not rotate a native TxPasskey EOA:
 
 ```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-contract PasskeyWithRecovery {
+/// @notice Application-level key registry for a contract-managed account.
+/// @dev Updating this registry does not change a native TxPasskey EOA's key.
+contract PasskeyRecoveryRegistry {
     address constant SECP256R1 = address(0x100);
 
     struct Account {
@@ -1057,7 +1027,14 @@ contract PasskeyWithRecovery {
 }
 ```
 
-The recovery address is a standard secp256k1 EOA (MetaMask, hardware wallet). The delay gives the legitimate owner time to cancel a malicious recovery attempt using their passkey.
+The recovery address is a standard secp256k1 EOA (MetaMask or a hardware wallet). The delay gives the
+legitimate owner time to cancel a malicious recovery attempt. To make the rotation effective, the smart
+account or application must verify future actions against `accounts[account].passkeyX/passkeyY`; this
+standalone registry only stores the policy.
+
+Do not present this pattern as recovery for funds held directly by the passkey-derived EOA. For native EOA
+funds, use passkey-provider device sync and backup procedures, or transfer funds into a recoverable smart
+account while the original passkey is still available.
 
 ---
 
@@ -1128,4 +1105,4 @@ WebAuthn is supported in all modern browsers (Chrome 67+, Firefox 60+, Safari 14
 ### Key Storage and Cross-Device Sync
 P-256 private keys are created in the device's secure enclave. On modern platforms, passkeys may sync across devices via iCloud Keychain (Apple), Google Password Manager (Android/Chrome), or Windows Hello (Microsoft). This means the "key never leaves the device" guarantee is now "key never leaves the platform ecosystem." For high-security applications, set `authenticatorAttachment: 'cross-platform'` to require a hardware security key (YubiKey) that does not sync. For consumer applications, synced passkeys are desirable — they prevent device-loss lockout.
 
-If the user loses all devices in their sync ecosystem, they lose access. Implement recovery mechanisms (see section 9 — Recovery Pattern).
+If the user loses all devices in their sync ecosystem, they lose access. For contract-managed accounts, see section 11. The registry cannot recover a lost native passkey EOA.

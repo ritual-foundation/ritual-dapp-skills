@@ -60,9 +60,11 @@ This skill is a **composition layer**. It combines patterns from other skills wi
 
 - **`ritual-dapp-secrets`** — ECIES encryption, secret string replacement syntax, SecretsAccessControl. All credential encryption in X402 follows the patterns defined there.
 - **`ritual-dapp-http`** — HTTP precompile (0x0801) encoding format, executor selection, ABI parameter layout. X402 uses the same encoding with encrypted secrets added.
-- **`ritual-dapp-wallet`** — RitualWallet deposit flows. The sender's wallet must be funded before any X402 call.
+- **`ritual-dapp-wallet`** — RitualWallet deposit and sponsor allowance flows. The sponsor's wallet must be funded before any X402 call, and must approve the consumer contract when `sponsor != caller`.
 - **`ritual-dapp-longrunning`** — For premium APIs with response times >30s, use 0x0805 instead of 0x0801.
-- **`ritual-dapp-frontend`** — For building UI around X402 flows. Use `walletClient.request({ method: "eth_sendTransaction" })` with explicit `gas` hex field (never `useWriteContract` or `useSendTransaction` for async precompiles — both trigger EVM simulation which fails).
+- **`ritual-dapp-frontend`** — For building UI around X402 flows. Use `walletClient.sendTransaction` or wagmi `useSendTransaction` with explicit `gas` to avoid `eth_call` simulation. Do not use `useWriteContract` for functions that touch async precompiles.
+
+If the paid request also needs DA-backed JSON, output projection/fan-out, a held response, or selected SSE, load the RITHTTP1 reference from `ritual-dapp-http`. X402 fields and authorization remain in the unchanged outer HTTP/Long HTTP ABI; RITHTTP1 only versions `body`. Keep payment credentials in the normal owner-bound secret envelope. RITHTTP1's `storage:*` aliases are for storage credentials and `http:*` aliases are for request values—do not encode billing credentials into a StorageRef path.
 
 ---
 
@@ -75,18 +77,21 @@ X402 uses the **same HTTP precompile ABI** (`0x0801`) as a plain HTTP call. The 
 | # | Type | Parameter | Plain HTTP | X402 (Paid) |
 |---|------|-----------|-----------|-------------|
 | 0 | `address` | executor | TEE executor address | Same |
-| 1 | `bytes[]` | **encryptedSecrets** | `[]` (empty) | **← X402: `[encryptedHex]`** — ECIES-encrypted JSON containing payment credential keys |
-| 2 | `uint256` | ttl | Blocks until timeout | Same |
-| 3 | `bytes[]` | **secretSignatures** | `[]` (empty) | **← X402: `[signature]`** — ECDSA signature over each encrypted blob |
-| 4 | `bytes` | userPublicKey | `'0x'` | `'0x'` (or user pubkey for encrypted responses) |
-| 5 | `string` | url | Plain URL | **← X402: URL with `SECRET_NAME` placeholders** |
-| 6 | `uint8` | method | HTTP method enum | Same |
-| 7 | `string[]` | headerKeys | Header names | Same (may include credential headers) |
-| 8 | `string[]` | headerValues | Header values | **← X402: values with secret placeholders** |
-| 9 | `bytes` | body | Request body | **← X402: body with secret placeholders** |
-| 10 | `uint256` | dkmsKeyIndex | `0` (disabled) | `0` (X402 does not use dKMS) |
-| 11 | `uint8` | dkmsKeyFormat | `0` (disabled) | `0` (X402 does not use dKMS) |
-| 12 | `bool` | piiEnabled | `false` | **← X402: set to `true`** — enables secret template substitution. See `ritual-dapp-secrets`. |
+| 1 | `address` | sponsor | Address sponsoring payment (RitualWallet account) | Same (typically the payer's RitualWallet) |
+| 2 | `address[]` | **secretOwners** | `[]` (empty) | **← X402: `[ownerAddress]`** — one non-zero owner per encrypted blob, parallel to encryptedSecrets/secretSignatures |
+| 3 | `bytes[]` | **encryptedSecrets** | `[]` (empty) | **← X402: `[encryptedHex]`** — ECIES-encrypted JSON containing payment credential keys |
+| 4 | `uint256` | ttl | Blocks until timeout | Same |
+| 5 | `bytes[]` | **secretSignatures** | `[]` (empty) | **← X402: `[signature]`** — EIP-191 owner signature over each blob's domain-separated authorization payload |
+| 6 | `bytes` | userPublicKey | `'0x'` | `'0x'` (or user pubkey for encrypted responses) |
+| 7 | `string` | url | Plain URL | **← X402: URL with `SECRET_NAME` placeholders** |
+| 8 | `uint8` | method | HTTP method enum | Same |
+| 9 | `string[]` | headerKeys | Header names | Same (may include credential headers) |
+| 10 | `string[]` | headerValues | Header values | **← X402: values with secret placeholders** |
+| 11 | `bytes` | body | Request body | **← X402: body with secret placeholders** |
+| 12 | `uint256` | dkmsKeyIndex | `0` (disabled) | `0` (X402 does not use dKMS) |
+| 13 | `uint8` | dkmsKeyFormat | `0` (disabled) | `0` (X402 does not use dKMS) |
+| 14 | `bool` | piiEnabled | `false` | Optional PII redaction flag. Secret template substitution is triggered by non-empty `encryptedSecrets` + matching `secretOwners`/`secretSignatures`, not by this flag. |
+| 15 | `(string,string,string)` | outputStorageRef | `("","","")` (inline) | Same — typically inline `("","","")` for x402 paid responses. Set `(platform, path, keyRef)` to store the ABI-encoded response in DA instead of returning it inline. Must be fully empty or have BOTH platform AND path (partial refs are rejected). |
 
 ### How String Replacement Works
 
@@ -115,27 +120,47 @@ The encryption follows `ritual-dapp-secrets`. The X402-specific part is the **pa
 ```typescript
 import { encrypt } from 'eciesjs';
 
-// 1. Build the payload — keys MUST match placeholder names in URL/headers/body
-const x402Payload = JSON.stringify({
-  API_KEY: process.env.PREMIUM_API_KEY,
-  BILLING_TOKEN: process.env.BILLING_TOKEN,
-});
+// 1. Build the owner-bound envelope — credential keys MUST match placeholder
+//    names in URL/headers/body. The bare key-value map is wrapped in a
+//    canonical envelope {version:1, secret_owner:<owner>, secrets:{...}}; the
+//    executor rejects bare-map blobs and any owner mismatch.
+const ownerAddress = account.address; // owner of these credentials (secret_owners[i])
+const x402Envelope = JSON.stringify({
+  secret_owner: ownerAddress,
+  secrets: {
+    API_KEY: process.env.PREMIUM_API_KEY,
+    BILLING_TOKEN: process.env.BILLING_TOKEN,
+  },
+  version: 1,
+}); // canonical: sorted keys, no whitespace separators
 
-// 2. Encrypt to executor's pubkey (lookup via TEEServiceRegistry.getNodePublicKey)
-const encrypted = encrypt(executorPublicKey.slice(2), Buffer.from(x402Payload));
+// 2. Encrypt to executor's pubkey (from TEEServiceRegistry.getServicesByCapability(...).node.executorSecretsAuthPublicKey)
+const encrypted = encrypt(executorPublicKey.slice(2), Buffer.from(x402Envelope));
 const encryptedHex = `0x${Buffer.from(encrypted).toString('hex')}`;
 
-// 3. Sign the encrypted blob
-const signature = await account.signMessage({ message: { raw: encrypted } });
+// 3. Sign the domain-separated authorization payload (NOT the raw blob). The
+//    owner signs the preimage so the executor can verify the signer ==
+//    secret_owners[i]. Layout (byte-identical Python/Go):
+//    "RITUAL_SECRET_AUTHORIZATION_V1" || uint16(len(useContext)) || useContext
+//    || uint256(chainId) || executor(20) || owner(20) || keccak256(encrypted)
+//    useContext for X402 is the HTTP precompile context (binds the signature to
+//    0x0801 so it cannot be replayed on another precompile):
+const useContext = 'precompile:0x0000000000000000000000000000000000000801';
+const payload = buildSecretAuthorizationPayload({
+  domain: 'RITUAL_SECRET_AUTHORIZATION_V1',
+  useContext, chainId, executor, owner: ownerAddress, encrypted,
+});
+const signature = await account.signMessage({ message: { raw: payload } });
 
-// 4. These go into ABI parameter slots 1 and 3:
-//    encryptedSecrets: [encryptedHex]
-//    secretSignatures: [signature]
+// 4. These go into ABI parameter slots 2, 3 and 5 (all parallel, same length):
+//    secretOwners:      [ownerAddress]
+//    encryptedSecrets:  [encryptedHex]
+//    secretSignatures:  [signature]
 ```
 
-The `executorPublicKey` comes from the TEE Service Registry at `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` via `getNodePublicKey(executorAddress)`. To find available executors, query `getServicesByCapability(0, true)` for HTTP_CALL-capable executors — see `ritual-dapp-http` section 10. See `ritual-dapp-secrets` for the full encryption flow.
+The `executorPublicKey` comes from the TEE Service Registry at `0xf4495DC72143D44A93AB0ecE4d6D63a216b27839`. Query `getServicesByCapability(0, true)` for HTTP_CALL-capable executors and use the selected service's `node.executorSecretsAuthPublicKey` with `node.teeAddress`; see `ritual-dapp-http` section 10. See `ritual-dapp-secrets` for the full encryption flow.
 
-**Multiple secrets:** The `encryptedSecrets` array can hold multiple blobs. Typically you encrypt a single JSON object with all credential keys and pass it as a single-element array. Multiple entries are for cases where different secrets are encrypted to different executor public keys (e.g., a multi-executor setup). For most X402 dApps, use `[encryptedHex]` (single element).
+**Multiple secrets:** The `encryptedSecrets` array can hold multiple blobs. Typically you encrypt a single JSON object with all credential keys and pass it as a single-element array. Multiple entries are for cases where different secrets are encrypted to different executor public keys (e.g., a multi-executor setup). For most X402 dApps, use `[encryptedHex]` (single element). The `secretOwners` and `secretSignatures` arrays must stay strictly parallel to `encryptedSecrets` (same length, all empty together) — one owner address and one authorization signature per blob — or the executor rejects the request.
 
 ---
 
@@ -143,10 +168,10 @@ The `executorPublicKey` comes from the TEE Service Registry at `0x9644e8562cE0Fe
 
 When building an X402 dApp, follow this order:
 
-1. **Fund the RitualWallet** — Deposit RITUAL to cover precompile execution fees. See `ritual-dapp-wallet`. Must happen before any X402 call.
-2. **Select an executor** — Query `TEEServiceRegistry.getServicesByCapability(0, true)` to find executors with HTTP_CALL capability. See `ritual-dapp-http` section 10 for the full lookup pattern. Pick one and note its `teeAddress` (the executor address) and `publicKey` (for ECIES encryption).
+1. **Fund the RitualWallet** — Deposit RITUAL into the account encoded as `sponsor`. If the X402 call goes through a consumer contract and `sponsor` is an EOA or third-party account, the sponsor must also call `RitualWallet.approve(consumerContract, amount)` before the X402 call. See `ritual-dapp-wallet`.
+2. **Select an executor** — Query `TEEServiceRegistry.getServicesByCapability(0, true)` to find executors with HTTP_CALL capability. See `ritual-dapp-http` section 10 for the full lookup pattern. Pick one and note its `teeAddress` (the executor address) and `executorSecretsAuthPublicKey` (for ECIES encryption).
 3. **Encrypt credentials** — Build the JSON payload, encrypt with ECIES to the executor's public key, sign with your account (see "Constructing the Encrypted Secrets" above).
-4. **Encode the HTTP precompile call** — Use the ABI parameter layout table above. Fill slots 1, 3, 5, 8, 9, and 12 with X402-specific values. Set slots 10–11 (dKMS) to zero.
+4. **Encode the HTTP precompile call** — Use the ABI parameter layout table above. Set slot 1 (`sponsor`) to the payer's RitualWallet account. Fill slots 2 (`secretOwners`), 3 (`encryptedSecrets`), 5 (`secretSignatures`), 7 (`url`), 10 (`headerValues`), and 11 (`body`) with X402-specific values. Set slots 12–13 (dKMS) to zero and leave slot 14 (`piiEnabled`) false unless you explicitly need PII redaction.
 5. **Send the transaction** — Call the consumer contract or send directly to `0x0801`. The result comes back **in the same transaction** via inline settlement (not a callback).
 6. **Decode the response** — The precompile returns `(bytes, bytes)` where the second element decodes to `(uint16 status, string[] headerKeys, string[] headerValues, bytes body, string errorMessage)`. See `ritual-dapp-http` for the full decoding pattern.
 
@@ -158,6 +183,10 @@ The HTTP precompile (0x0801) does **NOT** use callbacks. The result is settled i
 (bool success, bytes memory rawOutput) = HTTP_PRECOMPILE.call(input);
 (, bytes memory actualOutput) = abi.decode(rawOutput, (bytes, bytes));
 // actualOutput decodes to: (uint16 status, string[] headerKeys, string[] headerValues, bytes body, string errorMessage)
+// NOTE: this inline decode applies only when outputStorageRef is empty (the typical x402 case).
+// If outputStorageRef is set, actualOutput is instead a DA result envelope
+// (bool hasError, string outputURI, bytes32 outputContentHash, uint64 outputSizeBytes, string errorMessage);
+// fetch the bytes from outputURI, verify outputContentHash, and (if encrypted) decrypt them to recover the HTTPCallResponse.
 ```
 
 If the premium API returns an error (4xx, 5xx), the result still settles — you get the error status code and body. The executor fee is still consumed. The external API cost depends on whether the API's billing considers failed requests billable.
@@ -182,6 +211,8 @@ On top of populating the precompile's secret slots, X402 introduces three concer
 
 This is the primary X402-specific Solidity concern. The consumer contract should enforce per-address spending limits.
 
+Payment preflight is separate from budget accounting: if `sponsor != address(this)`, the sponsor must approve this consumer contract in `RitualWallet` before `fetchPaidData()` can reserve funds. A frontend should check both `availableBalance(sponsor)` and `allowance(sponsor, consumer)` before enabling submit.
+
 **Key design decisions the agent must make:**
 
 | Decision | Options | Guidance |
@@ -204,29 +235,39 @@ contract X402Consumer {
         string errorMessage;
     }
 
+    struct StorageRef {
+        string platform;
+        string path;
+        string keyRef;
+    }
+
     uint256 public costPerCall;
     mapping(address => uint256) public budgetUsed;
     mapping(address => uint256) public budgetLimit;
 
     function fetchPaidData(
-        address executor, uint256 ttl, string calldata url,
+        address executor, address sponsor, address[] calldata secretOwners,
+        uint256 ttl, string calldata url,
         bytes[] calldata encryptedSecrets, bytes[] calldata secretSignatures,
         string[] calldata headerKeys, string[] calldata headerValues
     ) external returns (uint16, bytes memory) {
         require(budgetUsed[msg.sender] + costPerCall <= budgetLimit[msg.sender], "Budget exceeded");
 
         bytes memory input = abi.encode(
-            executor, encryptedSecrets, ttl, secretSignatures, bytes(""),
+            executor, sponsor, secretOwners, encryptedSecrets, ttl, secretSignatures, bytes(""),
             url, uint8(1), headerKeys, headerValues, bytes(""),
             uint256(0), uint8(0),  // dkmsKeyIndex, dkmsKeyFormat (0 = disabled)
-            true                   // piiEnabled
+            false,                 // piiEnabled: credential substitution does not require PII redaction
+            StorageRef("", "", "") // outputStorageRef (string,string,string) tuple — empty = inline response
         );
 
         (bool success, bytes memory rawOutput) = HTTP_PRECOMPILE.call(input);
         require(success, "Precompile call failed");
 
         (, bytes memory actualOutput) = abi.decode(rawOutput, (bytes, bytes));
-        HTTPResponse memory resp = abi.decode(actualOutput, (HTTPResponse));
+        HTTPResponse memory resp;
+        (resp.status, resp.headerKeys, resp.headerValues, resp.body, resp.errorMessage) =
+            abi.decode(actualOutput, (uint16, string[], string[], bytes, string));
 
         budgetUsed[msg.sender] += costPerCall;
         return (resp.status, resp.body);
@@ -245,7 +286,7 @@ For DAOs or multi-user dApps where many users access the same paid API, the admi
 This follows the delegation pattern from `ritual-dapp-secrets`:
 
 1. Admin encrypts the premium API key to the executor's public key
-2. Admin calls `SecretsAccessControl.grantAccess(memberAddress, secretsHash)` at `0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD`
+2. Admin calls `SecretsAccessControl.grantAccess(memberAddress, secretsHash, expiresAt, policy)` at `0x0cEae62e2082829226eF5821Bb662483Db17A71F` — e.g. `grantAccess(memberAddress, keccak256(encryptedSecrets), 2**256-1, emptyPolicy)`, where `expiresAt` is a block number (`type(uint256).max` = never-expiring) and `emptyPolicy` is the 7-field tuple `([],[],[],[],[],"","")` (allowedDestinations, allowedMethods, allowedPaths, allowedQueryParams, allowedHeaders, secretLocation, bodyFormat) for unrestricted access. All four arguments are required.
 3. Member includes the shared encrypted secret in their X402 HTTP calls
 4. Executor verifies access before decrypting
 
@@ -259,7 +300,9 @@ When the premium API has a submit-then-poll pattern (e.g., AI inference APIs tha
 
 The X402 concern is the same — encrypted payment credentials are passed as secrets. The only difference is the precompile address and the additional polling/delivery parameters.
 
-See `ritual-dapp-longrunning` for the full 0x0805 encoding format. Add the encrypted secrets and signatures to the `encryptedSecrets` and `secretSignatures` parameter slots.
+See `ritual-dapp-longrunning` for the full 0x0805 encoding format. Add the owners, encrypted secrets, and signatures to the parallel `secretOwners`, `encryptedSecrets`, and `secretSignatures` parameter slots (the same `secret_owners` base field exists on 0x0805, with `use_context` = `precompile:0x0000000000000000000000000000000000000805`).
+
+For a single paid request that itself stays open, use long HTTP RITHTTP1 `AWAIT_RESPONSE`, not fake task-ID polling. For task-ID paid APIs, omit `AWAIT_RESPONSE` and retain the legacy polling configuration. Preflight that the selected executor supports both the payment path and RITHTTP1 before submitting.
 
 ---
 
@@ -285,11 +328,11 @@ See `ritual-dapp-longrunning` for the full 0x0805 encoding format. Add the encry
 |------|-------|
 | HTTP precompile | `0x0000000000000000000000000000000000000801` |
 | Long-Running HTTP precompile | `0x0000000000000000000000000000000000000805` |
-| SecretsAccessControl | `0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD` |
-| RitualWallet | `0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948` |
-| TEE Service Registry | `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` |
-| Chain ID | 1979 |
+| SecretsAccessControl | `0x0cEae62e2082829226eF5821Bb662483Db17A71F` |
+| RitualWallet | `0xF04076756d8129Baec46Dc0F1c526Baec490C393` |
+| TEE Service Registry | `0xf4495DC72143D44A93AB0ecE4d6D63a216b27839` |
+| Chain ID | 784 |
 | Payment encryption | ECIES to executor pubkey — see `ritual-dapp-secrets` |
 | Secret replacement syntax | `SECRET_NAME` — keys must match encrypted JSON, `UPPER_SNAKE_CASE` |
 | Budget pattern | Per-address limits with configurable `costPerCall` in consumer contract |
-| Callback access control | `require(msg.sender == HTTP_PRECOMPILE)` — always enforce |
+| Callback access control | `0x0801` has no callback. For X402 over `0x0805`, guard the callback with `require(msg.sender == ASYNC_DELIVERY)` |

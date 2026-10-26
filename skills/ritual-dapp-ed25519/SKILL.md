@@ -124,4 +124,4 @@ async function verifyEd25519(
 - **Free to query**: call via `eth_call` to verify signatures without a transaction and without spending gas. Unlike async precompiles (HTTP, LLM), the result is real — not a placeholder. See the TypeScript example above.
 - **Gas-only**: no RitualWallet deposit or executor fees. Just standard EVM gas (2,000 gas for the precompile itself)
 - **No sender lock**: doesn't block or get blocked by async job locks on the same address
-- **Composable**: can be combined with other synchronous precompiles (SECP256R1 at `0x0100`, JQ at `0x0803`, ONNX at `0x0800`) and short-running async precompiles in the same transaction. See `ritual-dapp-passkey` for the SECP256R1 equivalent and `ritual-dapp-precompiles` for the full address map.
+- **Composable**: can be combined with other synchronous precompiles (SECP256R1 at `0x0100`, JQ at `0x0803`) and short-running async precompiles in the same transaction. See `ritual-dapp-passkey` for the SECP256R1 equivalent and `ritual-dapp-precompiles` for the full address map.

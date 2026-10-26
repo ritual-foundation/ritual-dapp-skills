@@ -1,215 +1,127 @@
 #!/usr/bin/env bash
-# ============================================================================
-# Sovereign Agent E2E (direct precompile caller mode) — deploy, fund, call, receive
-#
-# Required environment (this script will fail fast if any are missing or look
-# like unfilled placeholders):
-#   RPC_URL        — e.g. https://rpc.ritualfoundation.org
-#   PRIVATE_KEY    — 0x-prefixed funded key
-#   HF_TOKEN       — HuggingFace token for DA storage (hf_...)
-#   HF_REPO_ID     — HuggingFace dataset ID in "user/repo" form that YOU own
-#                    (e.g. alice/my-agent-workspace). Stores convo history,
-#                    artifacts, and the system prompt.
-#   MODEL          — exact provider-routable model id (e.g. claude-sonnet-4-5-20250929)
-#   exactly one LLM key: ANTHROPIC_API_KEY | OPENAI_API_KEY | GEMINI_API_KEY | OPENROUTER_API_KEY
-#
-# IMPORTANT (for agents running this example on behalf of a user):
-# Elicit HF_REPO_ID and the LLM credentials from the user BEFORE invoking
-# this script. There are no sensible defaults and placeholder values will
-# abort with exit code 2.
-#
-# Prerequisites: forge, cast, uv
-# Factory-backed harness mode is documented in skills/ritual-dapp-agents/SKILL.md
-# ============================================================================
+# Deploy this directory's own consumer, authorize it, then call the agent precompile.
+# Prerequisites: public Foundry tools (forge/cast) and uv. Never enable shell tracing.
 set -euo pipefail
-
-# Guard: fail if a required var is unset OR if the caller left an unfilled
-# placeholder (angle-brackets or "YOUR_" / "YOUR-" sentinels). We cannot rely
-# on ":?" alone because "export FOO=<YOUR_THING>" would set FOO to the literal
-# string "<YOUR_THING>" in many shells, silently propagating garbage downstream.
-require_real_value() {
-    local name="$1"
-    local value="${2-}"
-    local hint="${3:-set it to a real value}"
-    if [ -z "$value" ]; then
-        echo "ERROR: $name is required — $hint" >&2
-        exit 2
+require_value() {
+    local name="$1" value="${2-}"
+    if [ -z "$value" ] || [[ "$value" == *'<'* || "$value" == *'>'* || "$value" == *YOUR_* ]]; then
+        echo "ERROR: $name is required and must not be a placeholder" >&2; exit 2
     fi
-    case "$value" in
-        *"<"*|*">"*|*YOUR_*|*YOUR-*)
-            echo "ERROR: $name looks like an unfilled placeholder ('$value') — $hint" >&2
-            exit 2
-            ;;
-    esac
+}
+for name in RPC_URL PRIVATE_KEY EXPECTED_CHAIN_ID ASYNC_DELIVERY_ADDRESS DA_PROVIDER; do require_value "$name" "${!name:-}"; done
+for tool in cast forge uv; do command -v "$tool" >/dev/null || { echo "ERROR: $tool is required" >&2; exit 2; }; done
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY_HELPER=(uv run --quiet --with eciespy --with eth-abi --with web3 python3 "$SCRIPT_DIR/helpers.py")
+TEE_SERVICE_REGISTRY="${TEE_SERVICE_REGISTRY:-0xf4495DC72143D44A93AB0ecE4d6D63a216b27839}"
+SECRETS_ACCESS_CONTROL="${SECRETS_ACCESS_CONTROL:-0x0cEae62e2082829226eF5821Bb662483Db17A71F}"
+ASYNC_JOB_TRACKER="${ASYNC_JOB_TRACKER:-0xf00385449fD961925A0B125F5f30b29B682D4bFb}"
+RITUAL_WALLET="${RITUAL_WALLET:-0xF04076756d8129Baec46Dc0F1c526Baec490C393}"
+SENDER=$(cast wallet address "$PRIVATE_KEY")
+CHAIN_ID=$(cast chain-id --rpc-url "$RPC_URL")
+if [ "$CHAIN_ID" != "$EXPECTED_CHAIN_ID" ]; then echo "ERROR: chain differs from expected deployment" >&2; exit 2; fi
+for name in TEE_SERVICE_REGISTRY SECRETS_ACCESS_CONTROL ASYNC_JOB_TRACKER RITUAL_WALLET ASYNC_DELIVERY_ADDRESS EXTRA_CONTRACT AGENT_HEARTBEAT_ADDRESS; do
+    address="${!name:-}"
+    [ -z "$address" ] && continue
+    if [ "$(cast code "$address" --rpc-url "$RPC_URL")" = "0x" ]; then echo "ERROR: $name has no deployed bytecode" >&2; exit 2; fi
+done
+if [ "$(cast call "$ASYNC_JOB_TRACKER" 'hasPendingJobForTxOrigin(address)(bool)' "$SENDER" --rpc-url "$RPC_URL")" = true ]; then
+    echo "ERROR: reconcile the sender's existing job before starting this example" >&2; exit 2
+fi
+
+require_value MODEL "${MODEL:-}"
+CONTRACT=SovereignAgentConsumer
+WALLET_MIN_WEI="${WALLET_MIN_WEI:-5000000000000000000}"
+WALLET_DEPOSIT_WEI="${WALLET_DEPOSIT_WEI:-5000000000000000000}"
+send_tx() {
+    local pre_nonce out hash i
+    pre_nonce=$(cast nonce "$SENDER" --rpc-url "$RPC_URL")
+    if out=$(cast send --private-key "$PRIVATE_KEY" --rpc-url "$RPC_URL" --async "$@" 2>&1); then
+        hash=$(printf '%s' "$out" | tr -d '[:space:]')
+    elif printf '%s' "$out" | grep -qiE "already known|nonce too low"; then
+        # "already known": the LB double-forwarded and the tx is pooled.
+        # "nonce too low": a duplicate already MINED before cast's (stale-backend)
+        # nonce fetch — same recovery: wait for the nonce to pass and find the tx.
+        echo "  (duplicate submission via RPC — recovering pooled/mined tx)" >&2
+        hash=""
+    else
+        printf '%s\n' "$out" >&2; return 1
+    fi
+    for i in $(seq 1 90); do
+        if [ "$(cast nonce "$SENDER" --rpc-url "$RPC_URL")" -gt "$pre_nonce" ]; then
+            if [ -z "$hash" ]; then
+                hash=$("${PY_HELPER[@]}" find-tx --rpc "$RPC_URL" \
+                    --sender "$SENDER" --nonce "$pre_nonce" | awk -F= '$1=="TX_HASH"{print $2}')
+            fi
+            # Nonce advancement alone also occurs for reverted transactions.
+            local receipt
+            if ! receipt=$(cast receipt "$hash" --rpc-url "$RPC_URL" --json); then
+                echo "ERROR: transaction receipt unavailable; reconcile $hash before any retry" >&2
+                return 1
+            fi
+            if ! printf '%s' "$receipt" | "${PY_HELPER[@]}" check-receipt >/dev/null; then
+                echo "ERROR: transaction $hash did not succeed; do not repeat funding blindly" >&2
+                return 1
+            fi
+            printf '%s' "$hash"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "ERROR: tx from nonce $pre_nonce not mined after 180s" >&2
+    return 1
 }
 
-require_real_value RPC_URL "${RPC_URL:-}" "e.g. https://rpc.ritualfoundation.org"
-require_real_value PRIVATE_KEY "${PRIVATE_KEY:-}" "0x-prefixed funded key"
-require_real_value HF_TOKEN "${HF_TOKEN:-}" "HuggingFace token (hf_...) with write access to HF_REPO_ID"
-require_real_value HF_REPO_ID "${HF_REPO_ID:-}" "HuggingFace dataset ID in 'user/repo' form, e.g. alice/my-agent-workspace"
-
-if ! command -v uv >/dev/null 2>&1; then
-    echo "ERROR: uv is required but not installed."
-    echo "Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
-    exit 1
-fi
-
-PY=(uv run --quiet python3)
-PY_HELPER=(uv run --quiet --with eciespy --with eth-abi --with web3 python3)
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WALLET="0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948"
-REGISTRY="0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F"
-TRACKER="0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5"
-PROMPT="${PROMPT:-Say hello world}"
-CLI_TYPE="${CLI_TYPE:-5}"
-PHASE1_TIMEOUT="${PHASE1_TIMEOUT:-300}"
-PHASE2_TIMEOUT="${PHASE2_TIMEOUT:-300}"
-MAX_FEE_GWEI="${MAX_FEE_GWEI:-20}"
-PRIORITY_FEE_GWEI="${PRIORITY_FEE_GWEI:-1}"
-PHASE1_GAS_LIMIT="${PHASE1_GAS_LIMIT:-900000}"
-MIN_RITUAL_WALLET_WEI="${MIN_RITUAL_WALLET_WEI:-1000000000000000000}" # 1 RIT
-DEPOSIT_WEI="${DEPOSIT_WEI:-5000000000000000000}" # 5 RIT
-LOCK_BLOCKS="${LOCK_BLOCKS:-100000000}"
-EXECUTOR_TEE_ADDRESS="${EXECUTOR_TEE_ADDRESS:-}"
-CONSUMER_ADDRESS="${CONSUMER_ADDRESS:-}"
-
-SENDER=$(cast wallet address "$PRIVATE_KEY")
-echo "Sender: $SENDER"
-echo "Chain:  $(cast chain-id --rpc-url "$RPC_URL")"
-
-case "$CLI_TYPE" in
-  0|5|6)
-    ;;
-  *)
-    echo "ERROR: CLI_TYPE must be one of: 0 (claude_code), 5 (crush), 6 (zeroclaw)"
-    exit 1
-    ;;
-esac
-
-# ── 1. Check for pending async job ──
-PENDING=$(cast call "$TRACKER" "hasPendingJobForSender(address)(bool)" "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')
-if [ "$PENDING" = "true" ]; then
-    echo "ERROR: Sender has a pending async job. Use a different key or wait for it to expire."
-    exit 1
-fi
-
-# ── 2. Fund RitualWallet if needed ──
-WALLET_BAL=$(cast call "$WALLET" "balanceOf(address)(uint256)" "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')
-NEEDS_DEPOSIT=$("${PY[@]}" - "$WALLET_BAL" "$MIN_RITUAL_WALLET_WEI" <<'PY'
+"${PY_HELPER[@]}" check-inputs --da-provider "$DA_PROVIDER"
+AVAILABLE=$(cast call "$RITUAL_WALLET" 'availableBalance(address)(uint256)' "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')
+NATIVE_BALANCE=$(cast balance "$SENDER" --rpc-url "$RPC_URL")
+uv run --quiet python3 - "$NATIVE_BALANCE" "$AVAILABLE" "$WALLET_MIN_WEI" "$WALLET_DEPOSIT_WEI" "${PRELAUNCH_FUND_WEI:-0}" <<'PYCHECK'
 import sys
-print("1" if int(sys.argv[1]) < int(sys.argv[2]) else "0")
-PY
-)
-if [ "$NEEDS_DEPOSIT" = "1" ]; then
-    echo "Depositing RitualWallet balance (value=$DEPOSIT_WEI wei, lock=$LOCK_BLOCKS blocks)..."
-    cast send "$WALLET" "deposit(uint256)" "$LOCK_BLOCKS" \
-        --value "$DEPOSIT_WEI" \
-        --private-key "$PRIVATE_KEY" \
-        --rpc-url "$RPC_URL" >/dev/null
-    echo "Funded."
+balance, available, minimum, deposit, prelaunch = map(int, sys.argv[1:])
+needed = (deposit if available < minimum else 0) + prelaunch + 5 * 10**17
+if balance < needed:
+    raise SystemExit("Insufficient native balance for wallet deposit, prelaunch funding and gas headroom")
+PYCHECK
+SELECT=(select-executor --rpc "$RPC_URL" --registry "$TEE_SERVICE_REGISTRY"
+    --executor-tee-address "${EXECUTOR_TEE_ADDRESS:-}"
+    --allowed-executors "${ALLOWED_EXECUTOR_ADDRESSES:-}"
+    --excluded-executors "${EXCLUDED_EXECUTOR_ADDRESSES:-}")
+EXECUTOR_OUT=$("${PY_HELPER[@]}" "${SELECT[@]}")
+EXECUTOR=$(printf '%s\n' "$EXECUTOR_OUT" | awk -F= '$1=="EXECUTOR"{print $2}')
+EXECUTOR_PUBKEY=$(printf '%s\n' "$EXECUTOR_OUT" | awk -F= '$1=="EXECUTOR_PUBKEY"{print $2}')
+BYTECODE=$(forge inspect --root "$SCRIPT_DIR" "$CONTRACT.sol:$CONTRACT" bytecode)
+CONSTRUCTOR=$(cast abi-encode 'f(address)' "$ASYNC_DELIVERY_ADDRESS")
+DEPLOY_TX=$(send_tx --gas-limit "${DEPLOY_GAS_LIMIT:-4000000}" --create "${BYTECODE}${CONSTRUCTOR#0x}")
+CONSUMER=$(cast receipt "$DEPLOY_TX" --rpc-url "$RPC_URL" --json | "${PY_HELPER[@]}" parse-deployment | awk -F= '$1=="CONSUMER"{print $2}')
+echo "CONSUMER=$CONSUMER"
+echo "DEPLOY_TX=$DEPLOY_TX"
+AVAILABLE=$(cast call "$RITUAL_WALLET" 'availableBalance(address)(uint256)' "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')
+if uv run --quiet python3 -c 'import sys;sys.exit(not(int(sys.argv[1])<int(sys.argv[2])))' "$AVAILABLE" "$WALLET_MIN_WEI"; then
+    send_tx "$RITUAL_WALLET" 'deposit()' --value "$WALLET_DEPOSIT_WEI" >/dev/null
 fi
-echo "RitualWallet wei: $(cast call "$WALLET" "balanceOf(address)(uint256)" "$SENDER" --rpc-url "$RPC_URL" | awk '{print $1}')"
+send_tx "$RITUAL_WALLET" 'approve(address,uint256)' "$CONSUMER" "$(cast max-uint)" >/dev/null
 
-# ── 3. Deploy consumer contract ──
-if [ -n "$CONSUMER_ADDRESS" ]; then
-    CONSUMER="$CONSUMER_ADDRESS"
-    echo "Using existing consumer: $CONSUMER"
-else
-    echo "Deploying SovereignAgentConsumer..."
-    DEPLOY_OUT=$(forge create --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" \
-        --broadcast "$SCRIPT_DIR/SovereignAgentConsumer.sol:SovereignAgentConsumer" 2>&1)
-    CONSUMER=$(printf '%s\n' "$DEPLOY_OUT" | awk '/Deployed to:/ {print $3}' | tail -n1)
-fi
-if [ -z "$CONSUMER" ]; then
-    echo "ERROR: Could not determine consumer contract address."
-    exit 1
-fi
-echo "Consumer: $CONSUMER"
+BUILD=(build-request --rpc "$RPC_URL" --consumer "$CONSUMER" --owner "$SENDER"
+    --executor-tee-address "$EXECUTOR" --executor-pubkey "$EXECUTOR_PUBKEY"
+    --model "$MODEL" --prompt "${PROMPT:-Say hello world}" --cli-type "${CLI_TYPE:-5}"
+    --max-turns "${MAX_TURNS:-50}" --max-tokens "${MAX_TOKENS:-8192}"
+    --da-provider "$DA_PROVIDER" --hf-repo-id "${HF_REPO_ID:-}" --gcs-prefix "${GCS_DA_PREFIX:-sovereign-agent}")
 
-# ── 4. Detect LLM provider and key ──
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    LLM_KEY_NAME="ANTHROPIC_API_KEY"
-    SECRETS_JSON=$("${PY[@]}" - <<'PY'
-import json
-import os
-print(json.dumps({"ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
-PY
-)
-elif [ -n "${OPENAI_API_KEY:-}" ]; then
-    LLM_KEY_NAME="OPENAI_API_KEY"
-    SECRETS_JSON=$("${PY[@]}" - <<'PY'
-import json
-import os
-print(json.dumps({"LLM_PROVIDER": "openai", "OPENAI_API_KEY": os.environ["OPENAI_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
-PY
-)
-elif [ -n "${GEMINI_API_KEY:-}" ]; then
-    LLM_KEY_NAME="GEMINI_API_KEY"
-    SECRETS_JSON=$("${PY[@]}" - <<'PY'
-import json
-import os
-print(json.dumps({"LLM_PROVIDER": "gemini", "GEMINI_API_KEY": os.environ["GEMINI_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
-PY
-)
-elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
-    LLM_KEY_NAME="OPENROUTER_API_KEY"
-    SECRETS_JSON=$("${PY[@]}" - <<'PY'
-import json
-import os
-print(json.dumps({"LLM_PROVIDER": "openrouter", "OPENROUTER_API_KEY": os.environ["OPENROUTER_API_KEY"], "HF_TOKEN": os.environ["HF_TOKEN"]}))
-PY
-)
-else
-    echo "ERROR: Set one of ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY"
-    exit 1
-fi
-: "${MODEL:?Set MODEL to an exact provider model id (e.g. claude-sonnet-4-5-20250929, gpt-4o-mini, gemini-2.5-flash)}"
-echo "Provider key: $LLM_KEY_NAME → model=$MODEL cli_type=$CLI_TYPE"
-
-# ── 5. Get executor + encrypt secrets ──
-echo "Finding executor and encrypting secrets..."
-BUILD_ARGS=(
-    --rpc "$RPC_URL"
-    --registry "$REGISTRY"
-    --consumer "$CONSUMER"
-    --secrets "$SECRETS_JSON"
-    --cli-type "$CLI_TYPE"
-    --model "$MODEL"
-    --prompt "$PROMPT"
-    --hf-repo-id "$HF_REPO_ID"
-)
-if [ -n "$EXECUTOR_TEE_ADDRESS" ]; then
-    BUILD_ARGS+=(--executor-tee-address "$EXECUTOR_TEE_ADDRESS")
-fi
-RESULT=$("${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" "${BUILD_ARGS[@]}")
-EXECUTOR=$(printf '%s\n' "$RESULT" | awk -F= '$1=="EXECUTOR"{print $2}')
-REQUEST_INPUT=$(printf '%s\n' "$RESULT" | awk -F= '$1=="REQUEST_INPUT"{print $2}')
-if [ -z "$EXECUTOR" ] || [ -z "$REQUEST_INPUT" ]; then
-    echo "ERROR: Failed to build sovereign agent request."
-    printf '%s\n' "$RESULT"
-    exit 1
-fi
-echo "Executor: $EXECUTOR"
-
-# ── 6. Submit Phase 1 via cast (typed call, hash printed immediately) ──
+REQUEST=$("${PY_HELPER[@]}" "${BUILD[@]}")
+CALLDATA=$(printf '%s\n' "$REQUEST" | awk -F= '$1=="CALLDATA"{print $2}')
+SECRETS_HASH=$(printf '%s\n' "$REQUEST" | awk -F= '$1=="SECRETS_HASH"{print $2}')
+GRANT=$("${PY_HELPER[@]}" encode-grant-calldata --delegate "$CONSUMER" --secrets-hash "$SECRETS_HASH" | awk -F= '$1=="CALLDATA"{print $2}')
+send_tx "$SECRETS_ACCESS_CONTROL" --data "$GRANT" >/dev/null
 FROM_BLOCK=$(cast block-number --rpc-url "$RPC_URL")
-echo "Submitting sovereign agent call (from_block=$FROM_BLOCK)..."
-TX_HASH=$(cast send "$CONSUMER" 'callSovereignAgent(bytes)' "$REQUEST_INPUT" \
-    --rpc-url "$RPC_URL" \
-    --private-key "$PRIVATE_KEY" \
-    --gas-limit "$PHASE1_GAS_LIMIT" \
-    --async)
-echo "Phase 1 tx: $TX_HASH"
+# An async origin may not have an ordinary receipt yet. Observe its exact job
+# through spcCalls/JobAdded rather than inferring success from nonce advancement.
+JOB_ID=$(cast send "$CONSUMER" --data "$CALLDATA" --gas-limit "${AGENT_GAS_LIMIT:-3000000}" \
+    --private-key "$PRIVATE_KEY" --rpc-url "$RPC_URL" --async)
+echo "JOB_ID=$JOB_ID"
+OBSERVE=(--rpc "$RPC_URL" --consumer "$CONSUMER" --tracker "$ASYNC_JOB_TRACKER"
+    --tx-hash "$JOB_ID" --from-block "$FROM_BLOCK")
+PHASE1=$("${PY_HELPER[@]}" wait-phase1 "${OBSERVE[@]}" --timeout "${PHASE1_TIMEOUT:-180}")
+printf '%s\n' "$PHASE1"
 
-# ── 7. Poll for Phase 2 event ──
-echo "Waiting for Phase 2 delivery (up to ${PHASE2_TIMEOUT}s)..."
-"${PY_HELPER[@]}" "$SCRIPT_DIR/helpers.py" \
-    --rpc "$RPC_URL" \
-    --poll-phase2 \
-    --consumer "$CONSUMER" \
-    --tx-hash "$TX_HASH" \
-    --from-block "$FROM_BLOCK" \
-    --timeout "$PHASE2_TIMEOUT"
-
-echo "Done."
+"${PY_HELPER[@]}" wait-result "${OBSERVE[@]}" --timeout "${RESULT_TIMEOUT:-600}"
+echo "SOVEREIGN_INVOCATION_SUCCESS=1"
+echo "CONSUMER=$CONSUMER JOB_ID=$JOB_ID"

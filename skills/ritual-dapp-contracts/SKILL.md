@@ -12,7 +12,7 @@ Ritual precompiles use one of three execution models. The full precompile list i
 | | Synchronous | Async (short-running) | Async (long-running) |
 |---|---|---|---|
 | How it works | Call returns result in the same transaction | Transaction is deferred until the TEE executor's result is available, then re-executed with the result injected into the precompile (fulfilled replay) — looks synchronous from your contract's perspective | Phase 1: returns a task ID, settles fees, releases nonce. Phase 2: executor delivers result via callback in a separate tx |
-| RitualWallet deposit | No | Yes — lock must cover `commit_block + ttl` | Yes — lock must cover `commit_block + ttl` |
+| RitualWallet deposit | No | Yes — sponsor `availableBalance` (+ `allowance(sponsor, caller)` if delegated) must cover the reserved fees | Yes — sponsor `availableBalance` (+ `allowance(sponsor, caller)` if delegated) must cover the reserved fees |
 | Executor from TEEServiceRegistry | No | Yes | Yes |
 | Callback function | No | No | Yes — guarded by `msg.sender == ASYNC_DELIVERY` with sufficient `deliveryGasLimit` |
 | Sender nonce lock | None | Until settlement | Until Phase 1 settlement |
@@ -21,46 +21,39 @@ Ritual precompiles use one of three execution models. The full precompile list i
 
 ## System Contracts
 
-| Contract | Address |
-|---|---|
-| RitualWallet | `0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948` |
-| AsyncJobTracker | `0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5` |
-| AsyncDelivery | `0x5A16214fF555848411544b005f7Ac063742f39F6` |
-| TEEServiceRegistry | `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` |
-| Scheduler | `0x56e776BAE2DD60664b69Bd5F865F1180ffB7D58B` |
-| SecretsAccessControl | `0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD` |
-
-## Agent Factory Contracts
+These are the live chain-784 system contracts. On a local network, resolve addresses from the node's generated configuration; verify bytecode either way. Use this skill’s included minimal interfaces for covered operations. Additional methods require a matching verified ABI or versioned deployment artifact; see [ABI retrieval](../../examples/README.md#abi-and-deployment-authority). A private source checkout is not required.
 
 | Contract | Address |
 |---|---|
-| SovereignAgentFactory | `0x9dC4C054e53bCc4Ce0A0Ff09E890A7a8e817f304` |
-| PersistentAgentFactory | `0xD4AA9D55215dc8149Af57605e70921Ea16b73591` |
+| RitualWallet | `0xF04076756d8129Baec46Dc0F1c526Baec490C393` |
+| AsyncJobTracker | `0xf00385449fD961925A0B125F5f30b29B682D4bFb` |
+| AsyncDelivery | `0x508f57AE70967Da28AE0Ab6b95532878c4D0F440` |
+| TEEServiceRegistry | `0xf4495DC72143D44A93AB0ecE4d6D63a216b27839` |
+| Scheduler | `0x4E0abeE2233D73E66382b45244F7459B34E1490E` |
+| SecretsAccessControl | `0x0cEae62e2082829226eF5821Bb662483Db17A71F` |
+| AgentHeartbeat | `0xDeeA4Df0C958966ED75570a05430BB0D4844a8cc` |
+| AgentIdentityRegistry | `0x2cbF50F833a3AEfb5c5B27068052cB5585F5c087` |
 
-Preflight before launch:
+## Agent Consumer Contracts
 
-```bash
-cast code "0x9dC4C054e53bCc4Ce0A0Ff09E890A7a8e817f304" --rpc-url "$RPC_URL"
-cast code "0xD4AA9D55215dc8149Af57605e70921Ea16b73591" --rpc-url "$RPC_URL"
-```
+Deploy the application-owned consumers included in [the agent examples](../../examples/README.md). Each compiles locally with minimal public system ABIs and calls `0x080C` or `0x0820` directly. Configure the chain's `AsyncDelivery`, sponsor wallet allowance, secret delegation, and (for persistent agents) identity operator grant. See `ritual-dapp-agents` for the launch sequence.
 
 ## Precompile Addresses
 
 | Address | Name | Type | ABI Fields | Skill |
 |---|---|---|---|---|
-| `0x0800` | ONNX ML Inference | Synchronous | 7 | `ritual-dapp-onnx` |
-| `0x0801` | HTTP Call | Async (short-running) | 13 | `ritual-dapp-http` |
-| `0x0802` | LLM Call | Async (short-running) | 30 | `ritual-dapp-llm` |
+| `0x0801` | HTTP Call | Async (short-running) | 16 | `ritual-dapp-http` |
+| `0x0802` | LLM Call | Async (short-running) | 32 | `ritual-dapp-llm` |
 | `0x0803` | JQ JSON Query | Synchronous | 3 | `ritual-dapp-http` §7 |
-| `0x0805` | Long-Running HTTP | Async (long-running) | 35 | `ritual-dapp-longrunning` |
-| `0x0806` | ZK Long-Running | Async (long-running) | 14 | — |
-| `0x0807` | FHE/CKKS Inference | Async (long-running) | 19 | — |
-| `0x080C` | Sovereign Agent | Async (long-running) | 23 | `ritual-dapp-agents` |
-| `0x0818` | Image Generation | Async (long-running) | 18 | `ritual-dapp-multimodal` |
-| `0x0819` | Audio Generation | Async (long-running) | 18 | `ritual-dapp-multimodal` |
-| `0x081A` | Video Generation | Async (long-running) | 18 | `ritual-dapp-multimodal` |
-| `0x081B` | DKMS Key Derivation | Async | 8 | — |
-| `0x0820` | Persistent Agent | Async (long-running) | 26 | `ritual-dapp-agents` |
+| `0x0805` | Long-Running HTTP | Async (long-running) | 38 | `ritual-dapp-longrunning` |
+| `0x0806` | ZK Long-Running | Async (long-running) | 16 | — |
+| `0x0807` | FHE/CKKS Inference | Async (long-running) | 21 | — |
+| `0x080C` | Sovereign Agent | Async (long-running) | 13-field envelope | `ritual-dapp-agents` |
+| `0x0818` | Image Generation | Async (long-running) | 20 | `ritual-dapp-multimodal` |
+| `0x0819` | Audio Generation | Async (long-running) | 20 | `ritual-dapp-multimodal` |
+| `0x081A` | Video Generation | Async (long-running) | 20 | `ritual-dapp-multimodal` |
+| `0x081B` | DKMS Key Derivation | Async | 10 | — |
+| `0x0820` | Persistent Agent | Async (long-running) | 13-field envelope | `ritual-dapp-agents` |
 | `0x0009` | Ed25519 Verify | Synchronous | 3 | `ritual-dapp-ed25519` |
 | `0x0100` | SECP256R1/P-256 | Synchronous | 3 | `ritual-dapp-passkey` |
 | `0x0830` | TX Hash | Synchronous | 0 (any input) | — |
@@ -73,15 +66,60 @@ cast code "0xD4AA9D55215dc8149Af57605e70921Ea16b73591" --rpc-url "$RPC_URL"
 
 ```solidity
 interface IRitualWallet {
-    function deposit(uint256 lockDuration) external payable;
-    function depositFor(address user, uint256 lockDuration) external payable;
+    enum EscrowStatus { NONE, ACTIVE, SETTLED, EXPIRED }
+
+    struct Escrow {
+        address sponsor;
+        uint256 reserved;
+        uint256 paid;
+        uint64 expiryBlock;
+        EscrowStatus status;
+    }
+
+    function deposit() external payable;
+    function depositFor(address account) external payable;
     function withdraw(uint256 amount) external;
-    function balanceOf(address account) external view returns (uint256);
-    function lockUntil(address account) external view returns (uint256);
+    function availableBalance(address account) external view returns (uint256);
+    function reservedBalance(address account) external view returns (uint256);
+    function allowance(address sponsor, address caller) external view returns (uint256);
+    function approve(address caller, uint256 amount) external;
+    function increaseAllowance(address caller, uint256 amount) external;
+    function decreaseAllowance(address caller, uint256 amount) external;
+    function escrows(bytes32 escrowId) external view returns (Escrow memory);
 }
 ```
 
-There is no `lockedBalanceOf`. There is no `emergencyWithdraw`. `lockUntil` returns a block number, not a balance. Lock is monotonic — new deposits only extend, never shorten. See `ritual-dapp-wallet` for deposit sizing, lock duration guidance, and EOA vs contract deposit semantics.
+There is no `emergencyWithdraw`. There is no lock — deposits are immediately available; the balance getter is `availableBalance`. Accounting is two-bucket: `availableBalance(account)` is spendable now, `reservedBalance(account)` is what active escrows hold. To let a consumer contract reserve funds on your behalf, grant a sponsor→caller allowance with `approve(caller, amount)` (read it back via `allowance(sponsor, caller)`; `type(uint256).max` is infinite and never decremented); per-job escrow state lives in `escrows(escrowId)`. This is not an exhaustive list of the V2 surface — `increaseAllowance`/`decreaseAllowance` and the escrow accessors also exist. See `ritual-dapp-wallet` for deposit sizing, allowance guidance, and EOA vs contract deposit semantics.
+
+### IAgentIdentityRegistry / AgentIdentityRegistry
+
+AgentIdentityRegistry (`0x2cbF50F833a3AEfb5c5B27068052cB5585F5c087`) is the canonical on-chain source of agent-id ownership and operator delegation. A chain-issued `agentId` is required to spawn a Persistent Agent (0x0820) — see `ritual-dapp-agents`.
+
+```solidity
+interface IAgentIdentityRegistry {
+    struct AgentIdentity {
+        uint256 agentId;
+        address owner;
+    }
+
+    function getIdentity(uint256 agentId) external view returns (AgentIdentity memory);
+    function ownerOf(uint256 agentId) external view returns (address);
+}
+
+// Full AgentIdentityRegistry surface (beyond the IAgentIdentityRegistry read subset):
+//   function allocateAgentId(address identityOwner) external returns (uint256 agentId);
+//   function agentIdsOf(address identityOwner) external view returns (uint256[] memory);
+//   function getOwnerAgentIds(address identityOwner) external view returns (uint256[] memory);
+//   function exists(uint256 agentId) external view returns (bool);
+//   function setAgentOperator(uint256 agentId, address operator, bool approved) external;
+//   function isAgentOperator(uint256 agentId, address operator) external view returns (bool);
+//   uint256 public nextAgentId;
+//   event AgentIdAllocated(uint256 indexed agentId, address indexed owner, address indexed allocator);
+//   event AgentOperatorSet(uint256 indexed agentId, address indexed operator, bool approved);
+//   errors: InvalidOwner, InvalidOperator, IdentityOwnerMismatch, NotAgentOwner, UnknownAgentId
+```
+
+`allocateAgentId` requires `identityOwner == msg.sender` (else reverts `IdentityOwnerMismatch`) and allocates `++nextAgentId`. Operator delegation (`setAgentOperator`) grants *action-initiation* authority only — `operator == address(0)` is rejected with `InvalidOperator`, and the DKMS derivation principal always stays the owner (keyed by `agentId`).
 
 ### IScheduler
 
@@ -97,7 +135,7 @@ interface IScheduler {
         uint256 maxFeePerGas,
         uint256 maxPriorityFeePerGas,
         uint256 value,
-        address payer
+        address sponsor
     ) external returns (uint256 callId);
 
     function schedule(
@@ -109,12 +147,10 @@ interface IScheduler {
 
     function cancel(uint256 callId) external;
     function getCallState(uint256 callId) external view returns (uint8);
-    function approveScheduler(address schedulerContract) external;
-    function revokeScheduler(address schedulerContract) external;
 }
 ```
 
-The Scheduler always calls back `msg.sender` — there is no `target` parameter. Only contracts can schedule (not EOAs). Returns `uint256`, not `bytes32`. The first `uint256` parameter of your callback (bytes 4–35) is overwritten with the real `executionIndex` at execution time. See `ritual-dapp-scheduler` for full usage patterns, predicate scheduling, and TTL sizing.
+The Scheduler always calls back `msg.sender` — there is no `target` parameter. Only contracts can schedule (not EOAs). Returns `uint256`, not `bytes32`. The first `uint256` parameter of your callback (bytes 4–35) is overwritten with the real `executionIndex` at execution time. There is no `approveScheduler`/`revokeScheduler` — to authorize a `sponsor != msg.sender`, the sponsor calls `RitualWallet.approve(scheduledConsumer, amount)` (the same unified allowance used by async precompiles); revoke by lowering it via `approve(caller, 0)` / `decreaseAllowance(caller, amount)`. See `ritual-dapp-scheduler` for full usage patterns, predicate scheduling, and TTL sizing.
 
 CallState: SCHEDULED=0, EXECUTING=1, COMPLETED=2, CANCELLED=3, EXPIRED=4.
 
@@ -126,9 +162,9 @@ interface ITEEServiceRegistry {
         address paymentAddress;
         address teeAddress;
         uint8 teeType;
-        bytes publicKey;
+        bytes executorSecretsAuthPublicKey;
         string endpoint;
-        bytes32 certPubKeyHash;
+        bytes32 mTlsSpkiHash;
         uint8 capability;
     }
 
@@ -186,7 +222,7 @@ If your contract stores executor preferences, make them updatable and validate a
 
 ### AsyncJobTracker (read-only)
 
-AsyncJobTracker (`0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5`) is a system contract — the block builder and executors write to it, dApps only read from it. Full ABI is verified on the [block explorer](https://explorer.ritualfoundation.org/address/0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5). The two things you need from it: **watch events** (for indexing) and **check sender lock** (before submitting).
+AsyncJobTracker (`0xf00385449fD961925A0B125F5f30b29B682D4bFb`) is a system contract — the block builder and executors write to it, dApps only read from it. Full ABI is verified on the [block explorer](https://explorer.ritualfoundation.org/address/0xf00385449fD961925A0B125F5f30b29B682D4bFb). The two things you need from it: **watch events** (for indexing) and **check the tx-origin nonce lock** (before submitting).
 
 **Events:**
 
@@ -197,7 +233,8 @@ event JobAdded(
     address indexed precompileAddress,
     uint256 commitBlock,
     bytes precompileInput,
-    address senderAddress,
+    address callerAddress,
+    address txOrigin,
     bytes32 previousBlockHash,
     uint256 previousBlockNumber,
     uint256 previousBlockTimestamp,
@@ -213,12 +250,12 @@ event JobRemoved(address indexed executor, bytes32 indexed jobId, bool indexed c
 **View functions:**
 
 ```solidity
-function hasPendingJobForSender(address sender) external view returns (bool);
+function hasPendingJobForTxOrigin(address txOrigin) external view returns (bool);
 function isLongRunning(bytes32 jobId) external view returns (bool);
 function isPhase1Settled(bytes32 jobId) external view returns (bool);
 ```
 
-`hasPendingJobForSender` is the canonical sender lock check — call it before submitting any async transaction. `isLongRunning` tells you if a job uses long-running async delivery. `isPhase1Settled` tells you if Phase 1 settlement happened (long-running async only).
+`hasPendingJobForTxOrigin` is the canonical nonce-lock check, keyed on `txOrigin` (== the EOA signer for ordinary user txs; system txs set `txOrigin = 0` and are exempt) — call it before submitting any non-system async transaction. `isLongRunning` tells you if a job uses long-running async delivery. `isPhase1Settled` tells you if Phase 1 settlement happened (long-running async only).
 
 There is also `getJob(bytes32) returns (Job memory, bytes memory, bytes memory)` which returns a 14-field struct for advanced status reconciliation. The `Job` struct has `commitBlock` and `ttl` fields — compute expiry as `commitBlock + ttl` (there is no `expiryBlock` field or getter). For short-running async precompiles (HTTP, LLM, DKMS), settlement removes the job and `getJob` reverts with "not found". See `ritual-dapp-backend` for the full polling pattern.
 
@@ -232,17 +269,29 @@ GET=1, POST=2, PUT=3, DELETE=4, PATCH=5, HEAD=6, OPTIONS=7. Method code 0 is inv
 
 ### Short-Running Async Output Envelope
 
-All short-running async precompiles (0x0801, 0x0802) return a two-layer envelope:
+The Solidity CALL return from a short-running async precompile (0x0801, 0x0802) has a two-layer envelope:
 
 ```solidity
 (bytes memory simmedInput, bytes memory actualOutput) = abi.decode(raw, (bytes, bytes));
 ```
 
-The inner `actualOutput` is precompile-specific. For HTTP (5 fields):
+RPC receipt `spcCalls[i].output` already contains the bare `actualOutput`. Decode that field directly with the response ABI below.
+
+The inner `actualOutput` is precompile-specific. For inline HTTP output (5 fields):
 
 ```solidity
 (uint16 statusCode, string[] headerKeys, string[] headerValues, bytes body, string errorMessage)
 ```
+
+When the HTTP request sets `output_storage_ref` (DA output), the executor uploads the (ECIES-encrypted) ABI-encoded HTTPCallResponse off-chain and `actualOutput` is instead a DA result envelope (5 fields):
+
+```solidity
+(bool hasError, string outputUri, bytes32 outputContentHash, uint64 outputSizeBytes, string errorMessage)
+```
+
+To read it: decode the envelope, fetch the bytes from `outputUri`, verify the sha256 and size, ABI-decode the stored bytes as a single `bytes` value to extract the ciphertext, ECIES-decrypt with the user private key, then decode the recovered bytes as the inline HTTPCallResponse above. DA output encryption is fail-closed — it requires a valid 65-byte `user_public_key` with a `0x04` prefix.
+
+When the HTTP `body` starts with `RITHTTP1`, the outer `output_storage_ref` must be empty and `actualOutput` instead starts with `RITOUT1`. Guard the seven-byte prefix, then decode `(bool hasError, uint16 upstreamStatus, uint8 contractEncoding, bytes contractOutput, ArtifactReceipt[] receipts, bytes4 errorCode)`. The same bytes arrive in a long-running Phase 2 callback. Authenticate the callback and pending job first. Normal completion uses encoding `4`: decode `contractOutput` as `PipeResult[]`, matched by index to requested outputs; outer receipts are empty. Early failures can have encoding `0` and no pipe results. Inspect each required pipe's success, kind, encoding, encryption, size and hash before bounded state writes. A failed live stream or DA upload can leave valid CONTRACT usage: preserve accounting according to application policy instead of blanket-rejecting the aggregate `hasError`. Use `RITHTTP1.encodeRequest(options,jsonTemplate,inputRefs,outputs)` and `RITHTTP1.decodePipeResults`. See the [base](../ritual-dapp-http/references/rithttp1.md) and [private-I/O](../ritual-dapp-http/references/rithttp1-private-io.md) references.
 
 ### Long-Running Async Base Fields
 
@@ -251,9 +300,11 @@ All long-running async precompiles share these base fields at the start of their
 | Field | Type | Description |
 |---|---|---|
 | executor | address | TEE executor from registry |
+| sponsor | address | RitualWallet account escrowing payment for this async job (non-zero) |
+| secretOwners | address[] | explicit owner per encrypted secret blob; parallel to encryptedSecrets and secretSignatures (all empty together when no secrets, each owner non-zero) |
 | encryptedSecrets | bytes[] | ECIES-encrypted secrets (or empty) |
 | ttl | uint256 | Max blocks for Phase 1 settlement (1–500) |
-| secretSignatures | bytes[] | EIP-191 signatures over encrypted secrets |
+| secretSignatures | bytes[] | EIP-191 owner signatures over each blob's domain-separated secret-authorization payload (not the raw ciphertext); signer = secretOwners[i] |
 | userPublicKey | bytes | 65-byte uncompressed secp256k1 key (or empty) |
 
 Followed by precompile-specific polling config, delivery config, and payload fields. See each precompile's skill for the complete ABI layout.
@@ -268,28 +319,42 @@ HTTP (0x0801) and Long-Running HTTP (0x0805) append these fields after the core 
 | dkmsKeyFormat | uint8 | Key format (0 = disabled, 1 = Eth/secp256k1) |
 | piiEnabled | bool | Enable PII redaction (independent of dKMS) |
 
-`dkmsKeyIndex` and `dkmsKeyFormat` control dKMS key derivation. `piiEnabled` controls PII redaction and is independent of dKMS. Always encode all 13 fields for HTTP and all 35 fields for Long-Running HTTP — set unused fields to zero.
+`dkmsKeyIndex` and `dkmsKeyFormat` control dKMS key derivation. `piiEnabled` controls PII redaction and is independent of dKMS. Always encode all 16 fields for HTTP and all 38 fields for Long-Running HTTP — set unused fields to zero.
 
 ---
 
 ## Callback Security
 
-All long-running async callbacks are delivered by the AsyncDelivery contract. Always verify `msg.sender`.
+Authenticate both the delivery sender and the job. A caller can choose this contract as a delivery target for a job submitted elsewhere; `msg.sender == AsyncDelivery` alone does not establish provenance.
+
+Record the origin transaction hash using `0x0830` immediately before submitting the long-running call. Consume that pending job before processing its result:
 
 ```solidity
-address constant ASYNC_DELIVERY = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+address constant ASYNC_DELIVERY = 0x508f57AE70967Da28AE0Ab6b95532878c4D0F440;
+address constant TX_HASH_PRECOMPILE = address(0x0830);
+mapping(bytes32 => bool) public pendingJobs;
 
 modifier onlyAsyncDelivery() {
     require(msg.sender == ASYNC_DELIVERY, "only async delivery");
     _;
 }
 
+function _trackCurrentJob() internal returns (bytes32 jobId) {
+    (bool ok, bytes memory output) = TX_HASH_PRECOMPILE.staticcall("");
+    require(ok && output.length == 32, "tx hash unavailable");
+    jobId = abi.decode(output, (bytes32));
+    require(!pendingJobs[jobId], "job already pending");
+    pendingJobs[jobId] = true;
+}
+
 function onResult(bytes32 jobId, bytes calldata result) external onlyAsyncDelivery {
-    require(!fulfilled[jobId], "already fulfilled");
-    fulfilled[jobId] = true;
+    require(pendingJobs[jobId], "unknown or fulfilled job");
+    delete pendingJobs[jobId];
     // process result
 }
 ```
+
+Encode this contract and its matching selector as the delivery target. Submission access control is application-specific: pending-job tracking proves this contract submitted the job, not that every caller should be authorized to create paid jobs.
 
 ### Escape Hatch for Stuck State
 
@@ -309,7 +374,7 @@ function _checkAutoExpiry(address user) internal {
 
 ## Error Handling
 
-**Synchronous precompiles** (ONNX, JQ, Ed25519, SECP256R1): errors revert the transaction. Use try/catch.
+**Synchronous precompiles** (JQ, Ed25519, SECP256R1): check low-level call success and the expected return shape before decoding. Do not assume every failure reverts: JQ query/type failures can return empty output on a successful call. See the [JQ compatibility notes](../ritual-dapp-precompiles/SKILL.md#query-compatibility-and-silent-failures).
 
 **Short-running async** (HTTP, LLM): the transaction settles even if the executor hit an error. Check the output:
 ```solidity
@@ -320,7 +385,7 @@ if (bytes(err).length > 0) { /* executor error */ }
 if (statusCode >= 400) { /* HTTP error */ }
 ```
 
-**Two-phase async** (Agent, Long HTTP, etc.): Phase 1 returns a task ID. Phase 2 delivers via callback. If the callback reverts, `AsyncDelivery` emits `DeliveryFailed(bytes32 jobId, address user, string reason)`.
+**Two-phase async** (Agent, Long HTTP, etc.): Phase 1 returns a task ID. Phase 2 delivers via callback. If the callback reverts, `AsyncDelivery` emits `Delivered(bytes32 jobId, address sponsor, address target, bool success, uint256 gasConsumed, uint256 gasRefunded, uint256 valueRefunded)` with `success = false` and refunds the reverted callback value to the escrow sponsor (there is no `DeliveryFailed` event).
 
 ---
 
@@ -332,7 +397,7 @@ if (statusCode >= 400) { /* HTTP error */ }
 import "forge-std/Test.sol";
 
 contract ConsumerTest is Test {
-    address constant ASYNC_DELIVERY = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+    address constant ASYNC_DELIVERY = 0x508f57AE70967Da28AE0Ab6b95532878c4D0F440;
 
     function test_callbackOnlyFromDelivery() public {
         AgentConsumer consumer = new AgentConsumer();
@@ -390,10 +455,10 @@ function setUp() public {
 }
 
 function test_walletDeposit() public {
-    IRitualWallet wallet = IRitualWallet(0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948);
+    IRitualWallet wallet = IRitualWallet(0xF04076756d8129Baec46Dc0F1c526Baec490C393);
     vm.deal(address(this), 1 ether);
-    wallet.deposit{value: 0.5 ether}(5000);
-    assertEq(wallet.balanceOf(address(this)), 0.5 ether);
+    wallet.deposit{value: 0.5 ether}();
+    assertEq(wallet.availableBalance(address(this)), 0.5 ether);
 }
 ```
 
@@ -401,16 +466,16 @@ function test_walletDeposit() public {
 
 ## Security Checklist
 
-- [ ] All callback functions have `onlyAsyncDelivery` modifier (`msg.sender == 0x5A16...39F6`)
+- [ ] All callback functions have `onlyAsyncDelivery` modifier (`msg.sender == 0x508f...F440`)
 - [ ] Callbacks are idempotent (check-and-set fulfillment flag before processing)
 - [ ] Follows Check-Effects-Interactions pattern
 - [ ] Stuck-state escape hatch (TTL-based auto-expiry or admin override)
-- [ ] RitualWallet has sufficient balance with lock covering `commit_block + ttl`
+- [ ] Payer/sponsor RitualWallet has sufficient available balance (and, for sponsored/delegated calls, `allowance(sponsor, caller)`) to cover the required reserve. For long-running HTTP this includes Phase 1 HTTP fee, worst-case Phase 2 polling escrow (`FEE_PER_POLL_BLOCK_WEI * (ttl + maxPollBlock)`), worst-case output payload fee, and callback gas/value.
 - [ ] Executor address fetched from TEEServiceRegistry (not zero address)
 - [ ] `deliverySelector` matches the actual callback function's selector
 - [ ] `deliveryGasLimit` is sufficient for callback execution
 - [ ] HTTP method codes are correct (GET=1, POST=2, PUT=3, DELETE=4, PATCH=5)
-- [ ] HTTP encoding has all 13 fields (including `dkmsKeyIndex`, `dkmsKeyFormat`, `piiEnabled`)
+- [ ] HTTP encoding has all 16 fields (including `sponsor`, `secret_owners`, `dkmsKeyIndex`, `dkmsKeyFormat`, `piiEnabled`, `output_storage_ref`)
 - [ ] `receive()` present if contract needs to accept native RITUAL
 - [ ] Events emitted for all state changes (for off-chain indexing)
 
@@ -421,13 +486,13 @@ function test_walletDeposit() public {
 | Constraint | Value |
 |---|---|
 | Block time | ~350ms (conservative baseline) |
-| Chain ID | 1979 |
+| Chain ID | 784 |
 | RPC | `https://rpc.ritualfoundation.org` |
-| Max TTL (async commitment) | 500 blocks (~175s, ~2.9m) |
+| Max TTL (async commitment) | 500 blocks (~175s at the ~350ms baseline; chain-config value) |
 | Min TTL (async commitment) | 1 block |
 | Max Phase 2 deadline offset | 70,000 blocks (~6.8h) |
 | Max precompile input size | 10 KB |
-| Max HTTP response size | 5 KB |
+| Max HTTP response size | 5 KB (chain-config value) |
 | Max long-running calls per tx | 1 |
 | Max async commits per sender per block | 1 |
 | Sender lock | Until Phase 1 settlement |

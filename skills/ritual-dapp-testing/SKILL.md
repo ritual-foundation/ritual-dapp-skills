@@ -5,6 +5,8 @@ description: Testing and debugging patterns for Ritual dApps. Use when writing t
 
 # Testing & Debugging — Ritual dApp Patterns
 
+> **Do not test with Anvil, Hardhat network, or a Foundry fork.** Ritual's asynchronous precompiles (HTTP `0x0801`, LLM `0x0802`, DKMS `0x081B`, and the two-phase ones `0x0805`/`0x0806`/`0x0807`/`0x080C`/`0x0818`–`0x081A`/`0x0820`) only exist on a real Ritual node: the block builder commits the job, a TEE executor computes off-chain, and the builder replays your transaction with the result injected. Anvil and every other local EVM have no code at those addresses, so a call returns empty bytes — a "passing" local test proves nothing about the precompile. Unit tests may mock the envelope with `vm.mockCall`/`vm.etch` to check encoding/decoding; everything else runs against the RPC you were given (`RITUAL_RPC_URL`), and a settled on-chain receipt is the only proof that a precompile integration works.
+
 ## Overview
 
 Ritual dApps span multiple layers — Solidity contracts, TypeScript viem interactions, backend services, and frontends — each requiring a different testing strategy. The async nature of Ritual precompiles adds complexity: a single user action may touch commit, execute, and settle phases across multiple blocks.
@@ -52,6 +54,12 @@ contract HTTPConsumer {
     address constant HTTP_PRECOMPILE = address(0x0801);
     event ResponseReceived(uint16 status, string body);
 
+    struct StorageRef {
+        string platform;
+        string path;
+        string keyRef;
+    }
+
     function decodeSettlement(bytes memory rawOutput)
         public
         pure
@@ -64,14 +72,14 @@ contract HTTPConsumer {
         );
     }
 
-    function fetchData(address executor, uint256 ttl, string calldata url)
+    function fetchData(address executor, address sponsor, uint256 ttl, string calldata url)
         external
         returns (uint16 status, bytes memory body)
     {
         bytes memory input = abi.encode(
-            executor, new bytes[](0), ttl, new bytes[](0), bytes(""),
+            executor, sponsor, new address[](0), new bytes[](0), ttl, new bytes[](0), bytes(""),
             url, uint8(1), new string[](0), new string[](0), bytes(""),
-            uint256(0), uint8(0), false
+            uint256(0), uint8(0), false, StorageRef("", "", "")
         );
         (bool success, bytes memory rawOutput) = HTTP_PRECOMPILE.call(input);
         require(success, "Precompile call failed");
@@ -136,6 +144,8 @@ contract HTTPConsumerTest is Test {
 
 ### Async Consumer with Callback Tests
 
+This callback-only unit fixture seeds pending-job state with an origin job hash; it does not implement job submission.
+
 ```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
@@ -143,25 +153,15 @@ pragma solidity ^0.8.24;
 import "forge-std/Test.sol";
 
 contract AsyncConsumer {
-    address constant LONG_HTTP_PRECOMPILE = address(0x0805);
     address public deliveryAddress;
 
     mapping(bytes32 => bool) public pendingJobs;
     mapping(bytes32 => bytes) public results;
 
-    event JobSubmitted(bytes32 indexed jobId);
     event JobCompleted(bytes32 indexed jobId, bytes result);
 
     constructor(address _deliveryAddress) {
         deliveryAddress = _deliveryAddress;
-    }
-
-    function submitJob(bytes calldata input) external {
-        (bool success, bytes memory result) = LONG_HTTP_PRECOMPILE.call(input);
-        require(success, "Precompile call failed");
-        bytes32 jobId = keccak256(result);
-        pendingJobs[jobId] = true;
-        emit JobSubmitted(jobId);
     }
 
     function onResult(bytes32 jobId, bytes calldata result) external {
@@ -240,8 +240,8 @@ contract AsyncConsumerTest is Test {
 
 ```solidity
 contract FeeCalculatorTest is Test {
-    uint256 constant BASE_FEE = 2_500_000_000_000; // 0.0000025 RITUAL
-    uint256 constant PER_BYTE_FEE = 350_000_000; // 0.35 gwei/byte input
+    uint256 constant BASE_FEE = 10_000_000_000_000_000; // 0.01 RIT (HTTP_EXECUTOR_BASE_FEE_WEI)
+    uint256 constant PER_BYTE_FEE = 350_000_000; // 0.35 gwei/byte input — snapshot value; confirm against deployed config
     uint256 constant MAX_INPUT_SIZE = 10 * 1024; // 10KB async input cap
 
     function calculateFee(uint256 inputSize) internal pure returns (uint256) {
@@ -299,7 +299,7 @@ contract MockPrecompileTest is Test {
 
         vm.mockCall(
             HTTP_PRECOMPILE,
-            "",
+            bytes(""),
             spcEnvelope
         );
 
@@ -314,6 +314,42 @@ contract MockPrecompileTest is Test {
             abi.decode(actualOutput, (uint16, string[], string[], bytes, string));
         assertEq(status, 200);
         assertEq(string(body), '{"result": "ok"}');
+    }
+
+    // When the request sets output_storage_ref, the executor uploads the
+    // (ECIES-encrypted) ABI-encoded HTTPCallResponse off-chain and actualOutput
+    // becomes a DA result envelope instead of the inline HTTPCallResponse:
+    //   (bool has_error, string output_uri, bytes32 output_content_hash, uint64 output_size_bytes, string error_message)
+    // The stored bytes (fetched from output_uri, verified against output_content_hash,
+    // then decrypted with the user private key) are the inline HTTPCallResponse above.
+    function test_MockHTTPResponse_DAOutput() public {
+        bytes32 contentHash = sha256(bytes('{"result": "ok"}')); // executor uses sha256 of the stored bytes
+        bytes memory daEnvelope = abi.encode(
+            false,                              // has_error
+            "gs://ritual-da/responses/abc",    // output_uri
+            contentHash,                        // output_content_hash
+            uint64(64),                         // output_size_bytes
+            ""                                  // error_message
+        );
+        bytes memory spcEnvelope = abi.encode(bytes("simulated-input"), daEnvelope);
+
+        vm.mockCall(HTTP_PRECOMPILE, bytes(""), spcEnvelope);
+
+        (bool success, bytes memory result) = HTTP_PRECOMPILE.call(
+            abi.encode("anything")
+        );
+        assertTrue(success);
+
+        // Unwrap short-running async envelope, then decode the DA result envelope.
+        (, bytes memory actualOutput) = abi.decode(result, (bytes, bytes));
+        (bool hasError, string memory outputUri, bytes32 outputHash, uint64 size, ) =
+            abi.decode(actualOutput, (bool, string, bytes32, uint64, string));
+        assertFalse(hasError);
+        assertEq(outputUri, "gs://ritual-da/responses/abc");
+        assertEq(outputHash, contentHash);
+        assertEq(size, 64);
+        // dApp then fetches outputUri, verifies sha256 == outputHash, decrypts,
+        // and ABI-decodes the inline HTTPCallResponse from the stored bytes.
     }
 }
 ```
@@ -379,6 +415,7 @@ contract ParameterizedMockTest is Test {
     function setUp() public {
         mock = new ParameterizedMock();
         vm.etch(HTTP_PRECOMPILE, address(mock).code);
+        mock = ParameterizedMock(HTTP_PRECOMPILE);
     }
 
     function test_DifferentResponsesPerInput() public {
@@ -420,9 +457,9 @@ pragma solidity ^0.8.24;
 import "forge-std/Test.sol";
 
 contract ForkTest is Test {
-    address constant RITUAL_WALLET = 0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948;
-    address constant ASYNC_JOB_TRACKER = 0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5;
-    address constant TEE_SERVICE_REGISTRY = 0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F;
+    address constant RITUAL_WALLET = 0xF04076756d8129Baec46Dc0F1c526Baec490C393;
+    address constant ASYNC_JOB_TRACKER = 0xf00385449fD961925A0B125F5f30b29B682D4bFb;
+    address constant TEE_SERVICE_REGISTRY = 0xf4495DC72143D44A93AB0ecE4d6D63a216b27839;
 
     uint256 ritualFork;
 
@@ -437,12 +474,12 @@ contract ForkTest is Test {
 
         vm.prank(user);
         (bool ok,) = RITUAL_WALLET.call{value: 0.1 ether}(
-            abi.encodeWithSignature("deposit(uint256)", 100) // 100 = lock duration in blocks
+            abi.encodeWithSignature("deposit()") // deposits credit available balance immediately (no lock)
         );
         assertTrue(ok, "Deposit failed");
 
         (bool ok2, bytes memory result) = RITUAL_WALLET.call(
-            abi.encodeWithSignature("balanceOf(address)", user)
+            abi.encodeWithSignature("availableBalance(address)", user)
         );
         assertTrue(ok2);
         uint256 balance = abi.decode(result, (uint256));
@@ -482,8 +519,8 @@ contract DeployAndTestOnFork is Test {
 
         // Deposit fees in RitualWallet
         vm.prank(address(consumer));
-        (bool ok,) = address(0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948).call{value: 0.1 ether}(
-            abi.encodeWithSignature("deposit(uint256)", 200) // 200 = lock duration in blocks
+        (bool ok,) = address(0xF04076756d8129Baec46Dc0F1c526Baec490C393).call{value: 0.1 ether}(
+            abi.encodeWithSignature("deposit()") // deposits credit available balance immediately (no lock)
         );
         assertTrue(ok);
     }
@@ -492,6 +529,7 @@ contract DeployAndTestOnFork is Test {
         // This will create a real commitment on the forked state
         consumer.fetchData(
             address(0x1234), // executor address from registry
+            address(consumer), // sponsor: RitualWallet account backing the job
             100,
             "https://api.example.com/test"
         );
@@ -523,7 +561,7 @@ Run fork tests: `RITUAL_RPC_URL=https://rpc.ritualfoundation.org forge test --ma
 
 When testing precompiles via `eth_call` (read-only simulation), behavior differs between sync and async precompiles.
 
-**Sync precompiles** (ONNX, JQ, Ed25519): execute normally and return real computation results. Standard `eth_call` testing works.
+**Sync precompiles** (JQ, Ed25519): execute normally and return real computation results. Standard `eth_call` testing works.
 
 **All async precompiles** (HTTP 0x0801, LLM 0x0802, Long HTTP 0x0805, Sovereign Agent 0x080C, etc.): the EVM injects a default `AsyncCommitmentContext` in `Building` mode with empty `pending_spc_calls`. Each precompile hits the "fresh simulation" code path and returns:
 
@@ -535,6 +573,8 @@ The call succeeds (no revert), but the output's second element is always empty b
 
 To test async precompiles, submit a real transaction and wait for settlement, or use `vm.mockCall` / `vm.etch` (Section 2) for unit tests.
 
+Source: `ritual-revm-internal/crates/precompile/src/http_call.rs:265-287`, `async_common.rs:12-50`, `reth/crates/evm/src/lib.rs:308-313`.
+
 ---
 
 ## 4. Precompile Encoding Unit Tests (Vitest)
@@ -543,10 +583,12 @@ To test async precompiles, submit a real transaction and wait for settlement, or
 
 ```typescript
 import { describe, it, expect } from 'vitest';
-import { encodeAbiParameters, decodeAbiParameters, type Address } from 'viem';
+import { hexToBytes, encodeAbiParameters, decodeAbiParameters, toHex, getAddress, type Address } from 'viem';
 
 const HTTP_REQUEST_TYPES = [
   { name: 'executor', type: 'address' },
+  { name: 'sponsor', type: 'address' },
+  { name: 'secretOwners', type: 'address[]' },
   { name: 'encryptedSecrets', type: 'bytes[]' },
   { name: 'ttl', type: 'uint256' },
   { name: 'secretSignatures', type: 'bytes[]' },
@@ -559,6 +601,11 @@ const HTTP_REQUEST_TYPES = [
   { name: 'dkmsKeyIndex', type: 'uint256' },
   { name: 'dkmsKeyFormat', type: 'uint8' },
   { name: 'piiEnabled', type: 'bool' },
+  { name: 'outputStorageRef', type: 'tuple', components: [
+    { name: 'platform', type: 'string' },
+    { name: 'path', type: 'string' },
+    { name: 'keyRef', type: 'string' },
+  ] }, // DA output ref (platform, path, keyRef); ['','',''] = inline response
 ] as const;
 
 const HTTP_RESPONSE_TYPES = [
@@ -571,53 +618,54 @@ const HTTP_RESPONSE_TYPES = [
 
 describe('HTTP Call request encoding', () => {
   const executor: Address = '0x1234567890abcdef1234567890abcdef12345678';
+  const sponsor: Address = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
 
   it('encodes and decodes a GET request', () => {
     const encoded = encodeAbiParameters(HTTP_REQUEST_TYPES, [
-      executor, [], 100n, [], '0x',
+      executor, sponsor, [], [], 100n, [], '0x',
       'https://api.example.com/data', 1, ['Accept'], ['application/json'],
-      new TextEncoder().encode(''),
-      0n, 0, false,
+      '0x',
+      0n, 0, false, ['', '', ''],
     ]);
     expect(encoded).toMatch(/^0x/);
 
     const decoded = decodeAbiParameters(HTTP_REQUEST_TYPES, encoded);
-    expect(decoded[0]).toBe(executor);
-    expect(decoded[5]).toBe('https://api.example.com/data');
-    expect(decoded[6]).toBe(1); // GET
-    expect(decoded[7]).toEqual(['Accept']);
-    expect(decoded[8]).toEqual(['application/json']);
-    expect(decoded[2]).toBe(100n);
+    expect(decoded[0]).toBe(getAddress(executor));
+    expect(decoded[7]).toBe('https://api.example.com/data');
+    expect(decoded[8]).toBe(1); // GET
+    expect(decoded[9]).toEqual(['Accept']);
+    expect(decoded[10]).toEqual(['application/json']);
+    expect(decoded[4]).toBe(100n);
   });
 
   it('encodes and decodes a POST request with body', () => {
     const body = JSON.stringify({ query: 'test' });
 
     const encoded = encodeAbiParameters(HTTP_REQUEST_TYPES, [
-      executor, [], 200n, [], '0x',
+      executor, sponsor, [], [], 200n, [], '0x',
       'https://api.example.com/query', 2,
       ['Content-Type'], ['application/json'],
-      new TextEncoder().encode(body),
-      0n, 0, false,
+      toHex(body),
+      0n, 0, false, ['', '', ''],
     ]);
 
     const decoded = decodeAbiParameters(HTTP_REQUEST_TYPES, encoded);
-    expect(decoded[5]).toBe('https://api.example.com/query');
-    expect(decoded[6]).toBe(2); // POST
-    expect(new TextDecoder().decode(decoded[9] as Uint8Array)).toBe(body);
+    expect(decoded[7]).toBe('https://api.example.com/query');
+    expect(decoded[8]).toBe(2); // POST
+    expect(new TextDecoder().decode(hexToBytes(decoded[11]))).toBe(body);
   });
 
   it('handles empty headers and body', () => {
     const encoded = encodeAbiParameters(HTTP_REQUEST_TYPES, [
-      executor, [], 50n, [], '0x',
+      executor, sponsor, [], [], 50n, [], '0x',
       'https://test.com', 1, [], [],
-      new Uint8Array(),
-      0n, 0, false,
+      '0x',
+      0n, 0, false, ['', '', ''],
     ]);
 
     const decoded = decodeAbiParameters(HTTP_REQUEST_TYPES, encoded);
-    expect(decoded[7]).toEqual([]); // headerKeys
-    expect(decoded[8]).toEqual([]); // headerValues
+    expect(decoded[9]).toEqual([]); // headerKeys
+    expect(decoded[10]).toEqual([]); // headerValues
   });
 });
 
@@ -627,7 +675,7 @@ describe('HTTP Call response decoding', () => {
       200,
       ['content-type'],
       ['application/json'],
-      new TextEncoder().encode('{"price": 3500}'),
+      toHex('{"price": 3500}'),
       '',
     ]);
 
@@ -636,12 +684,12 @@ describe('HTTP Call response decoding', () => {
 
     expect(statusCode).toBe(200);
     expect(errorMessage).toBe('');
-    expect(JSON.parse(new TextDecoder().decode(body as Uint8Array))).toEqual({ price: 3500 });
+    expect(JSON.parse(new TextDecoder().decode(hexToBytes(body)))).toEqual({ price: 3500 });
   });
 
   it('decodes an error response', () => {
     const encoded = encodeAbiParameters(HTTP_RESPONSE_TYPES, [
-      0, [], [], new Uint8Array(), 'executor timeout',
+      0, [], [], '0x', 'executor timeout',
     ]);
 
     const [statusCode, , , , errorMessage] =
@@ -654,12 +702,12 @@ describe('HTTP Call response decoding', () => {
   it('round-trips through ABI encoding', () => {
     const bodyText = 'hello';
     const encoded = encodeAbiParameters(HTTP_RESPONSE_TYPES, [
-      200, [], [], new TextEncoder().encode(bodyText), '',
+      200, [], [], toHex(bodyText), '',
     ]);
 
     const [statusCode, , , body] = decodeAbiParameters(HTTP_RESPONSE_TYPES, encoded);
     expect(statusCode).toBe(200);
-    expect(new TextDecoder().decode(body as Uint8Array)).toBe('hello');
+    expect(new TextDecoder().decode(hexToBytes(body))).toBe('hello');
   });
 });
 ```
@@ -667,6 +715,22 @@ describe('HTTP Call response decoding', () => {
 ### Executor Query Tests
 
 For executor discovery tests (`getServicesByCapability`, TEEServiceRegistry ABI, mock executor responses), see `ritual-dapp-deploy` and `ritual-dapp-contracts`.
+
+### RITHTTP1 protocol matrix
+
+When a dApp uses RITHTTP1, start with [the included Bun/Foundry codecs and upstream-generated fixtures](../../examples/rithttp/), [wire schema](../ritual-dapp-http/references/rithttp1.md) and [private I/O](../ritual-dapp-http/references/rithttp1-private-io.md). Minimum coverage:
+
+- Exact canonical four-field request and encoding-4 results across TypeScript, Solidity and pinned executor fixtures; reject unknown flags, trailing bytes, old five/six-field requests and early-error/no-array misuse.
+- Ordered `$ritual_da` slots, exact stored-byte SHA-256, one-level hydration, post-hydration `http:*` expansion and terminal secret values; unchanged input artifact vectors for every recipient and malformed-artifact rejection.
+- 8 inputs, 6 total pipes, 1 STREAM, 4 DA; valid recipient points, empty non-DA refs, duplicate normalized DA paths and real full 16/38-field request/callback size limits.
+- String selector input, `fromjson?`, `[DONE]` omission by selector, decimal preservation, static projections, empty vs empty-string emission, rejected iteration/arithmetic and explicit collection delimiters.
+- Every pipe kind with both plaintext and encryption, buffered and SSE upstreams; independent selectors, keys and encodings. Confirm encrypted CONTRACT works and public STREAM still uses a RITPIPE1 record.
+- Encoding-4 ordered metadata and per-pipe success: stream publication/DA upload failure preserves valid CONTRACT usage; fatal upstream read/cancel cannot authenticate incomplete collections.
+- STREAM length-prefixed binary-frame commitment, selected plaintext byte total, item count and job/pipe/encoding/sequence/payload-length bindings; reject tampering, replay, omission and reordering. DA hash/size must cover its independent stored bytes, never the live stream commitment.
+- Short rejection of `AWAIT_RESPONSE`; Long HTTP `resultJsonPath="."`, held deadlines/cancellation, and completed result retry without another upstream call/upload. An open TCP request is not crash durable.
+
+Network coverage should exercise GCS/HF/Pinata hydration/upload, legacy task polling, held responses, authenticated short/long SSE, subscriber loss and independent settlement verification. Local mocks/fixtures prove component behavior, not deployed fleet support or cloud-storage availability. Pin compatible executor code before live tests; keep secret/input routing bound to the executor that can decrypt them.
+
 
 ---
 
@@ -682,7 +746,7 @@ import { createPublicClient, createWalletClient, http, defineChain } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts';
 
 export const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: {
@@ -722,14 +786,14 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { getTestClients } from './setup';
 import { parseEther, encodeAbiParameters, type Address } from 'viem';
 
-const RITUAL_WALLET: Address = '0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948';
+const RITUAL_WALLET: Address = '0xF04076756d8129Baec46Dc0F1c526Baec490C393';
 const HTTP_PRECOMPILE: Address = '0x0000000000000000000000000000000000000801';
 
 const ritualWalletAbi = [
-  { name: 'balanceOf', type: 'function', stateMutability: 'view',
-    inputs: [{ name: 'user', type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { name: 'availableBalance', type: 'function', stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
   { name: 'deposit', type: 'function', stateMutability: 'payable',
-    inputs: [{ name: 'lockDuration', type: 'uint256' }], outputs: [] },
+    inputs: [], outputs: [] },
 ] as const;
 
 describe('HTTP Call (integration)', () => {
@@ -741,7 +805,7 @@ describe('HTTP Call (integration)', () => {
     const balance = await clients.publicClient.readContract({
       address: RITUAL_WALLET,
       abi: ritualWalletAbi,
-      functionName: 'balanceOf',
+      functionName: 'availableBalance',
       args: [clients.account.address],
     });
 
@@ -750,7 +814,7 @@ describe('HTTP Call (integration)', () => {
         address: RITUAL_WALLET,
         abi: ritualWalletAbi,
         functionName: 'deposit',
-        args: [5000n],
+        args: [],
         value: parseEther('0.05'),
       });
       await clients.publicClient.waitForTransactionReceipt({ hash });
@@ -763,6 +827,8 @@ describe('HTTP Call (integration)', () => {
     const encoded = encodeAbiParameters(
       [
         { name: 'executor', type: 'address' },
+        { name: 'sponsor', type: 'address' },
+        { name: 'secretOwners', type: 'address[]' },
         { name: 'encryptedSecrets', type: 'bytes[]' },
         { name: 'ttl', type: 'uint256' },
         { name: 'secretSignatures', type: 'bytes[]' },
@@ -775,12 +841,17 @@ describe('HTTP Call (integration)', () => {
         { name: 'dkmsKeyIndex', type: 'uint256' },
         { name: 'dkmsKeyFormat', type: 'uint8' },
         { name: 'piiEnabled', type: 'bool' },
+        { name: 'outputStorageRef', type: 'tuple', components: [
+          { name: 'platform', type: 'string' },
+          { name: 'path', type: 'string' },
+          { name: 'keyRef', type: 'string' },
+        ] },
       ],
       [
-        executor, [], 100n, [], '0x',
+        executor, clients.account.address, [], [], 100n, [], '0x',
         'https://httpbin.org/get', 1, [], [],
-        new Uint8Array(),
-        0n, 0, false,
+        '0x',
+        0n, 0, false, ['', '', ''],
       ]
     );
 
@@ -805,13 +876,13 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { getTestClients } from './setup';
 import { parseEther, type Address } from 'viem';
 
-const RITUAL_WALLET: Address = '0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948';
+const RITUAL_WALLET: Address = '0xF04076756d8129Baec46Dc0F1c526Baec490C393';
 
 const ritualWalletAbi = [
-  { name: 'balanceOf', type: 'function', stateMutability: 'view',
-    inputs: [{ name: 'user', type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { name: 'availableBalance', type: 'function', stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
   { name: 'deposit', type: 'function', stateMutability: 'payable',
-    inputs: [{ name: 'lockDuration', type: 'uint256' }], outputs: [] },
+    inputs: [], outputs: [] },
 ] as const;
 
 describe('RitualWallet (integration)', () => {
@@ -825,7 +896,7 @@ describe('RitualWallet (integration)', () => {
     const before = await clients.publicClient.readContract({
       address: RITUAL_WALLET,
       abi: ritualWalletAbi,
-      functionName: 'balanceOf',
+      functionName: 'availableBalance',
       args: [clients.account.address],
     });
 
@@ -833,7 +904,7 @@ describe('RitualWallet (integration)', () => {
       address: RITUAL_WALLET,
       abi: ritualWalletAbi,
       functionName: 'deposit',
-      args: [5000n],
+      args: [],
       value: parseEther('0.001'),
     });
     await clients.publicClient.waitForTransactionReceipt({ hash });
@@ -841,7 +912,7 @@ describe('RitualWallet (integration)', () => {
     const after = await clients.publicClient.readContract({
       address: RITUAL_WALLET,
       abi: ritualWalletAbi,
-      functionName: 'balanceOf',
+      functionName: 'availableBalance',
       args: [clients.account.address],
     });
 
@@ -871,7 +942,7 @@ For frontend component and hook testing patterns (React Testing Library, wagmi m
 import { createPublicClient, http, defineChain, type Address, type Hex } from 'viem';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: {
@@ -884,8 +955,8 @@ const publicClient = createPublicClient({
   transport: http(process.env.RITUAL_RPC_URL),
 });
 
-const TEE_SERVICE_REGISTRY: Address = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F';
-const ASYNC_JOB_TRACKER: Address = '0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5';
+const TEE_SERVICE_REGISTRY: Address = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839';
+const ASYNC_JOB_TRACKER: Address = '0xf00385449fD961925A0B125F5f30b29B682D4bFb';
 
 // 1. Check if services are available for your precompile type
 const services = await publicClient.readContract({
@@ -900,9 +971,9 @@ const services = await publicClient.readContract({
         { name: 'paymentAddress', type: 'address' },
         { name: 'teeAddress', type: 'address' },
         { name: 'teeType', type: 'uint8' },
-        { name: 'publicKey', type: 'bytes' },
+        { name: 'executorSecretsAuthPublicKey', type: 'bytes' },
         { name: 'endpoint', type: 'string' },
-        { name: 'certPubKeyHash', type: 'bytes32' },
+        { name: 'mTlsSpkiHash', type: 'bytes32' },
         { name: 'capability', type: 'uint8' },
       ]},
       { name: 'isValid', type: 'bool' },
@@ -919,18 +990,18 @@ if (services.length === 0) {
   console.log('Check TEEServiceRegistry at', TEE_SERVICE_REGISTRY);
 }
 
-// 2. Check sender lock on AsyncJobTracker
+// 2. Check tx-origin lock on AsyncJobTracker
 const isLocked = await publicClient.readContract({
   address: ASYNC_JOB_TRACKER,
   abi: [{
-    name: 'hasPendingJobForSender', type: 'function', stateMutability: 'view',
-    inputs: [{ name: 'sender', type: 'address' }],
+    name: 'hasPendingJobForTxOrigin', type: 'function', stateMutability: 'view',
+    inputs: [{ name: 'txOrigin', type: 'address' }],
     outputs: [{ type: 'bool' }],
   }] as const,
-  functionName: 'hasPendingJobForSender',
+  functionName: 'hasPendingJobForTxOrigin',
   args: [testEOA],
 });
-console.log('Sender locked:', isLocked);
+console.log('Tx origin locked:', isLocked);
 
 // For full job status polling (getJob returns a 14-field struct),
 // see the AsyncJobTracker interface in the ritual-dapp-contracts skill.
@@ -1021,12 +1092,12 @@ console.log('Expected selector:', expectedSelector);
 ```typescript
 import { parseEther, formatEther, type Address } from 'viem';
 
-const RITUAL_WALLET: Address = '0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948';
+const RITUAL_WALLET: Address = '0xF04076756d8129Baec46Dc0F1c526Baec490C393';
 const walletAbi = [
-  { name: 'balanceOf', type: 'function', stateMutability: 'view',
-    inputs: [{ name: 'user', type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { name: 'availableBalance', type: 'function', stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
   { name: 'deposit', type: 'function', stateMutability: 'payable',
-    inputs: [{ name: 'lockDuration', type: 'uint256' }], outputs: [] },
+    inputs: [], outputs: [] },
 ] as const;
 
 const userAddress = walletClient.account.address;
@@ -1035,7 +1106,7 @@ const userAddress = walletClient.account.address;
 const balance = await publicClient.readContract({
   address: RITUAL_WALLET,
   abi: walletAbi,
-  functionName: 'balanceOf',
+  functionName: 'availableBalance',
   args: [userAddress],
 });
 console.log('Wallet balance:', formatEther(balance), 'RITUAL');
@@ -1051,7 +1122,7 @@ if (balance < parseEther('0.01')) {
     address: RITUAL_WALLET,
     abi: walletAbi,
     functionName: 'deposit',
-    args: [5000n],
+    args: [],
     value: parseEther('0.05'),
   });
   await publicClient.waitForTransactionReceipt({ hash });
@@ -1068,7 +1139,7 @@ if (balance < parseEther('0.01')) {
 3. For HTTP responses: body is `bytes`, not `string` — cast if needed
 
 ```typescript
-import { decodeAbiParameters, type Hex } from 'viem';
+import { hexToBytes, decodeAbiParameters, type Hex } from 'viem';
 
 // HTTP precompile (0x0801) response format
 const [statusCode, headerKeys, headerValues, body, errorMessage] =
@@ -1082,7 +1153,7 @@ const [statusCode, headerKeys, headerValues, body, errorMessage] =
 const bad = JSON.parse(resultHex); // ❌
 
 // Correct: decode via ABI, then parse the body bytes
-const textBody = new TextDecoder().decode(body);
+const textBody = new TextDecoder().decode(hexToBytes(body));
 const data = JSON.parse(textBody); // ✅ properly decoded
 ```
 
@@ -1110,7 +1181,7 @@ This returns the full call tree — precompile calls, internal calls, reverts wi
 | `Unknown job` | Callback for a job ID that doesn't exist in your mapping | Ensure job was properly registered in `submitJob` |
 | `Input too large` | Encoded request exceeds 10KB async input limit | Reduce request size; move data off-chain |
 | `Executor timeout` | Executor didn't respond within the execution window | Retry with different executor or higher TTL |
-| `Invalid secret signature` | Secret signature doesn't match encrypted payload | Re-sign with correct private key |
+| `Invalid secret signature` | Signed the raw ciphertext instead of the domain-separated authorization payload, or signed with a key whose address != `secret_owners[i]` | Rebuild the `RITUAL_SECRET_AUTHORIZATION_V1` preimage (domain ‖ uint16(len(useContext)) ‖ useContext ‖ uint256(chainId) ‖ executor ‖ owner ‖ keccak256(blob)) and sign it with the owner's private key |
 | `Decoding error` | ABI mismatch between encoder and decoder | Verify codec type matches precompile |
 | `Transaction reverted without reason` | Contract logic error or insufficient gas | Increase gas limit; check contract with `forge test -vvvv` |
 | `Nonce too low` | Concurrent transactions from same account | Wait for pending tx or use nonce manager |
@@ -1119,7 +1190,7 @@ This returns the full call tree — precompile calls, internal calls, reverts wi
 
 ## 9. Environment & Run Commands
 
-Ritual Chain (ID 1979, testnet).
+Ritual Chain (current configured snapshot: ID 784; classify the deployment before funding or writes).
 
 ```bash
 RITUAL_RPC_URL=https://rpc.ritualfoundation.org
@@ -1174,7 +1245,7 @@ export function makeMockHTTPResponseData(
   error = ''
 ): Hex {
   // Returns ABI-encoded HTTP response data for testing short-running async settlement decoding
-  const { encodeAbiParameters } = require('viem');
+  const { encodeAbiParameters, toHex } = require('viem');
   return encodeAbiParameters(
     [
       { type: 'uint16' },
@@ -1183,7 +1254,7 @@ export function makeMockHTTPResponseData(
       { type: 'bytes' },
       { type: 'string' },
     ],
-    [status, [], [], new TextEncoder().encode(body), error]
+    [status, [], [], toHex(body), error]
   );
 }
 ```
@@ -1238,12 +1309,12 @@ export async function retryAsync<T>(
 | Integration tests | `npx vitest run --config vitest.integration.config.ts` |
 | Gas snapshot | `forge snapshot` |
 | Coverage | `forge coverage` |
-| Mock precompile | `vm.mockCall(address(0x0801), "", responseBytes)` |
+| Mock precompile | `vm.mockCall(address(0x0801), bytes(""), responseBytes)` |
 | Etch precompile | `vm.etch(address(0x0801), mockContract.code)` |
-| AsyncJobTracker | `0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5` |
-| TEEServiceRegistry | `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` |
-| RitualWallet | `0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948` |
-| Chain ID | 1979 |
+| AsyncJobTracker | `0xf00385449fD961925A0B125F5f30b29B682D4bFb` |
+| TEEServiceRegistry | `0xf4495DC72143D44A93AB0ecE4d6D63a216b27839` |
+| RitualWallet | `0xF04076756d8129Baec46Dc0F1c526Baec490C393` |
+| Chain ID | 784 |
 | ABI encoding | `encodeAbiParameters` / `decodeAbiParameters` from viem |
 | Executor query | `publicClient.readContract({ address: TEE_SERVICE_REGISTRY, ... })` |
 | DA providers | Test with GCS (default), HuggingFace, and Pinata — see `ritual-dapp-da` for StorageRef format |

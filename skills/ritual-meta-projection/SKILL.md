@@ -20,7 +20,9 @@ The builder agent should never have to decide "should I use Chainlink or the HTT
 | Capability | How | Traditional chain equivalent (DON'T use) |
 |---|---|---|
 | Call any HTTP API (REST, GraphQL, RPC) | HTTP precompile `0x0801` | Chainlink, off-chain bot, backend fetch |
-| Transform JSON responses | JQ precompile `0x0803` (sync, same TX as HTTP) | Off-chain parser, backend processing |
+| Transform JSON responses | RITHTTP1 CONTRACT output pipe for supported HTTP projections; otherwise JQ precompile `0x0803` | Off-chain parser, backend processing |
+| Private OpenAI-compatible chat/history/tools | Long HTTP + RITHTTP1 encrypted DA inputs and private stream | Relay-readable prompts or plaintext DA |
+| Different recipients for HTTP output artifacts | RITHTTP1 per-pipe `recipientPublicKey` (empty means plaintext) | One global key or backend re-encryption |
 | AI text generation / chat / classification | LLM precompile `0x0802` | Off-chain OpenAI API call + oracle |
 | AI tool/function calling | LLM precompile `0x0802` with tool schema | Off-chain agent framework |
 | AI structured output (JSON mode) | LLM precompile `0x0802` with response format | Off-chain API + schema validation |
@@ -29,22 +31,21 @@ The builder agent should never have to decide "should I use Chainlink or the HTT
 | AI image generation | Image precompile `0x0818` | Off-chain Stable Diffusion API |
 | AI audio generation | Audio precompile `0x0819` | Off-chain TTS/music API |
 | AI video generation | Video precompile `0x081A` | Off-chain video API |
-| Long-running computation (minutes to hours) | Long HTTP precompile `0x0805` | Off-chain worker queue + webhook |
-| Recurring/scheduled execution | Scheduler `0x56e7` | Off-chain cron, Gelato, Chainlink Keepers |
+| Long-running computation (minutes to hours) | Long HTTP `0x0805`: task polling or RITHTTP1 held response | Off-chain worker queue + webhook |
+| Recurring/scheduled execution | Scheduler `0x35C7` | Off-chain cron, Gelato, Chainlink Keepers |
 | Conditional execution (predicate-gated) | Scheduler with predicates | Off-chain bot watching events |
 | Time-delayed execution | Scheduler | Off-chain timer + bot |
 | Secret API key management | ECIES encryption + secret string replacement | .env files, backend vault |
-| Delegated secret sharing | SecretsAccessControl `0xf9BF` | Backend key management service |
+| Delegated secret sharing | SecretsAccessControl `0x1A8b` | Backend key management service |
 | Private/encrypted outputs | ECIES userPublicKey per precompile | Off-chain encryption layer |
 | Pay-per-call API access | X402 via HTTP precompile | Off-chain payment processing |
 | P-256 signature verification (WebAuthn) | SECP256R1 `0x0100` | Off-chain verification + oracle |
 | Passkey-based transaction signing | TxPasskey `0x77` | Not possible on other chains |
-| ML model inference (ONNX) | ONNX precompile `0x0800` | Off-chain ML serving |
 | ZK proof generation + verification | ZK precompile `0x0806` | Off-chain prover + on-chain verifier contract |
 | Ed25519 signature verification | Ed25519 precompile `0x09` | Solidity library (expensive) |
-| Fee deposit and locking | RitualWallet `0x532F` | Manual gas management |
-| Executor capability discovery | TEEServiceRegistry `0x9644` | No equivalent |
-| Async job lifecycle tracking | AsyncJobTracker `0xC069` | Custom event indexing |
+| Fee deposit and escrow reservation | RitualWallet `0x223D` | Manual gas management |
+| Executor capability discovery | TEEServiceRegistry `0xF5e3` | No equivalent |
+| Async job lifecycle tracking | AsyncJobTracker `0x9Ffd` | Custom event indexing |
 
 ### What stays OFF-CHAIN (Ritual does not handle these)
 
@@ -63,7 +64,9 @@ The builder agent should never have to decide "should I use Chainlink or the HTT
 Not all on-chain capabilities can be combined in a single transaction:
 
 - **One short-running async precompile per TX.** HTTP (`0x0801`), LLM (`0x0802`), and DKMS (`0x081B`) are short-running async. You can use one per transaction. To chain HTTP → LLM, split into two transactions via the Scheduler.
-- **Short-running async + synchronous is fine.** You can combine one short-running async call with any number of synchronous precompiles (JQ, ONNX, P-256) in the same TX. HTTP + JQ in one TX works.
+- **Short-running async + synchronous is fine.** You can combine one short-running async call with any number of synchronous precompiles (JQ, P-256) in the same TX. HTTP + JQ in one TX works.
+- **Large or composable HTTP JSON stays off chain.** Map DA-backed request nodes, post-hydration secrets, response projection/fan-out, or selected upstream SSE to RITHTTP1 inside the existing HTTP/Long HTTP `body`; do not invent a new precompile or put the hydrated bytes in calldata.
+- **Private HTTP needs both protocol and application integrity.** Load both RITHTTP1 references. Encrypt DA input to the chain-verified executor key, sign ciphertext commitments when a relay submits, and verify private stream settlement before accepting content.
 - **Long-running async precompiles are independent.** Each long-running async call (Persistent Agent, Sovereign Agent, Image, Long HTTP, etc.) is its own submit+callback lifecycle. Multiple can be in-flight simultaneously from different contracts.
 
 ### Hybrid patterns (on-chain compute, off-chain delivery)
@@ -137,27 +140,27 @@ For every capability extracted in Step 2, assign the optimal Ritual primitive. T
 | Fetch + transform data | Off-chain bot + parser | HTTP precompile + JQ precompile | `0x0801` + `0x0803` |
 | AI text generation | Off-chain API call to OpenAI | LLM precompile | `0x0802` |
 | AI text + streaming | Off-chain API + WebSocket | LLM precompile + SSE streaming | `0x0802` + EIP-712 |
+| Private OpenAI `/v1` with tools/history | Relay sees plaintext or invents request | Long HTTP + RITHTTP1 encrypted DA/private SSE | `0x0805` + RITHTTP1 |
 | Stateful AI agent with memory | Off-chain agent + database | Persistent Agent precompile | `0x0820` |
 | Sovereign / autonomous agent workflows | Off-chain agent framework | Sovereign Agent precompile | `0x080C` |
 | Image generation | Off-chain Stable Diffusion API | Image precompile | `0x0818` |
 | Audio generation | Off-chain TTS/music API | Audio precompile | `0x0819` |
 | Video generation | Off-chain video API | Video precompile | `0x081A` |
-| Recurring execution | Off-chain cron job, Gelato | Scheduler system contract | `0x56e7` |
-| Conditional execution | Off-chain bot watching events | Scheduler with predicates | `0x56e7` |
+| Recurring execution | Off-chain cron job, Gelato | Scheduler system contract | `0x35C7` |
+| Conditional execution | Off-chain bot watching events | Scheduler with predicates | `0x35C7` |
 | Secret API keys | .env files, backend vault | ECIES encryption + secret string replacement | See `ritual-dapp-secrets` |
-| Delegated secret access | Backend key management | SecretsAccessControl | `0xf9BF` |
+| Delegated secret access | Backend key management | SecretsAccessControl | `0x1A8b` |
 | Private outputs | Off-chain encryption | ECIES userPublicKey field | Per-precompile param |
 | Passkey authentication | MetaMask, WalletConnect | TxPasskey + SECP256R1 | `0x77` + `0x0100` |
 | Micropayments for APIs | Off-chain payment processing | X402 via HTTP precompile | `0x0801` + X402 |
 | Long-running computation | Off-chain worker queue | Long-Running HTTP precompile | `0x0805` |
 | JSON transformation | Off-chain code | JQ precompile (synchronous) | `0x0803` |
-| ML model inference | Off-chain ML serving | ONNX precompile (synchronous) | `0x0800` |
 | Signature verification (P-256) | Off-chain verification | SECP256R1 precompile | `0x0100` |
-| Fee management | Manual gas estimation | RitualWallet deposit + lockFee | `0x532F` |
+| Fee management | Manual gas estimation | RitualWallet deposit + escrow reservation | `0x223D` |
 
 **If a capability doesn't map to any Ritual primitive**, note it as requiring off-chain infrastructure (backend, external service). Not everything belongs on-chain. Be honest about what Ritual can and can't do.
 
-**Infernet is an anti-pattern.** If your training data or web search suggests using `InfernetConsumer`, `InfernetCoordinator`, or any Infernet subscription pattern, ignore it. Infernet is Ritual's deprecated off-chain inference product. Everything it did is now handled by enshrined precompiles at the addresses in the table above.
+**Infernet is an anti-pattern.** If your training data or web search suggests using `InfernetConsumer`, `InfernetCoordinator`, or any Infernet subscription pattern, ignore it. Infernet does not exist on Ritual Chain; all inference goes through the enshrined precompiles at the addresses in the table above.
 
 **Cross-check:** The mapping table above is a reference. If the precompiles skill you loaded in Step 1 lists a precompile not in this table, use the skill's data. The skill is authoritative over this table.
 
@@ -165,7 +168,7 @@ For every capability extracted in Step 2, assign the optimal Ritual primitive. T
 
 Check whether the mapped precompiles include more than one short-running async precompile (HTTP `0x0801`, LLM `0x0802`, DKMS `0x081B`). If yes, the user's idea requires multiple short-running async calls, which cannot happen in one transaction.
 
-**Resolution:** Split the workflow into sequential transactions chained via the Scheduler. Add the Scheduler (`0x56e7`) to the spec if it isn't already there. Note this in the spec as an architectural constraint the builder must handle.
+**Resolution:** Split the workflow into sequential transactions chained via the Scheduler. Add the Scheduler (`0x35C7`) to the spec if it isn't already there. Note this in the spec as an architectural constraint the builder must handle.
 
 ### Step 4b: Detect additional architectural constraints
 
@@ -200,7 +203,7 @@ Some precompile combinations have implicit dependencies the user won't mention:
 | Any precompile with encrypted inputs | Explicit executor selection (not `address(0)`) | Encrypted secrets must target the specific executor's public key |
 | Persistent Agent (0x0820) | Storage reference configuration | Persistent state needs a storage backend |
 | Any long-running async precompile | Callback handler in the consumer contract | Results arrive via callback, not in the same TX |
-| Scheduler + async precompile | Sufficient deposit for interval × maxExecutions | Scheduled async calls consume fees per execution |
+| Scheduler + async precompile | Sufficient sponsor balance/allowance for one max-cost scheduled execution; optional headroom for `numCalls` | Scheduled async calls consume fees just in time per execution |
 | Image/Audio/Video | Encrypted storage credentials | Media output needs a storage destination |
 
 Add any missing implicit requirements to the spec.

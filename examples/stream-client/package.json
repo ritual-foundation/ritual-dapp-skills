@@ -1,0 +1,14 @@
+{
+  "name": "ritual-documented-stream-tests",
+  "private": true,
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-test-renderer": "^18.3.1",
+    "viem": "^2.21.0",
+    "zustand": "^4.5.7",
+    "ritual-short-settlement": "file:../short-settlement"
+  }
+}

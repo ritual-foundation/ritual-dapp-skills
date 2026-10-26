@@ -1,5 +1,5 @@
 {
-  "chain_id": 1979,
+  "chain_id": 784,
   "rpc_endpoints": [
     "https://rpc.ritualfoundation.org"
   ],
@@ -17,6 +17,20 @@
       "address": "0xDb0f588a05F56aF801ED9e17241fa48706e8AE1f",
       "deploy_block": 2215742,
       "features": ["Scheduler", "HTTP precompile", "Secrets/Delegation", "Contract-owned secrets"],
+      "github": null
+    },
+    {
+      "name": "ExecutorCity",
+      "address": "TBD",
+      "deploy_block": null,
+      "features": ["Agent execution", "TEEServiceRegistry"],
+      "github": null
+    },
+    {
+      "name": "AgentHub",
+      "address": "TBD",
+      "deploy_block": null,
+      "features": ["Verify contracts flow"],
       "github": null
     }
   ]

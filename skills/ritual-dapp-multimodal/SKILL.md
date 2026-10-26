@@ -16,7 +16,7 @@ Ritual Chain provides three multimodal generation precompiles — Image (`0x0818
 | Audio | `0x0000000000000000000000000000000000000819` |
 | Video | `0x000000000000000000000000000000000000081A` |
 
-**Chain ID**: 1979 (Ritual Chain)
+**Chain ID**: 784 (Ritual Chain)
 **Transaction type**: Async two-phase (submit → generate → callback)
 
 ### How It Works
@@ -54,7 +54,7 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual Chain',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
@@ -64,19 +64,21 @@ const account = privateKeyToAccount(process.env.PRIVATE_KEY! as `0x${string}`);
 const publicClient = createPublicClient({ chain: ritualChain, transport: http() });
 const walletClient = createWalletClient({ account, chain: ritualChain, transport: http() });
 
-const RITUAL_WALLET = '0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948' as const;
+const RITUAL_WALLET = '0xF04076756d8129Baec46Dc0F1c526Baec490C393' as const;
 const IMAGE_PRECOMPILE = '0x0000000000000000000000000000000000000818' as const;
 
-// Deposit to RitualWallet for fees
-// Recommended minimum: 5000 blocks (~29 minutes at Ritual's ~350ms conservative block-time baseline).
-// For development, 100_000 blocks (~9.7 hours) avoids lock-expiry during iteration.
+// Deposit to RitualWallet for fees.
+// Deposits are immediately available — there is no time lock. Just fund enough
+// availableBalance to cover the generation fee.
 await walletClient.writeContract({
   address: RITUAL_WALLET,
   abi: [{ name: 'deposit', type: 'function', stateMutability: 'payable',
-    inputs: [{ name: 'lockDuration', type: 'uint256' }], outputs: [] }] as const,
+    inputs: [], outputs: [] }] as const,
   functionName: 'deposit',
-  args: [100_000n],   // 100k blocks ≈ 9.7 hours. Use large values for development — lock only extends, never shortens.
-  value: parseEther('0.15'),  // ~0.15 RITUAL per IMAGE request
+  args: [],
+  value: parseEther('2.5'),   // deposit at least the worst-case reserve for your model (read ModelPricingRegistry.getModel);
+                              // ≈2.2 RITUAL per IMAGE request for FLUX.2 Klein at 39.6 gwei/px.
+                              // Realized fee is far lower (≈0.05 RITUAL at 1024² / 15 steps) — the rest is refunded at settlement
 });
 
 // Submit image generation via your consumer contract
@@ -146,10 +148,16 @@ const hash = await walletClient.writeContract({
 
 The video backend pre-warms a **cached DiT** (diffusion transformer) for a single fixed shape. Requesting a different duration or resolution can invalidate that cache, causing the job to hang or fail on-chain settlement.
 
+**Behavior (executor → vLLM proxy → Wan backend):**
+
+- **Executor-go** forwards your ABI `width`, `height`, and `durationMs` to the vLLM proxy unchanged (after validating non-zero dims and max 4096×4096 / 60 s).
+- The **vLLM proxy** is where clamping happens. With the default `VIDEO_WAN_USE_CLIENT_PARAMS=false`, the proxy **replaces** client params with `VIDEO_WAN_CACHE_DIT_*` — defaults **1280×720** and **3000 ms** (3 s). Mismatched client values are logged and ignored, not rejected.
+- Set `VIDEO_WAN_USE_CLIENT_PARAMS=true` on the proxy to honor client duration/resolution (duration rounded up to whole seconds).
+
 **What this means for your dApp:**
 
-- The `width`, `height`, and `durationMs` parameters are part of the ABI but are **currently clamped by the proxy** to match the backend's cached shape. Regardless of what values you pass, the backend will produce video at its fixed shape.
-- The response `duration_ms` reflects what the backend **actually produced**, not what you requested.
+- Pass **1280×720** and **3000 ms** unless you have confirmed the deployment honors client params — these match the default cache-DiT shape and avoid cache invalidation.
+- The response `duration_ms` (and artifact dimensions) reflect what the backend **actually produced**, not necessarily what you requested.
 
 ---
 
@@ -161,16 +169,19 @@ The video backend pre-warms a **cached DiT** (diffusion transformer) for a singl
 import { encodeAbiParameters, type Address, type Hex } from 'viem';
 
 const executor: Address = '0x...';
+const sponsor: Address = '0x...';   // RitualWallet account funding the job (often the caller itself)
 
 const textInputData = new TextEncoder().encode(
   'Cyberpunk cityscape at night, neon reflections'
 );
 
 // IMPORTANT: Use tuple types for inputs (ModalInput[]) and output (OutputConfig).
-// Flat scalar encoding (20 fields) will fail at the executor's decoder.
+// Flat scalar encoding (22 fields) will fail at the executor's decoder.
 const encoded = encodeAbiParameters(
   [
     { type: 'address' },   // executor
+    { type: 'address' },   // sponsor
+    { type: 'address[]' }, // secretOwners (one owner per encryptedSecrets blob)
     { type: 'bytes[]' },   // encryptedSecrets
     { type: 'uint256' },   // ttl
     { type: 'bytes[]' },   // secretSignatures
@@ -207,13 +218,14 @@ const encoded = encodeAbiParameters(
       { name: 'negativePrompt', type: 'string' },
     ]},
     { type: 'tuple', components: [{ type: 'string' }, { type: 'string' }, { type: 'string' }] }, // outputStorageRef
-    { type: 'bytes[]' },   // encryptedSecrets
   ],
   [
     executor,
-    [],                          // no encrypted secrets
+    sponsor,                     // sponsor — RitualWallet account that funds this job (defaults to caller)
+    secretOwners,                // one owner per encrypted credential blob
+    encryptedSecrets,            // ECIES-encrypted storage credentials
     60n,                         // ttl
-    [],                          // no signatures
+    secretSignatures,            // owner signatures authorizing these blobs
     '0x',                        // no private output
     5n,                          // pollIntervalBlocks
     1000n,                       // maxPollBlock
@@ -232,7 +244,6 @@ const encoded = encodeAbiParameters(
       encryptOutput: false, numInferenceSteps: 0, guidanceScaleX100: 0,
       seed: 0, fps: 0, negativePrompt: '' },
     outputStorageRef,            // StorageRef tuple: ['gcs', 'images/model', 'GCS_CREDS']
-    encryptedSecrets,            // ECIES-encrypted JSON containing GCS_CREDS
   ]
 );
 ```
@@ -315,6 +326,13 @@ console.log('Duration:', videoFields[8], 'ms');
 
 ```
 MULTIMODAL_REQUEST_ABI (extends EXECUTOR_REQUEST_ABI):
+  // EXECUTOR_REQUEST_ABI base fields (indices 0–6):
+  //   executor (address), sponsor (address), secretOwners (address[]),
+  //   encryptedSecrets (bytes[]), ttl (uint256), secretSignatures (bytes[]),
+  //   userPublicKey (bytes).
+  //   `sponsor` is the RitualWallet account funding the job (index 1).
+  //   `secretOwners` (index 2) is one owner address per encryptedSecrets blob;
+  //   its length MUST equal encryptedSecrets (and secretSignatures).
   pollIntervalBlocks        uint64    — blocks between status polls
   maxPollBlock              uint64    — max block to poll until
   taskIdMarker              string    — marker for task ID extraction
@@ -348,7 +366,6 @@ MULTIMODAL_REQUEST_ABI (extends EXECUTOR_REQUEST_ABI):
     negativePrompt          string    — negative prompt text
 
   outputStorageRef          (string,string,string) — StorageRef: (platform, path, keyRef). See `ritual-dapp-da`.
-  encryptedSecrets          bytes[]   — ECIES-encrypted JSON with storage credentials keyed by keyRef
 ```
 
 ### Response ABI by Modality
@@ -406,7 +423,7 @@ All three providers — GCS, HuggingFace, and Pinata — work for image, audio, 
 > 1. Is `outputStorageRef` non-empty? `['', '', '']` means no storage — the executor cannot upload output.
 > 2. Does `keyRef` in your StorageRef match a key in the decrypted `encryptedSecrets` JSON?
 > 3. Is `ECIES_CONFIG.symmetricNonceLength` = 12? (wrong nonce → decryption failure)
-> 4. Is the RitualWallet lock still active? `lockUntil` must be > `current block + ttl`. Locks expire fast — 5,000 blocks ~ 29 min on Ritual's ~350ms baseline. Use 100,000+ for development. See `ritual-dapp-block-time` for conversion formulas and measurement preflight.
+> 4. Does the sponsor's RitualWallet have enough funds? `availableBalance(sponsor)` must cover the required reserve for the job. For sponsored calls (sponsor ≠ caller), `allowance(sponsor, caller)` must also cover the reserve. There is no time lock — deposits are immediately available.
 > 5. Is the precompile input using **tuple-based encoding** (with `ModalInput[]`, `OutputConfig`, and `StorageRef` tuples)? Flat scalar encoding will fail at the executor's decoder.
 
 ### Storage Credentials
@@ -425,18 +442,25 @@ ECIES_CONFIG.symmetricNonceLength = 12;  // MUST be set before any encrypt()
 // outputStorageRef: (platform, path, keyRef)
 const outputStorageRef = ['gcs', `images/${model}`, 'GCS_CREDS'];
 
-// encryptedSecrets: JSON with credential keyed by keyRef
-const secretsJson = JSON.stringify({
+// encryptedSecrets: an owner-bound envelope wrapping the credential map.
+// The executor rejects a bare map — secrets MUST be wrapped as
+// {version:1, secret_owner:<checksumOwner>, secrets:{...}} (canonical JSON,
+// sorted keys, no spaces) before ECIES encryption. On decrypt the executor
+// verifies the envelope's secret_owner matches secretOwners[i] for this blob.
+const secrets = {
   GCS_CREDS: JSON.stringify({
     service_account_json: process.env.GCS_SA_KEY!,
     bucket: process.env.GCS_BUCKET!,
   }),
-});
+};
+const secretsJson = JSON.stringify(
+  { secret_owner: secretOwner, secrets, version: 1 },  // sorted keys; no whitespace
+);
 
-const encryptedSecrets = `0x${encrypt(
+const encryptedSecrets = `0x${Buffer.from(encrypt(
   executorPublicKey.slice(2),
   Buffer.from(secretsJson),
-).toString('hex')}` as `0x${string}`;
+)).toString('hex')}` as `0x${string}`;
 ```
 
 ### Executor Discovery
@@ -446,7 +470,7 @@ Before creating `encryptedSecrets`, fetch the executor's public key from the TEE
 ```typescript
 import { createPublicClient, http } from 'viem';
 
-const TEE_SERVICE_REGISTRY = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F' as const;
+const TEE_SERVICE_REGISTRY = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839' as const;
 const IMAGE_CAPABILITY = 7;  // Capability enum: 7 = IMAGE_CALL
 
 // Use the (uint8, bool) overload — capability enum + active-only flag
@@ -459,7 +483,7 @@ const services = await publicClient.readContract({
     inputs: [{ name: 'capability', type: 'uint8' }, { name: 'activeOnly', type: 'bool' }],
     outputs: [{ type: 'tuple[]', components: [
       { name: 'teeAddress', type: 'address' },
-      { name: 'publicKey', type: 'bytes' },
+      { name: 'executorSecretsAuthPublicKey', type: 'bytes' },
       // ... other fields
     ]}],
   }] as const,
@@ -469,12 +493,12 @@ const services = await publicClient.readContract({
 
 const executor = services[0];
 const executorAddress = executor.teeAddress;
-// executor.publicKey is already a 0x-prefixed hex string from viem — use it directly.
+// executor.executorSecretsAuthPublicKey is already a 0x-prefixed hex string from viem — use it directly.
 // Do NOT use Buffer.from(hexString) which interprets hex chars as UTF-8 and garbles the key.
-const executorPublicKey = executor.publicKey as `0x${string}`;
+const executorPublicKey = executor.executorSecretsAuthPublicKey as `0x${string}`;
 
 // You don't need the executor's endpoint — routing is handled internally.
-// Only teeAddress (for ABI) and publicKey (for secret encryption) are needed.
+// Only teeAddress (for ABI) and executorSecretsAuthPublicKey (for secret encryption) are needed.
 ```
 
 ### Models
@@ -485,7 +509,7 @@ const executorPublicKey = executor.publicKey as `0x${string}`;
 | Audio | `LiquidAI/LFM2.5-Audio-1.5B` | 2 |
 | Video | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 3 |
 
-The current chain supports exactly these three models. Hard-code these model IDs.
+Discover media models via `ModelPricingRegistry.getAllModelsWithInfo()` filtered by modality; the IDs below are the current registry rows.
 
 ### Output URI Handling
 
@@ -510,12 +534,12 @@ const displayUri = gsUriToHttps(imageUri);
 
 > **⚠ Security Warning — Credentials are replayable without access control**: `encryptedSecrets` bytes are public on-chain. Anyone can copy them from your transaction and reuse them in a different contract to upload to *your* storage bucket. The executor does not verify the caller by default.
 >
-> To prevent this, use `SecretsAccessControl` (`0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD`) to bind the encrypted credentials to your specific contract address. The executor will then verify the delegation before decrypting. See `ritual-dapp-secrets` for the full delegation pattern.
+> To prevent this, use `SecretsAccessControl` (`0x0cEae62e2082829226eF5821Bb662483Db17A71F`) to bind the encrypted credentials to your specific contract address. The executor will then verify the delegation before decrypting. See `ritual-dapp-secrets` for the full delegation pattern.
 
 ```typescript
 import { keccak256, toBytes } from 'viem';
 
-const SECRETS_AC = '0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD' as const;
+const SECRETS_AC = '0x0cEae62e2082829226eF5821Bb662483Db17A71F' as const;
 
 // After encrypting storage credentials, compute the hash
 const secretsHash = keccak256(toBytes(encryptedSecrets));
@@ -591,9 +615,9 @@ See the `ritual-dapp-secrets` skill for the full delegation pattern including So
 ```
 1. Fetch executor address + public key from TEEServiceRegistry (capability 7)
 2. Build outputStorageRef: ('gcs', 'images/<model>', 'GCS_CREDS')
-3. Build secretsJson: {"GCS_CREDS": "{"service_account_json":..., "bucket":...}"}
+3. Build owner-bound envelope: {version:1, secret_owner:<owner>, secrets:{"GCS_CREDS": "{"service_account_json":..., "bucket":...}"}}
 4. Set ECIES_CONFIG.symmetricNonceLength = 12
-5. ECIES-encrypt secretsJson with executor's public key → encryptedSecrets
+5. ECIES-encrypt the envelope with executor's public key → encryptedSecrets (pass owner as secretOwners[i])
 6. secretsHash = keccak256(encryptedSecrets)
 7. SecretsAccessControl.grantAccess(consumerContract, secretsHash, expiresAt, policy)
 8. Include outputStorageRef + encryptedSecrets in request ABI
@@ -614,15 +638,23 @@ A contract handling image, audio, and video generation with callbacks.
 pragma solidity ^0.8.20;
 
 interface IRitualWallet {
-    function deposit(uint256 lockDuration) external payable;
+    function deposit() external payable;
 }
 
 contract MediaConsumer {
+    struct StorageRef {
+        string platform;
+        string path;
+        string keyRef;
+    }
+
     address constant IMAGE_PRECOMPILE = 0x0000000000000000000000000000000000000818;
     address constant AUDIO_PRECOMPILE = 0x0000000000000000000000000000000000000819;
     address constant VIDEO_PRECOMPILE = 0x000000000000000000000000000000000000081A;
-    address constant RITUAL_WALLET    = 0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948;
-    address constant ASYNC_DELIVERY_SENDER = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+    address constant RITUAL_WALLET    = 0xF04076756d8129Baec46Dc0F1c526Baec490C393;
+    address constant ASYNC_DELIVERY_SENDER = 0x508f57AE70967Da28AE0Ab6b95532878c4D0F440;
+
+    address constant TX_HASH_PRECOMPILE = address(0x0830);
 
     modifier onlyAsyncSystem() {
         require(msg.sender == ASYNC_DELIVERY_SENDER, "unauthorized callback");
@@ -662,6 +694,7 @@ contract MediaConsumer {
     }
 
     mapping(bytes32 => MediaResult) public results;
+    mapping(bytes32 => bool) public pendingJobs;
     bytes32[] public resultIds;
 
     event ImageRequested(bytes32 indexed taskId);
@@ -671,9 +704,9 @@ contract MediaConsumer {
     event MediaFailed(bytes32 indexed taskId, string error);
 
     function depositForFees() external payable {
-        // Recommended minimum: 5000 blocks (~29 min at ~350ms/block).
-        // Use 100_000+ in development to avoid lock-expiry during iteration.
-        IRitualWallet(RITUAL_WALLET).deposit{value: msg.value}(100_000);
+        // Deposits are immediately available — no time lock. Fund enough to cover
+        // the generation fee (availableBalance must exceed the required reserve).
+        IRitualWallet(RITUAL_WALLET).deposit{value: msg.value}();
     }
 
     /// @notice Request image generation
@@ -687,26 +720,28 @@ contract MediaConsumer {
         uint32 width,
         uint32 height,
         StorageRef calldata outputStorageRef,
-        bytes[] calldata encryptedSecrets
+        bytes[] calldata encryptedSecrets,
+        address[] calldata secretOwners,
+        bytes[] calldata secretSignatures
     ) external {
+        bytes32 jobId = _trackCurrentJob();
         bytes memory input = _buildMultiModalInput(
             executor, ttl, prompt, model,
             width, height, 0,  // no duration for images
             outputStorageRef,
             encryptedSecrets,
+            secretOwners,
+            secretSignatures,
             "IMAGE_TASK_ID",
             this.onImageReady.selector,
             1  // outputType: IMAGE
         );
 
         // Use .call() not staticcall — async precompiles require a state-mutating call
-        (bool ok, bytes memory result) = IMAGE_PRECOMPILE.call(input);
+        (bool ok,) = IMAGE_PRECOMPILE.call(input);
         require(ok, "Image precompile call failed");
 
-        // NOTE: The callback jobId is the ORIGINAL TX HASH, not keccak256(result).
-        // Do not use keccak256(result) as a key for pending request lookup —
-        // it will not match the jobId delivered in the callback.
-        emit ImageRequested(keccak256(result));
+        emit ImageRequested(jobId);
     }
 
     /// @notice Request audio generation
@@ -718,24 +753,27 @@ contract MediaConsumer {
         string calldata model,
         uint32 maxDurationMs,
         StorageRef calldata outputStorageRef,
-        bytes[] calldata encryptedSecrets
+        bytes[] calldata encryptedSecrets,
+        address[] calldata secretOwners,
+        bytes[] calldata secretSignatures
     ) external {
+        bytes32 jobId = _trackCurrentJob();
         bytes memory input = _buildMultiModalInput(
             executor, ttl, prompt, model,
             maxDurationMs, 0, 0,
             outputStorageRef,
             encryptedSecrets,
+            secretOwners,
+            secretSignatures,
             "AUDIO_TASK_ID",
             this.onAudioReady.selector,
             2  // outputType: AUDIO
         );
 
-        (bool ok, bytes memory result) = AUDIO_PRECOMPILE.call(input);
+        (bool ok,) = AUDIO_PRECOMPILE.call(input);
         require(ok, "Audio precompile call failed");
 
-        // NOTE: keccak256(result) is a local identifier only.
-        // The Phase 2 callback jobId is the original TX hash, not this value.
-        emit AudioRequested(keccak256(result));
+        emit AudioRequested(jobId);
     }
 
     /// @notice Request video generation
@@ -749,24 +787,27 @@ contract MediaConsumer {
         uint32 height,
         uint32 durationMs,
         StorageRef calldata outputStorageRef,
-        bytes[] calldata encryptedSecrets
+        bytes[] calldata encryptedSecrets,
+        address[] calldata secretOwners,
+        bytes[] calldata secretSignatures
     ) external {
+        bytes32 jobId = _trackCurrentJob();
         bytes memory input = _buildMultiModalInput(
             executor, ttl, prompt, model,
             width, height, durationMs,
             outputStorageRef,
             encryptedSecrets,
+            secretOwners,
+            secretSignatures,
             "VIDEO_TASK_ID",
             this.onVideoReady.selector,
             3  // outputType: VIDEO
         );
 
-        (bool ok, bytes memory result) = VIDEO_PRECOMPILE.call(input);
+        (bool ok,) = VIDEO_PRECOMPILE.call(input);
         require(ok, "Video precompile call failed");
 
-        // NOTE: keccak256(result) is a local identifier only.
-        // The Phase 2 callback jobId is the original TX hash, not this value.
-        emit VideoRequested(keccak256(result));
+        emit VideoRequested(jobId);
     }
 
     /// @notice Phase 2 callback for image results
@@ -775,6 +816,8 @@ contract MediaConsumer {
     ///      The AsyncDelivery system calls: target.call(abi.encodeWithSelector(selector, jobId, result))
     ///      Both parameters are required. Registering a single-param selector will never match.
     function onImageReady(bytes32 jobId, bytes calldata responseData) external onlyAsyncSystem {
+        require(pendingJobs[jobId], "unknown or fulfilled job");
+        delete pendingJobs[jobId];
         (
             bool hasError,
             ,
@@ -810,6 +853,8 @@ contract MediaConsumer {
 
     /// @notice Phase 2 callback for audio results
     function onAudioReady(bytes32 jobId, bytes calldata responseData) external onlyAsyncSystem {
+        require(pendingJobs[jobId], "unknown or fulfilled job");
+        delete pendingJobs[jobId];
         (
             bool hasError,
             ,
@@ -844,6 +889,8 @@ contract MediaConsumer {
 
     /// @notice Phase 2 callback for video results
     function onVideoReady(bytes32 jobId, bytes calldata responseData) external onlyAsyncSystem {
+        require(pendingJobs[jobId], "unknown or fulfilled job");
+        delete pendingJobs[jobId];
         (
             bool hasError,
             ,
@@ -878,8 +925,16 @@ contract MediaConsumer {
         emit MediaReady(taskId, outputUri);
     }
 
+    function _trackCurrentJob() internal returns (bytes32 jobId) {
+        (bool ok, bytes memory output) = TX_HASH_PRECOMPILE.staticcall("");
+        require(ok && output.length == 32, "tx hash unavailable");
+        jobId = abi.decode(output, (bytes32));
+        require(!pendingJobs[jobId], "job already pending");
+        pendingJobs[jobId] = true;
+    }
+
     /// @dev Builds the ABI-encoded input for multimodal precompiles.
-    ///      The executor expects exactly 18 ABI fields where fields 15-17 are
+    ///      The executor expects exactly 20 ABI fields where fields 17-19 are
     ///      ModalInput[] (tuple[]), OutputConfig (tuple), and StorageRef (tuple).
     function _buildMultiModalInput(
         address executor,
@@ -890,7 +945,9 @@ contract MediaConsumer {
         uint32 param2,
         uint32 param3,
         StorageRef calldata outputStorageRef,
-        bytes[] calldata encryptedSecrets,
+        bytes[] memory encryptedSecrets,
+        address[] memory secretOwners,
+        bytes[] memory secretSignatures,
         string memory taskMarker,
         bytes4 callbackSelector,
         uint8 outputType
@@ -921,9 +978,11 @@ contract MediaConsumer {
 
         return abi.encode(
             executor,
+            address(this),      // sponsor — RitualWallet account that funds this job
+            secretOwners,      // one owner per encryptedSecrets blob
             encryptedSecrets,   // ECIES-encrypted JSON with storage creds
             ttl,
-            new bytes[](0),     // secretSignatures
+            secretSignatures,  // one owner signature per encryptedSecrets blob
             bytes(""),          // userPublicKey
             uint64(5),          // pollIntervalBlocks
             uint64(1000),       // maxPollBlock
@@ -952,6 +1011,8 @@ contract MediaConsumer {
 ## 6. Async Constraints
 
 > **Read this section before writing any contract that calls a multimodal precompile.** These constraints are specific to Ritual's async precompile model and differ from normal Solidity development.
+>
+> **Payload bounds:** the encoded request is capped at 10 KB (`MAX_ASYNC_INPUT_SIZE_BYTES`) and the executor's Phase 2 delivery payload for Image / Audio / Video is capped at 10 KiB of canonical delivery bytes as well (artifact size is not what is measured — outputs go to DA); an over-limit delivery is a `SettlementConstraintViolation` that invalidates the proposed block.
 
 ### Two-phase async model
 
@@ -1295,24 +1356,50 @@ Multimodal generation is significantly more expensive than text-based precompile
 ### Cost Components
 
 ```
-Total Cost = BASE_FEE + COMPUTE_FEE + STORAGE_FEE
+Total Cost = PHASE1_FEE + PHASE2_FEE
 
 Where:
-  BASE_FEE     = precompile base fee (~5e12 wei)
-  COMPUTE_FEE  = GPU time × model rate (varies by model/executor)
-  STORAGE_FEE  = output_size × storage rate (depends on provider)
+  PHASE1_FEE   = per-modality settlement fee: image 1e16 / audio 1e16 / video 1e17 wei
+                 (0.01 / 0.01 / 0.10 RITUAL), plus the standard async commitment/inclusion fees
+  PHASE2_FEE   = per-model rate card from ModelPricingRegistry — read it with
+                 ModelPricingRegistry.getModel(modelName) on the chain you deploy to:
+                 image = max(image_min_fee_wei, width × height × image_fee_wei_per_pixel) × (steps / steps_baseline)
+                 audio = max(audio_min_fee_wei, seconds × audio_fee_wei_per_second)
+                 video = (video_base_fee_wei + width × height × seconds × video_fee_wei_per_pixel_second)
+                         × (steps / steps_baseline) × (fps / fps_baseline)
+                 (multipliers never drop below 1×)
+
+  ESCROW_LOCKUP (worst-case, locked at submit and refunded down to PHASE2_FEE at settlement):
+                 image = max(image_min_fee_wei, image_fee_wei_per_pixel × 2048 × 2048) × max(200 / steps_baseline, 1)
+                 audio = max(audio_min_fee_wei, audio_fee_wei_per_second × 900)
+                 video = (video_base_fee_wei + video_fee_wei_per_pixel_second × 2048 × 2048 × 60)
+                         × max(200 / steps_baseline, 1) × max(60 / fps_baseline, 1)
 ```
+
+The rate card is per model and lives on chain — `ModelPricingRegistry.getModel(modelName)` on the chain you deploy to is the source of truth; never hard-code a number. Genesis rate cards for the real-inference models (FLUX.2 Klein image, steps baseline 15; LFM2.5 Audio; Wan 2.2 video, steps baseline 20, fps baseline 16):
+
+| Model | Rate card | Worst-case lockup | Typical realized |
+|-------|-----------|-------------------|------------------|
+| FLUX.2 Klein (image) | 39.6 gwei/px, min 5e14 wei | ≈ 2.21 RITUAL | 1024² at 15 steps ≈ 0.0415 RITUAL |
+| LFM2.5 Audio | 33_333_333_333_333 wei/s, min 1e14 wei | ≈ 0.03 RITUAL | 10 s ≈ 0.0003 RITUAL |
+| Wan 2.2 (video) | base 2.05e17 wei + 1.456e12 wei/px·s | ≈ 13,748 RITUAL | 720p/5 s ≈ 6.9 RITUAL |
+
+Video realized figures are at ≤ 20 steps and ≤ 16 fps (multiplier 1×). There is no on-chain GPU-time or storage-rate term — storage is billed by your own provider. At submit time the sponsor's `availableBalance` must cover a **worst-case reserve** = Phase 1 fee + ESCROW_LOCKUP (max resolution 2048×2048, max 200 steps, and for video max 60 s at 60 fps; audio max 900 s); the difference between the reserve and the realized Phase 2 fee is refunded at settlement.
 
 ### Recommended Deposits by Modality
 
-| Modality | Min Deposit | Recommended | Generation Time |
+Figures use the genesis rate cards above; read `getModel(modelName)` and recompute if your chain's card differs.
+
+| Modality | Min Deposit (reserve) | Recommended | Generation Time |
 |-----------|------------|-------------|-----------------|
-| Image (1024×1024) | 0.02 RITUAL | 0.05 RITUAL | 10-60s |
-| Image (512×512) | 0.01 RITUAL | 0.03 RITUAL | 5-30s |
-| Audio (10s) | 0.03 RITUAL | 0.08 RITUAL | 15-90s |
-| Audio (30s) | 0.05 RITUAL | 0.12 RITUAL | 30-180s |
-| Video (5s, 720p) | 0.10 RITUAL | 0.25 RITUAL | 60-300s |
-| Video (10s, 1080p) | 0.20 RITUAL | 0.50 RITUAL | 120-600s |
+| Image (1024×1024) | ≈2.2 RITUAL | 2.5 RITUAL | 10-60s |
+| Image (512×512) | ≈2.2 RITUAL | 2.5 RITUAL | 5-30s |
+| Audio (10s) | ≈0.04 RITUAL | 0.08 RITUAL | 15-90s |
+| Audio (30s) | ≈0.04 RITUAL | 0.08 RITUAL | 30-180s |
+| Video (5s, 720p) | ≈13,750 RITUAL | 14,000 RITUAL | 60-300s |
+| Video (10s, 1080p) | ≈13,750 RITUAL | 14,000 RITUAL | 120-600s |
+
+"Min Deposit" is the submit-time worst-case reserve (Phase 1 fee + ESCROW_LOCKUP, see above), not what you end up paying; it is the same for every resolution and duration of a given model because the lockup is computed at the maximums. Realized totals: image 1024×1024 ≈ 0.0415 RITUAL (+0.01 Phase 1 ≈ 0.05 total) at 15 steps, ≈0.093 total at 30 steps; 512×512 ≈ 0.0104 (+0.01 ≈ 0.02 total); video (at ≤ 20 steps and ≤ 16 fps) 720p/3 s ≈ 4.33 RITUAL total, 720p/5 s ≈ 7.0, 1080p/10 s ≈ 30.5; audio 10 s ≈ 0.0003 (+0.01 ≈ 0.011 total), 30 s ≈ 0.001 (+0.01 ≈ 0.011 total). The reserve minus the realized fee is refunded at settlement.
 
 ### TTL Recommendations
 
@@ -1373,10 +1460,11 @@ function handleImageResult(responseHex: `0x${string}`) {
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `No services found for multimodal capability` | No IMAGE/AUDIO/VIDEO services registered | Use `getServicesByCapability(7, true)` to find active services |
-| `model_not_found` | Model not supported on current chain | Hard-code one of: `black-forest-labs/FLUX.2-klein-4B`, `LiquidAI/LFM2.5-Audio-1.5B`, `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| `model_not_found` | Model not supported on current chain | Use a registered model — enumerate with `getAllModelsWithInfo()` (current rows: `black-forest-labs/FLUX.2-klein-4B`, `LiquidAI/LFM2.5-Audio-1.5B`, `Wan-AI/Wan2.2-T2V-A14B-Diffusers`) |
 | `storage_error` | Failed to upload to storage provider | Check `encryptedSecrets` encoding and `outputStorageRef` format; ensure ECIES nonce length = 12. See `ritual-dapp-da` for credential formats. |
-| `insufficient deposit` | Not enough RITUAL for generation + storage | Increase deposit; ~0.15 RITUAL per IMAGE request |
-| `insufficient lock duration` | `lockDuration` too short — lock already expired or doesn't cover `commit_block + ttl` | Advisory minimum is `5000`; use `100_000n` in development to reduce expiry risk |
+| `insufficient deposit` | Not enough RITUAL for generation + storage | Increase deposit to at least the worst-case reserve for your model — read `ModelPricingRegistry.getModel(modelName)` and apply the ESCROW_LOCKUP formula; ≈2.2 RITUAL per IMAGE request for FLUX.2 Klein (realized fee ≈0.05-0.09 RITUAL per 1MP image; the rest is refunded at settlement) |
+| `insufficient wallet balance` | Sponsor's `availableBalance` is below the required reserve for the job | Fund the sponsor's RitualWallet (`deposit` / `depositFor`); deposits are immediately available |
+| `Insufficient wallet allowance` | Sponsor ≠ caller and `allowance(sponsor, caller)` is below the required reserve | Have the sponsor `approve(caller, amount)` for at least the reserve |
 | `sender locked due to existing async transaction` | Same sender trying to submit a second async tx | Use a different EOA for each concurrent image request |
 | `timeout` | Generation exceeded TTL | Increase TTL (video especially needs high TTL) |
 | `prompt is required` | Empty or whitespace-only prompt | Provide a non-empty prompt string |
@@ -1385,24 +1473,24 @@ function handleImageResult(responseHex: `0x${string}`) {
 | No `MediaReady`/`MediaFailed` event within timeout | Storage credentials are malformed or cannot be decrypted/validated | Treat as storage-auth failure candidate; recheck credential JSON format per `ritual-dapp-da` |
 | `grantAccess` reverts with no data | Incorrect call shape/arguments | Verify 4-arg signature `grantAccess(delegate, secretsHash, expiresAt, policy)` and policy tuple fields before assuming network issue |
 | TX mines but callback never arrives | Invalid `encryptedSecrets` or empty `outputStorageRef` — credential format mismatch or ECIES decryption failure causes silent Phase 2 failure | See debugging checklist below and `ritual-dapp-da` |
-| TX accepted but never mined (nonce unchanged) | Base-field validation failure — executor address zero, TTL out of bounds, or insufficient RitualWallet balance/lock | Check executor address, TTL, and wallet deposit |
+| TX accepted but never mined (nonce unchanged) | Base-field validation failure — executor address zero, sponsor address zero, TTL out of bounds, or insufficient sponsor RitualWallet balance/allowance | Check executor address, sponsor address, TTL, and wallet deposit/allowance |
 
 ### Debugging: TX Mines But Callback Never Arrives
 
 This is the most common failure mode for multimodal precompiles. Phase 1 succeeds (TX mines, nonce increments) but the Phase 2 callback never arrives — the executor fails silently during content generation or delivery.
 
-**Note:** If the TX truly never mines (nonce unchanged), the issue is likely in the base fields validated at commitment time: executor address, TTL bounds, or RitualWallet balance/lock. Storage credential issues do **not** cause TX drops — they cause silent Phase 2 failures.
+**Note:** If the TX truly never mines (nonce unchanged), the issue is likely in the base fields validated at commitment time: executor address, sponsor address, TTL bounds, or sponsor RitualWallet balance/allowance. Storage credential issues do **not** cause TX drops — they cause silent Phase 2 failures.
 
 **Checklist:**
 
 1. **Check nonce before and after:** `eth_getTransactionCount(address, 'latest')`. If nonce didn't change, the issue is base-field validation (see items 2-3). If nonce incremented, the issue is Phase 2 (see items 4-10).
-2. **Check RitualWallet lock:** `lockUntil(address)` must be > current block + TTL. If expired, deposit with a longer `lockDuration`.
-3. **Check RitualWallet balance:** `balanceOf(address)` must cover the generation fee (~0.14 RITUAL for IMAGE). The balance check is against the **EOA** that signs the TX, not the calling contract (see Section 6 and ritual-dapp-wallet skill).
+2. **Check RitualWallet allowance:** For sponsored calls (sponsor ≠ caller), `allowance(sponsor, caller)` must cover the required reserve. Have the sponsor `approve(caller, amount)` if it is short.
+3. **Check RitualWallet balance:** `availableBalance(sponsor)` must cover the worst-case reserve for the model's live rate card (`ModelPricingRegistry.getModel(modelName)`, see Cost Components): IMAGE ≈2.2 RITUAL (FLUX.2 Klein); VIDEO ≈13,750 RITUAL (Wan 2.2). The balance check is against the **sponsor account** (`ReserveConfig.sponsor` / `job_sponsor`) encoded in the commitment — this defaults to the signer but may be a different designated account or contract (see Section 6 and ritual-dapp-wallet skill).
 4. **Verify `outputStorageRef`:** Must be a non-empty `(platform, path, keyRef)` tuple. `['', '', '']` means no storage — executor cannot upload.
 5. **Verify credential format matches platform:** GCS needs `{"service_account_json":..., "bucket":...}` JSON; HF needs a plain token string; Pinata needs `{"jwt":..., "gateway_url":...}` JSON. See `ritual-dapp-da` for details.
 6. **Verify ECIES config:** `ECIES_CONFIG.symmetricNonceLength` must be `12` before calling `encrypt()`.
-7. **Verify executor public key:** Fetch fresh from `TEEServiceRegistry.getService(executorAddress).node.publicKey`.
-8. **Executor endpoint is irrelevant to dApp developers.** Executor routing is handled internally. You only need `teeAddress` and `publicKey` from the registry.
+7. **Verify executor public key:** Fetch fresh from `TEEServiceRegistry.getService(executorAddress, true).node.executorSecretsAuthPublicKey` (or `getValidService(executorAddress)`).
+8. **Executor endpoint is irrelevant to dApp developers.** Executor routing is handled internally. You only need `teeAddress` and `executorSecretsAuthPublicKey` from the registry.
 9. **Verify model selection:** The current chain supports only `black-forest-labs/FLUX.2-klein-4B`, `LiquidAI/LFM2.5-Audio-1.5B`, and `Wan-AI/Wan2.2-T2V-A14B-Diffusers`.
 10. **Use `eth_call` as preflight only:** Validate payload shape and immediate revert/decode issues before sending a signed transaction.
 

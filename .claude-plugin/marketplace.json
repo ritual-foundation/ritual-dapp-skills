@@ -3,8 +3,8 @@
   "name": "ritual-dapp-skills",
   "description": "Claude Code skills and agents for building dApps on Ritual Chain",
   "owner": {
-    "name": "Ritual Foundation",
-    "url": "https://github.com/ritual-foundation"
+    "name": "Ritual",
+    "url": "https://github.com/ritual-net"
   },
   "plugins": [
     {

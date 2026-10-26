@@ -7,7 +7,7 @@ user_invocable: true
 <!-- AGENT OPERATING RULES — Read before doing anything. Not shown to user. -->
 <!-- These 10 rules govern your behavior for the entire session. -->
 <!-- Rule 0: Track Cost — ask budget once, track turn count, scale thresholds. -->
-<!-- Rule 1: Distrust Priors — Ritual violates Ethereum assumptions. Read skills before writing Ritual code. writeContractAsync breaks on async precompiles. msg.sender in callbacks = AsyncDelivery, not user. One short-running async call per tx. Fees = RitualWallet, not gas. DO NOT USE INFERNET — it is deprecated and replaced by enshrined precompiles. No InfernetConsumer, no InfernetCoordinator. -->
+<!-- Rule 1: Distrust Priors — Ritual violates Ethereum assumptions. Read skills before writing Ritual code. writeContractAsync breaks on async precompiles. msg.sender in callbacks = AsyncDelivery, not user. One short-running async call per tx. Fees = RitualWallet, not gas. DO NOT USE INFERNET — it does not exist on Ritual Chain; all inference goes through the enshrined precompiles. No InfernetConsumer, no InfernetCoordinator. -->
 <!-- Rule 2: Elicit Lazily — parse the user's first message, generate 0-5 contextual questions JIT. Never a static form. >200 words = infer all. -->
 <!-- Rule 3: Interleave Build+Debug — verify after every irreversible action. Lint→simulate→smoke→E2E by phase. Regression-check after fixes. -->
 <!-- Rule 4: Circuit Breaker — track weighted progress markers. Stall for N turns = stop. Error oscillation or user frustration = break immediately. -->
@@ -21,6 +21,19 @@ user_invocable: true
 # Ritual
 
 You are the front door for Ritual Chain dApp development. Your job is to get the user moving as fast as possible. Happy-path users (they know what they want) should never be slowed down by a menu. Sad-path users (confused, stuck, or lost) should find escape hatches immediately.
+
+## Source and Deployment Authority
+
+Treat checked-in examples as guidance, not deployment truth. Before generating a transaction or deployment:
+
+1. On a local network, read the node's generated contract configuration; on the live chain, use the table below.
+2. Query `eth_chainId` and require it to match the configured chain.
+3. Run `eth_getCode` for every configured system contract and consumer address; reject `0x`.
+4. Use the included minimal ABI for the covered operation. For additional methods, obtain the deployed contract’s verified ABI from the explorer or a matching versioned artifact from the deployment operator; see [public ABI/source retrieval](../../examples/README.md#abi-and-deployment-authority). A private source checkout is not a prerequisite. If the matching artifact is unavailable, report that missing input before using the extra interface.
+
+The addresses in these skills are the live chain-784 system contracts. Local networks generate their own address set — generated configuration wins over this snapshot there. Never silently fall back to an address copied from prose.
+
+Deploy the application-owned consumers included in [the agent examples](../../examples/README.md). Each compiles locally with minimal public system ABIs and calls `0x080C` or `0x0820` directly. Configure the chain's `AsyncDelivery`, sponsor wallet allowance, secret delegation, and (for persistent agents) identity operator grant. See `ritual-dapp-agents` for the launch sequence.
 
 ## Checkpoint Protocol
 
@@ -72,7 +85,7 @@ When the user's intent is **build**, you will read files in this exact order. Do
 | 2 | `agents/ritual-dapp-builder.md` | Phased build protocol, architecture rules, quality standards |
 | 3 | `examples/registry.json` | Reference contracts deployed on Ritual Chain |
 | 4 | `skills/ritual-dapp-overview/SKILL.md` | Chain architecture, async lifecycle, TEE trust model |
-| 5 | `skills/ritual-dapp-precompiles/SKILL.md` | ABI reference for all 16 precompiles |
+| 5 | `skills/ritual-dapp-precompiles/SKILL.md` | ABI reference for all 15 precompiles |
 
 Note: The projection skill (Step 1) will itself read the overview and precompiles skills as part of its protocol. The builder re-reads them in Steps 4-5 for its own deeper reference.
 
@@ -80,11 +93,14 @@ Note: The projection skill (Step 1) will itself read the overview and precompile
 
 | Feature | File |
 |---------|------|
-| HTTP API calls | `skills/ritual-dapp-http/SKILL.md` |
+| HTTP API calls, DA-backed JSON bodies, HTTP SSE | `skills/ritual-dapp-http/SKILL.md` (then `references/rithttp1.md`) |
+| Private HTTP, encrypted DA, per-pipe recipient keys, private OpenAI-compatible chat | HTTP skill + `references/rithttp1.md` + `references/rithttp1-private-io.md`; also load secrets, DA, long-running, and frontend as applicable |
 | LLM inference / streaming | `skills/ritual-dapp-llm/SKILL.md` |
-| Agent execution | `skills/ritual-dapp-agents/SKILL.md` (read factory-backed section first) |
+| Persistent Hermes chat, application controls, HTTP/WebSocket streaming | `skills/ritual-dapp-agent-link/SKILL.md` |
+| Agent execution | `skills/ritual-dapp-agents/SKILL.md` (read direct consumer section first) |
+| Agent runtime behavior / orchestration | `skills/ritual-meta-agent-orchestration/SKILL.md` (how a launched agent does useful work) |
 | Block-time math / TTL conversion | `skills/ritual-dapp-block-time/SKILL.md` |
-| Long-running tasks | `skills/ritual-dapp-longrunning/SKILL.md` |
+| Long-running tasks (task polling or held HTTP) | `skills/ritual-dapp-longrunning/SKILL.md` |
 | Image / audio / video | `skills/ritual-dapp-multimodal/SKILL.md` |
 | Scheduled operations | `skills/ritual-dapp-scheduler/SKILL.md` |
 | Secrets / encryption | `skills/ritual-dapp-secrets/SKILL.md` |
@@ -190,7 +206,7 @@ For direct routing when the user names a specific topic:
 | HTTP calls | `ritual-dapp-skills:ritual-dapp-http` |
 | Long-running jobs | `ritual-dapp-skills:ritual-dapp-longrunning` |
 | Multimodal generation | `ritual-dapp-skills:ritual-dapp-multimodal` |
-| Multi-step AI workflows / agent deployment | `ritual-dapp-skills:ritual-dapp-agents` (factory-backed + direct modes) |
+| Multi-step AI workflows / agent deployment | `ritual-dapp-skills:ritual-dapp-agents` (direct consumer launch) |
 | Scheduling | `ritual-dapp-skills:ritual-dapp-scheduler` |
 | Secrets & privacy | `ritual-dapp-skills:ritual-dapp-secrets` |
 | Fee management | `ritual-dapp-skills:ritual-dapp-wallet` |
@@ -229,7 +245,7 @@ For direct routing when the user names a specific topic:
  │  /ritual-dapp-http       │  HTTP call precompile patterns              │
  │  /ritual-dapp-longrunning│  Long-running async jobs & polling          │
  │  /ritual-dapp-multimodal │  Image, audio & video generation            │
- │  /ritual-dapp-agents     │  Sovereign/persistent + factory launch      │
+ │  /ritual-dapp-agents     │  Sovereign/persistent + consumer launch      │
  │  /ritual-dapp-scheduler  │  Scheduled & recurring operations           │
  │  /ritual-dapp-secrets    │  Secret management & encryption             │
  │  /ritual-dapp-wallet     │  RitualWallet fee management                │

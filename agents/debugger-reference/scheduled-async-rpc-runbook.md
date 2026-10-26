@@ -34,7 +34,7 @@ import requests
 CALL_SCHEDULED_TOPIC = "0xcaca4474e4e795729bb2ff72d20cbac301679d1329458aba9cc4a52235266949"
 EXECUTE_SELECTOR = bytes.fromhex("5601eaea")
 SCHEDULED_TX_TYPE = b"\x10"
-DEFAULT_SCHEDULER = "0x56e776BAE2DD60664b69Bd5F865F1180ffB7D58B"
+DEFAULT_SCHEDULER = "0x4E0abeE2233D73E66382b45244F7459B34E1490E"
 
 
 def normalize_hash(value: str) -> str:
@@ -234,8 +234,8 @@ from dataclasses import dataclass
 
 import requests
 
-ASYNC_TRACKER = "0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5"
-JOB_ADDED_TOPIC = "0xdc816fe478e06924e13d5c802912a8d7931e9a96b8443fe00d3f27c2da756cdf"
+ASYNC_TRACKER = "0xf00385449fD961925A0B125F5f30b29B682D4bFb"
+JOB_ADDED_TOPIC = "0xd83dc24dbfbb1495338e48098805afe63017833c8ddaf1ab7ccbed92f18b8540"
 PHASE1_SETTLED_TOPIC = "0x37f71b8eed16673ade1472b9c4d690c8d8cdfb7fd0f55f9cf2c9c9e679f04db4"
 JOB_REMOVED_TOPIC = "0x59725cef98fe1b85530b2a0a150f88c48a08cca2cafed999590140955f67b540"
 
@@ -397,7 +397,7 @@ def main() -> None:
                 job_id=job_id,
                 executor=decode_indexed_address(str(topics[1])),
                 commit_block=read_word(data, 0),
-                ttl=read_word(data, 6),
+                ttl=read_word(data, 7),
                 phase1_settled=phase1,
                 removed=removed,
                 removed_completed=completed,

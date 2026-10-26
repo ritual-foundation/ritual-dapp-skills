@@ -2,7 +2,7 @@
   "name": "ritual-dapp-skills",
   "description": "Claude Code skills and agents for building dApps on Ritual Chain. Covers smart contracts, frontend async state machines, precompile integration, secrets, scheduling, streaming LLM, agent calls, multimodal generation, X402 payments, and more. Includes automatic post-build debugger verification.",
   "author": {
-    "name": "Ritual Foundation",
-    "email": "community@ritualfoundation.org"
+    "name": "Ritual",
+    "email": "support@ritual.net"
   }
 }

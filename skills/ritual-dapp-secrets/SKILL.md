@@ -6,6 +6,11 @@ version: 1.0.0
 
 # Secret Management, Private I/O & Delegation
 
+For persistent Hermes, an encrypted named secret does **not** automatically become
+an arbitrary environment variable. Read [runtime secret bindings and Jev](../ritual-dapp-agents/references/hermes-tools-and-secrets.md)
+before promising custom tool credentials or configuration-based injection.
+
+
 Encrypt secrets for executor-side injection, receive private execution outputs, and manage delegated access control for shared secrets on Ritual Chain.
 
 > For storage credential formats (GCS, HuggingFace, Pinata) used in `encryptedSecrets`, see `ritual-dapp-da`.
@@ -15,6 +20,29 @@ Encrypt secrets for executor-side injection, receive private execution outputs, 
 Core path in this skill: encrypt `encryptedSecrets` to an executor public key, use template substitution, optionally set `userPublicKey` for encrypted outputs, and use delegation via `SecretsAccessControl`.
 
 Template substitution runs whenever `encryptedSecrets` is non-empty.
+
+RITHTTP1 adds structured aliases without changing encryption, ownership, delegation, or signatures. Put reusable storage credentials under `storage:*` and injected HTTP values under `http:*` in the same owner-bound secrets map. After DA hydration, the executor expands `{"$ritual_secret":"http:alias"}` whole-value nodes and `{{ritual.secret:http:alias}}` string markers, including markers that came from downloaded JSON. Encrypted DA artifacts are a separate content-encryption layer; see [`../ritual-dapp-http/references/rithttp1-private-io.md`](../ritual-dapp-http/references/rithttp1-private-io.md).
+
+### The four identities must stay separate
+
+| Identity | Meaning | Authorization role |
+|---|---|---|
+| Secret owner | Address named in `secretOwners[i]`, encoded inside the decrypted owner-bound envelope, and recovered from `signatures[i]` | Owns the ciphertext and is the only address that can create its on-chain grant because `grantAccess` stores `msg.sender` as owner |
+| Delegate | Immediate EVM caller of the async precompile (`job.SenderAddress`) | Must be the owner or have `checkAccess(owner, delegate, secretsHash)` permission |
+| Sponsor | RitualWallet account paying/reserving the async fee | Needs balance and, when different from the caller, wallet allowance; it does not receive secret access by paying |
+| Executor | Selected TEE address whose public key encrypted the blob | Bound into the owner's signature so authorization cannot be replayed to another executor |
+
+`tx.origin`, the end user who called a router, and a Scheduler callback sender are not automatically the delegate. The consuming router/manager contract is the delegate when it is the contract that calls the precompile.
+
+Every non-empty encrypted blob uses parallel array entries across `secretOwners`, `encryptedSecrets`, and `signatures`. The owner signs:
+
+```text
+RITUAL_SECRET_AUTHORIZATION_V1
+|| uint16(useContext.length) || useContext
+|| uint256(chainId) || executor || owner || keccak256(ciphertext)
+```
+
+The executor then decrypts `{version:1, secret_owner, secrets}` and requires the envelope owner to equal the explicit calldata owner. This prevents a ciphertext from being copied and relabeled.
 
 For the optional `piiEnabled` behavior, see **Optional PII Redaction (`piiEnabled`)** near the end of this document.
 
@@ -51,7 +79,7 @@ For the optional `piiEnabled` behavior, see **Optional PII Redaction (`piiEnable
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │            SecretsAccessControl Contract                 │   │
-│  │  Address: 0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD    │   │
+│  │  Address: 0x0cEae62e2082829226eF5821Bb662483Db17A71F    │   │
 │  │                                                          │   │
 │  │  grantAccess(delegate, secretsHash, expiresAt, policy)    │   │
 │  │  revokeAccess(delegate, secretsHash)                     │   │
@@ -72,7 +100,7 @@ import { encrypt, decrypt, PrivateKey, ECIES_CONFIG } from 'eciesjs';
 ECIES_CONFIG.symmetricNonceLength = 12;
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
@@ -108,14 +136,14 @@ import type { Address, Hex } from 'viem';
 import { encrypt } from 'eciesjs';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
 });
 const publicClient = createPublicClient({ chain: ritualChain, transport: http() });
 
-const TEE_SERVICE_REGISTRY = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F' as const;
+const TEE_SERVICE_REGISTRY = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839' as const;
 const CAPABILITY_HTTP = 0;
 
 // Option A (discover): pick a valid executor by capability
@@ -134,9 +162,9 @@ const services = await publicClient.readContract({
           { name: 'paymentAddress', type: 'address' },
           { name: 'teeAddress', type: 'address' },
           { name: 'teeType', type: 'uint8' },
-          { name: 'publicKey', type: 'bytes' },
+          { name: 'executorSecretsAuthPublicKey', type: 'bytes' },
           { name: 'endpoint', type: 'string' },
-          { name: 'certPubKeyHash', type: 'bytes32' },
+          { name: 'mTlsSpkiHash', type: 'bytes32' },
           { name: 'capability', type: 'uint8' },
         ]},
         { name: 'isValid', type: 'bool' },
@@ -152,17 +180,35 @@ const selected = services[0];
 
 // Option B (already selected): set these directly instead of discovery
 const executorAddress: Address = selected.node.teeAddress;
-const executorPublicKey: Hex = selected.node.publicKey as Hex;
+const executorPublicKey: Hex = selected.node.executorSecretsAuthPublicKey as Hex;
 
 // Endpoint note: `node.endpoint` is NOT used for encryption/delegation.
 // Secrets path uses executor address + executor public key.
 
-const secretsJson = JSON.stringify({
+// The plaintext is an owner-bound envelope, NOT a bare secrets map. The executor
+// rejects any blob whose envelope owner does not match the secret_owners[i] you
+// declare in the request. The envelope mirrors ritual-common build_secret_envelope:
+// {version:1, secret_owner:<checksum>, secrets:{...}}. The executor json-parses the
+// decrypted bytes, so exact key ordering is not required for correctness; the version
+// and owner-match checks are what matter.
+import { getAddress } from 'viem';
+
+function buildSecretEnvelope(secretOwner: Address, secrets: Record<string, string>): string {
+  return JSON.stringify({
+    secret_owner: getAddress(secretOwner),   // EIP-55 checksummed owner address
+    secrets,
+    version: 1,
+  });
+}
+
+const ownerAddress = account.address;        // the address that owns/signs this blob
+const secretsJson = buildSecretEnvelope(ownerAddress, {
   API_KEY: 'sk-my-openai-key-here',
   WEBHOOK_SECRET: 'whsec_abc123',
 });
 const encryptedBuffer = encrypt(executorPublicKey.slice(2), Buffer.from(secretsJson));
-const encryptedSecrets: Hex[] = [`0x${encryptedBuffer.toString('hex')}`];
+const encryptedSecrets: Hex[] = [`0x${Buffer.from(encryptedBuffer).toString('hex')}`];
+// Pass secret_owners=[ownerAddress] in the request; it must equal the envelope owner.
 const secretsHash: Hex = keccak256(toBytes(encryptedSecrets[0]));
 ```
 
@@ -178,23 +224,53 @@ const decryptedBuffer = decrypt(
   process.env.PRIVATE_KEY!.slice(2),  // raw hex private key
   Buffer.from(encryptedBytes),
 );
-const decrypted = JSON.parse(decryptedBuffer.toString('utf-8'));
-// Returns: { API_KEY: 'sk-my-openai-key-here', WEBHOOK_SECRET: 'whsec_abc123' }
+const envelope = JSON.parse(Buffer.from(decryptedBuffer).toString('utf-8'));
+// Returns the owner-bound envelope, NOT a flat map:
+//   { version: 1, secret_owner: '0x...', secrets: { API_KEY: 'sk-my-openai-key-here', WEBHOOK_SECRET: 'whsec_abc123' } }
+// Verify version === 1 and secret_owner === the expected owner, then read .secrets:
+if (envelope.version !== 1) throw new Error('Unsupported secret envelope version');
+// (executor-side) require getAddress(envelope.secret_owner) === getAddress(expectedOwner)
+const decrypted = envelope.secrets;
+// decrypted = { API_KEY: 'sk-my-openai-key-here', WEBHOOK_SECRET: 'whsec_abc123' }
 
 // Decrypt with a specific private key
 const specificKey = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const decryptedWithKey = JSON.parse(
-  decrypt(specificKey.slice(2), Buffer.from(hexToBytes(encryptedSecrets[0]))).toString('utf-8'),
-);
+  Buffer.from(decrypt(specificKey.slice(2), Buffer.from(hexToBytes(encryptedSecrets[0])))).toString('utf-8'),
+).secrets;
 ```
 
 ## Secret Template Substitution
 
-Executors perform template substitution by direct key-name replacement. If your decrypted secrets JSON contains `{ "API_KEY": "sk-..." }`, every literal `API_KEY` substring in relevant request fields is replaced with `sk-...`.
+Executors perform template substitution by direct key-name replacement using the keys inside the envelope's inner `secrets` object. If your decrypted envelope is `{ "version": 1, "secret_owner": "0x...", "secrets": { "API_KEY": "sk-..." } }`, every literal `API_KEY` (a key of `.secrets`) substring in relevant request fields is replaced with `sk-...`.
 
 Substitution is triggered by non-empty `encryptedSecrets` (not by `piiEnabled`).
 
 Use distinctive secret keys (`OPENAI_API_KEY_PROD`) to avoid accidental substring collisions.
+
+### RITHTTP1 post-hydration secrets
+
+Legacy HTTP requests keep the direct key-name replacement documented below. A body prefixed with `RITHTTP1` uses a bounded structured pipeline instead:
+
+1. decrypt the same owner-bound blobs and enforce the same owner/delegate/signature policy;
+2. resolve and digest-check DA inputs through `storage:*` aliases;
+3. splice the downloaded JSON values into exact `$ritual_da` nodes;
+4. resolve `http:*` secret nodes and string markers across the hydrated document.
+
+DA expansion is not recursive and secret values are terminal. RITHTTP1 does not support legacy PII mode, so set `piiEnabled=false`. This does not weaken secret privacy: the executor still decrypts inside its normal TEE flow, and credentials never enter the compact JSON template or StorageRef paths.
+
+### RITHTTP1 encrypted DA artifacts
+
+Do not conflate the two encrypted inputs:
+
+| Input | Contains | Encryption and authorization |
+|---|---|---|
+| `encryptedSecrets` | Storage credentials, provider keys, injected values | Owner-bound envelope encrypted to the executor, plus owner signature and delegate policy |
+| Encrypted DA artifact | Request content such as messages or tools | Random AES-GCM content DEK wrapped to 1–8 recipient keys; `InputRef` commits the ciphertext SHA-256 |
+
+Both are needed when private request content lives in authenticated storage: `encryptedSecrets` lets the executor fetch the object and call the provider, while the artifact keeps content opaque to storage and non-recipient relays. The executor recipient key is required; a user recipient is optional for recovery. Verify the selected executor key from chain state before encrypting.
+
+Output privacy is chosen explicitly on each `OutputPipe.recipientPublicKey`; empty bytes mean plaintext, including on CONTRACT. The outer user key does not encrypt pipes. See the private-I/O reference for RITPIPE1 bindings and separate stream/DA verification.
 
 ### Shared HTTP ABI (reuse in examples)
 
@@ -202,30 +278,36 @@ Use distinctive secret keys (`OPENAI_API_KEY_PROD`) to avoid accidental substrin
 import { parseAbiParameters } from 'viem';
 
 const HTTP_CALL_ABI = parseAbiParameters([
-  'address, bytes[], uint256, bytes[], bytes,',
-  'string, uint8, string[], string[], bytes, bool',
+  'address, address, address[], bytes[], uint256, bytes[], bytes,',
+  'string, uint8, string[], string[], bytes, uint256, uint8, bool,',
+  '(string, string, string)',
 ].join(''));
 ```
 
 ### In HTTP Headers
 
 ```typescript
-import { encodeAbiParameters } from 'viem';
+import { toHex, encodeAbiParameters } from 'viem';
 import type { Address } from 'viem';
 import { encrypt } from 'eciesjs';
 
-// 1. Encrypt your API key with the executor's public key
-const secretJson = JSON.stringify({ API_KEY: 'sk-live-abc123def456' });
+// 1. Encrypt your API key (wrapped in the owner-bound envelope) with the executor's public key.
+//    See buildSecretEnvelope / buildSecretAuthorizationPayload under "Signature Format" below.
+const secretJson = buildSecretEnvelope(account.address, { API_KEY: 'sk-live-abc123def456' });
 const encryptedBuffer = encrypt(executorPublicKey.slice(2), Buffer.from(secretJson));
-const encryptedSecrets = [`0x${encryptedBuffer.toString('hex')}` as `0x${string}`];
+const encryptedSecrets = [`0x${Buffer.from(encryptedBuffer).toString('hex')}` as `0x${string}`];
+// Sign the domain-separated authorization payload (NOT the raw ciphertext), as the OWNER.
+const HTTP_USE_CONTEXT = 'precompile:0x0000000000000000000000000000000000000801';
 const signature = await walletClient.signMessage({
   account: account.address,
-  message: { raw: encryptedSecrets[0] },
+  message: { raw: buildSecretAuthorizationPayload(784n, HTTP_USE_CONTEXT, executorAddress, account.address, encryptedSecrets[0]) },
 });
 
 // 2. Build HTTP request with template in headers using raw ABI encoding
 const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   executorAddress as Address,                      // executor
+  account.address as Address,                      // sponsor (RitualWallet account backing payment)
+  [account.address] as Address[],                  // secretOwners (one non-zero owner per blob, parallel to encryptedSecrets)
   encryptedSecrets,                                // encryptedSecrets
   100n,                                            // ttl
   [signature],                                     // secretSignatures (one per blob)
@@ -234,11 +316,14 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   2,                                               // method (POST)
   ['Content-Type', 'Authorization'],               // headersKeys
   ['application/json', 'Bearer API_KEY'],          // headersValues — template substitution
-  new TextEncoder().encode(JSON.stringify({
+  toHex(new TextEncoder().encode(JSON.stringify({
     model: 'gpt-4',
     messages: [{ role: 'user', content: 'Hello' }],
-  })),
+  }))),
+  0n,                                              // dkmsKeyIndex (0 = not using dKMS)
+  0,                                               // dkmsKeyFormat
   false,                                           // piiEnabled (independent from substitution)
+  ['', '', ''],                                    // outputStorageRef (empty = inline output)
 ]);
 
 // The executor decrypts API_KEY and replaces every literal API_KEY match
@@ -249,6 +334,8 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
 ```typescript
 const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   executorAddress,
+  account.address,                                  // sponsor
+  [account.address],                                // secretOwners (parallel to encryptedSecrets)
   encryptedSecrets,
   100n,
   [signature],
@@ -256,16 +343,23 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   'https://api.example.com/data?key=API_KEY',      // Template in URL
   1,                                                // GET
   [], [],                                           // no extra headers
-  new Uint8Array(0),                                // no body
+  '0x',                                // no body
+  0n,                                               // dkmsKeyIndex
+  0,                                                // dkmsKeyFormat
   false,                                            // piiEnabled (optional, unrelated)
+  ['', '', ''],                                     // outputStorageRef (empty = inline output)
 ]);
 ```
 
 ### In Request Body
 
 ```typescript
+import { toHex } from 'viem';
+
 const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   executorAddress,
+  account.address,                                  // sponsor
+  [account.address],                                // secretOwners (parallel to encryptedSecrets)
   encryptedSecrets,
   100n,
   [signature],
@@ -273,35 +367,43 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   'https://api.example.com/webhook',
   2,                                               // POST
   ['Content-Type'], ['application/json'],
-  new TextEncoder().encode(JSON.stringify({
+  toHex(new TextEncoder().encode(JSON.stringify({
     token: 'WEBHOOK_TOKEN',        // Template in body
     secret: 'WEBHOOK_SECRET',      // Multiple templates supported
     data: { message: 'Hello from Ritual' },
-  })),
+  }))),
+  0n,                                               // dkmsKeyIndex
+  0,                                                // dkmsKeyFormat
   false,                                            // piiEnabled (optional, unrelated)
+  ['', '', ''],                                     // outputStorageRef (empty = inline output)
 ]);
 ```
 
 ### Multiple Secrets in One Request
 
 ```typescript
+import { toHex } from 'viem';
+
 import { encrypt } from 'eciesjs';
 
-// Encrypt all secrets into a single blob
-const secretJson = JSON.stringify({
+// Encrypt all secrets into a single owner-bound blob
+const secretJson = buildSecretEnvelope(account.address, {
   OPENAI_KEY: 'sk-...',
   PINECONE_KEY: 'pc-...',
   CUSTOM_HEADER: 'my-value',
 });
 const encryptedBuffer = encrypt(executorPublicKey.slice(2), Buffer.from(secretJson));
-const encryptedSecrets = [`0x${encryptedBuffer.toString('hex')}` as `0x${string}`];
+const encryptedSecrets = [`0x${Buffer.from(encryptedBuffer).toString('hex')}` as `0x${string}`];
+const HTTP_USE_CONTEXT = 'precompile:0x0000000000000000000000000000000000000801';
 const signature = await walletClient.signMessage({
   account: account.address,
-  message: { raw: encryptedSecrets[0] },
+  message: { raw: buildSecretAuthorizationPayload(784n, HTTP_USE_CONTEXT, executorAddress, account.address, encryptedSecrets[0]) },
 });
 
 const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   executorAddress,
+  account.address,                               // sponsor
+  [account.address],                             // secretOwners (parallel to encryptedSecrets)
   encryptedSecrets,
   100n,
   [signature],
@@ -310,32 +412,88 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   2,                                             // POST
   ['Authorization', 'X-Pinecone-Api-Key', 'X-Custom'],
   ['Bearer OPENAI_KEY', 'PINECONE_KEY', 'CUSTOM_HEADER'],
-  new TextEncoder().encode(JSON.stringify({ query: 'Find similar documents' })),
-  false,                                          // piiEnabled (optional, unrelated)
+  toHex(new TextEncoder().encode(JSON.stringify({ query: 'Find similar documents' }))),
+  0n,                                            // dkmsKeyIndex
+  0,                                             // dkmsKeyFormat
+  false,                                         // piiEnabled (optional, unrelated)
+  ['', '', ''],                                  // outputStorageRef (empty = inline output)
 ]);
 ```
 
 ### Signature Format
 
-Sign each encrypted secret blob using viem's `signMessage` with raw bytes:
+The signature is NOT over the raw encrypted blob. Each blob's signature is an EIP-191
+`personal_sign` over a **domain-separated authorization payload**, and the signer must be
+the secret **owner** — the address placed in the new `secret_owners[i]` ABI slot. One
+signature per blob. The payload is byte-identical to ritual-common `create_secret_signature` /
+ritual-common `build_secret_authorization_payload` and Go `ReconstructSecretAuthorizationPreimage`.
+
+Payload byte layout:
+```
+RITUAL_SECRET_AUTHORIZATION_V1            (domain, ASCII bytes, no length prefix)
+|| uint16(len(use_context))               (big-endian, 2 bytes)
+|| utf8(use_context)                      (per-precompile context string)
+|| uint256(chain_id)                      (32 bytes, big-endian)
+|| executor                              (20 bytes)
+|| owner                                 (20 bytes, == secret_owners[i])
+|| keccak256(encrypted_secrets[i])        (32 bytes)
+```
+
+`use_context` for the HTTP precompile is the exact string
+`precompile:0x0000000000000000000000000000000000000801`. Per-precompile contexts prevent a
+signature for one precompile from being replayed on another.
 
 ```typescript
-// The executor expects EIP-191 personal_sign format
+import { getAddress, keccak256, concat, toBytes, numberToBytes } from 'viem';
+
+// Owner-bound envelope mirroring ritual-common build_secret_envelope ({version:1,
+// secret_owner, secrets}). The executor json-parses the decrypted bytes, so it is the
+// version/owner-match that matter, not exact key ordering.
+function buildSecretEnvelope(secretOwner: Address, secrets: Record<string, string>): string {
+  return JSON.stringify({ secret_owner: getAddress(secretOwner), secrets, version: 1 });
+}
+
+// Domain-separated authorization payload that the OWNER personal-signs.
+function buildSecretAuthorizationPayload(
+  chainId: bigint,
+  useContext: string,
+  executor: Address,
+  owner: Address,
+  encryptedBlob: `0x${string}`,
+): Uint8Array {
+  const ctx = new TextEncoder().encode(useContext);
+  return concat([
+    new TextEncoder().encode('RITUAL_SECRET_AUTHORIZATION_V1'),
+    numberToBytes(ctx.length, { size: 2 }),       // uint16 big-endian length
+    ctx,
+    numberToBytes(chainId, { size: 32 }),         // uint256 big-endian chain id
+    toBytes(getAddress(executor)),                // 20 bytes
+    toBytes(getAddress(owner)),                   // 20 bytes
+    toBytes(keccak256(encryptedBlob)),            // 32 bytes
+  ]);
+}
+
+// The executor expects EIP-191 personal_sign format over that payload.
+const HTTP_USE_CONTEXT = 'precompile:0x0000000000000000000000000000000000000801';
+const payload = buildSecretAuthorizationPayload(784n, HTTP_USE_CONTEXT, executorAddress, ownerAddress, encryptedSecretBytes);
 const signature = await walletClient.signMessage({
-  account: userAddress,
-  message: { raw: encryptedSecretBytes },  // Pass raw bytes, NOT the hash
+  account: ownerAddress,                          // signer MUST be the secret owner
+  message: { raw: payload },                      // sign the payload, NOT the raw ciphertext
 });
 // Returns 65-byte signature [R(32) || S(32) || V(1)]
 
-// The executor recovers the signer address using:
-// hash = keccak256("\x19Ethereum Signed Message:\n" + len + data)
+// The executor recovers the signer over the SAME payload:
+// hash = keccak256("\x19Ethereum Signed Message:\n" + len + payload)
 // signer = ecrecover(hash, v, r, s)
-// Verifies signer === tx.origin (or checks delegation via SecretsAccessControl)
+// Verifies signer === secret_owners[i] (the explicit per-blob owner). Caller/delegate
+// authorization is a separate downstream check via SecretsAccessControl: checkAccess is
+// evaluated as (secret_owners[i], delegate), where the delegate is the caller/sender
+// (job.SenderAddress), not the payment sponsor.
 ```
 
 Do NOT use `eth_sign` or manual hashing — `signMessage` already applies the EIP-191 prefix.
 
-For non-empty `encryptedSecrets`, provide one signature per blob even when signer is also `tx.origin`.
+`secretOwners`, `encryptedSecrets` and `secretSignatures` must be strictly parallel — equal length, and all three empty together when there are no secrets. For each blob provide one non-zero owner address and one signature. The chain rejects the request (Rust `CodecError` "secret_owners, encrypted_secrets and secret_signature arrays must have same length" / Go `DecodeBaseRequestFields` error / Python `validate_secret_arrays`) if the three lengths differ; empty owners (zero address), empty blobs, or empty signatures at any populated index are also rejected.
 
 ### Secret Reference Format
 
@@ -349,7 +507,7 @@ Secret template transactions can fail silently. Common causes:
 
 1. **Empty `encryptedSecrets`**: If `encryptedSecrets` is empty, no substitution runs and your request sends literal placeholders.
 
-2. **Signature mismatch**: The executor recovers the signer from each signature. If the recovered address doesn't match `tx.origin`, delegation is checked via `SecretsAccessControl`. Denied access returns HTTP 402 in the executor response (not a revert).
+2. **Signature mismatch**: The executor recovers the signer of each signature over the domain-separated authorization payload. If the recovered address doesn't match `secret_owners[i]` (the explicit per-blob owner), the blob is rejected. Caller/delegate authorization is a separate downstream check via `SecretsAccessControl` (`checkAccess(secret_owners[i], delegate)`, where the delegate is the caller/sender). Denied access returns HTTP 402 in the executor response (not a revert).
 
 3. **Check the receipt for errors**: Executor errors appear in the settled transaction receipt, not as reverts:
 ```typescript
@@ -373,40 +531,46 @@ import type { Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { encrypt } from 'eciesjs';
 
-// 1. Encrypt a JSON secrets map with executor's public key (ECIES)
-const secretJson = JSON.stringify({ API_KEY: 'sk-your-api-key' });
+// 1. Encrypt an owner-bound secret envelope with executor's public key (ECIES).
+//    buildSecretEnvelope wraps the map as {version:1, secret_owner, secrets} (canonical JSON).
+const secretJson = buildSecretEnvelope(account.address, { API_KEY: 'sk-your-api-key' });
 const encryptedBuffer = encrypt(executorPublicKey.slice(2), Buffer.from(secretJson));
-const encryptedSecret = `0x${encryptedBuffer.toString('hex')}` as `0x${string}`;
+const encryptedSecret = `0x${Buffer.from(encryptedBuffer).toString('hex')}` as `0x${string}`;
 
-// 2. Sign the encrypted blob
+// 2. Sign the domain-separated authorization payload as the OWNER (not the raw blob).
+//    The envelope owner and the secret_owners[i] passed below must agree.
+const HTTP_USE_CONTEXT = 'precompile:0x0000000000000000000000000000000000000801';
 const signature = await walletClient.signMessage({
   account,
-  message: { raw: encryptedSecret },
+  message: { raw: buildSecretAuthorizationPayload(784n, HTTP_USE_CONTEXT, executorAddress, account.address, encryptedSecret) },
 });
 
-// 3. Encode the precompile input (13 fields)
+// 3. Encode the precompile input (16 fields)
 const input = encodeAbiParameters(
   [
-    { type: 'address' }, { type: 'bytes[]' }, { type: 'uint256' },
+    { type: 'address' }, { type: 'address' }, { type: 'address[]' }, { type: 'bytes[]' }, { type: 'uint256' },
     { type: 'bytes[]' }, { type: 'bytes' },
     { type: 'string' }, { type: 'uint8' }, { type: 'string[]' },
     { type: 'string[]' }, { type: 'bytes' }, { type: 'uint256' },
-    { type: 'uint8' }, { type: 'bool' },
+    { type: 'uint8' }, { type: 'bool' }, { type: 'tuple', components: [{ type: 'string' }, { type: 'string' }, { type: 'string' }] },
   ],
   [
     executorAddress,
+    account.address,         // sponsor (RitualWallet account backing payment)
+    [account.address],       // secretOwners (one owner per blob, parallel to encryptedSecrets)
     [encryptedSecret],       // encrypted secrets array
     100n,                     // TTL in blocks
     [signature],              // signatures array
     '0x',                     // userPublicKey (empty if no response encryption)
     'https://api.example.com/data',
-    0,                        // GET
+    1,                        // GET
     ['Authorization'],
     ['Bearer API_KEY'],        // key-name placeholder
     '0x',                     // empty body for GET
     0n,                       // dkmsKeyIndex (0 = not using dKMS)
     0,                        // dkmsKeyFormat
     false,                    // piiEnabled (optional, unrelated)
+    ['', '', ''],             // outputStorageRef (empty = inline output)
   ]
 );
 
@@ -453,7 +617,7 @@ function generateKeyPair(): { publicKey: `0x${string}`; privateKey: `0x${string}
   const pk = sk.publicKey;
 
   return {
-    publicKey: `0x${pk.toHex()}` as `0x${string}`,
+    publicKey: `0x${pk.toHex(false)}` as `0x${string}`,
     privateKey: `0x${sk.toHex()}` as `0x${string}`,
   };
 }
@@ -474,6 +638,8 @@ const { publicKey: userPublicKey, privateKey: userPrivateKey } = generateKeyPair
 // Include userPublicKey so executor encrypts the response
 const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   executorAddress,
+  account.address, // sponsor (RitualWallet account backing payment)
+  [],              // secretOwners (all three secret arrays empty together when no secrets)
   [],              // encryptedSecrets
   100n,            // ttl
   [],              // secretSignatures
@@ -481,8 +647,11 @@ const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   'https://api.example.com/sensitive-data',
   1,               // GET
   [], [],          // no extra headers
-  new Uint8Array(0),
+  '0x',
+  0n,              // dkmsKeyIndex
+  0,               // dkmsKeyFormat
   false,           // piiEnabled — set to true only for PII redaction
+  ['', '', ''],    // outputStorageRef (empty = inline output)
 ]);
 
 // ... submit to precompile
@@ -506,7 +675,7 @@ function decryptOutput(encryptedHex: Hex, privateKeyHex: string): string {
   const encryptedBytes = hexToBytes(encryptedHex);
   const decryptedBuffer = decrypt(clean, Buffer.from(encryptedBytes));
 
-  return decryptedBuffer.toString('utf-8');
+  return Buffer.from(decryptedBuffer).toString('utf-8');
 }
 
 // Usage after receiving encrypted response from chain
@@ -520,33 +689,37 @@ console.log('Private result:', data);
 Based on the `private-horoscope` prototype — a complete flow where the user's horoscope is encrypted so only they can read it.
 
 ```typescript
-import { encodeAbiParameters } from 'viem';
+import { encodeAbiParameters, decodeAbiParameters, hexToBytes, toHex } from 'viem';
 import type { Hex } from 'viem';
-import { PrivateKey, encrypt } from 'eciesjs';
+import { PrivateKey, encrypt, decrypt } from 'eciesjs';
 
 // Reuse HTTP_CALL_ABI from "Shared HTTP ABI" above
 
 async function getPrivateHoroscope(zodiacSign: string) {
   // 1. Generate ephemeral keypair
   const sk = new PrivateKey();
-  const userPublicKey = `0x${sk.publicKey.toHex()}` as Hex;
+  const userPublicKey = `0x${sk.publicKey.toHex(false)}` as Hex;
   const userPrivateKey = sk.toHex();
 
-  // 2. Encrypt API key for the executor using ECIES
-  const secretJson = JSON.stringify({ HOROSCOPE_API_KEY: process.env.HOROSCOPE_API_KEY! });
+  // 2. Encrypt API key (owner-bound envelope) for the executor using ECIES
+  const secretJson = buildSecretEnvelope(account.address, { HOROSCOPE_API_KEY: process.env.HOROSCOPE_API_KEY! });
   const encryptedBuffer = encrypt(
     (executorPublicKey as string).slice(2),
     Buffer.from(secretJson),
   );
-  const encryptedSecrets = [`0x${encryptedBuffer.toString('hex')}` as `0x${string}`];
+  const encryptedSecrets = [`0x${Buffer.from(encryptedBuffer).toString('hex')}` as `0x${string}`];
+  // Sign the domain-separated authorization payload as the OWNER.
+  const HTTP_USE_CONTEXT = 'precompile:0x0000000000000000000000000000000000000801';
   const signature = await walletClient.signMessage({
     account: account.address,
-    message: { raw: encryptedSecrets[0] },
+    message: { raw: buildSecretAuthorizationPayload(784n, HTTP_USE_CONTEXT, executorAddress, account.address, encryptedSecrets[0]) },
   });
 
   // 3. Build request with both secrets AND private output key
   const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
     executorAddress,
+    account.address, // sponsor
+    [account.address], // secretOwners (parallel to encryptedSecrets)
     encryptedSecrets,
     100n,
     [signature],
@@ -555,17 +728,25 @@ async function getPrivateHoroscope(zodiacSign: string) {
     1,               // GET
     ['Authorization'],
     ['Bearer HOROSCOPE_API_KEY'],
-    new Uint8Array(0),
+    '0x',
+    0n,              // dkmsKeyIndex
+    0,               // dkmsKeyFormat
     false,           // piiEnabled (optional, unrelated)
+    ['', '', ''],    // outputStorageRef (empty = inline output)
   ]);
 
   // 4. Submit to precompile
   // ... submit transaction and wait for result
 
-  // 5. Decrypt the private result (only this user can do this)
-  // const encryptedResult = await getJobResult(jobId);
-  // const horoscope = decryptOutput(encryptedResult, userPrivateKey);
-  // return JSON.parse(horoscope);
+  // 5. Read actualOutput from this transaction's settled HTTP SPC receipt.
+  // const [ciphertext] = decodeAbiParameters([{ type: 'bytes' }], actualOutput);
+  // const plaintext = decrypt(userPrivateKey, hexToBytes(ciphertext));
+  // const [, , , body, errorMessage] = decodeAbiParameters(
+  //   [{ type: 'uint16' }, { type: 'string[]' }, { type: 'string[]' }, { type: 'bytes' }, { type: 'string' }],
+  //   toHex(plaintext),
+  // );
+  // if (errorMessage) throw new Error(errorMessage);
+  // return JSON.parse(new TextDecoder().decode(hexToBytes(body)));
 }
 ```
 
@@ -580,7 +761,7 @@ The SecretsAccessControl contract allows a secret owner to grant other addresses
 ### Contract Address
 
 ```
-SecretsAccessControl: 0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD
+SecretsAccessControl: 0x0cEae62e2082829226eF5821Bb662483Db17A71F
 ```
 
 ### Grant Access
@@ -592,7 +773,7 @@ import type { Address, Hex } from 'viem';
 import { encrypt } from 'eciesjs';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
@@ -600,13 +781,15 @@ const ritualChain = defineChain({
 const account = privateKeyToAccount(process.env.PRIVATE_KEY! as `0x${string}`);
 const walletClient = createWalletClient({ account, chain: ritualChain, transport: http() });
 
-const SECRETS_AC = '0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD' as const;
+const SECRETS_AC = '0x0cEae62e2082829226eF5821Bb662483Db17A71F' as const;
 const contractAddress = '0x1111111111111111111111111111111111111111' as Address;
 
-// Encrypt secrets and compute hash
-const secretJson = JSON.stringify({ API_KEY: 'sk-my-key' });
+// Encrypt the owner-bound envelope and compute hash. secret_owner is the delegating
+// owner; it must equal the secret_owners[i] presented at request time. The secretsHash
+// is computed over the encrypted envelope ciphertext.
+const secretJson = buildSecretEnvelope(account.address, { API_KEY: 'sk-my-key' });
 const encryptedBuffer = encrypt(executorPublicKey.slice(2), Buffer.from(secretJson));
-const encryptedHex = `0x${encryptedBuffer.toString('hex')}` as Hex;
+const encryptedHex = `0x${Buffer.from(encryptedBuffer).toString('hex')}` as Hex;
 const secretsHash = keccak256(toBytes(encryptedHex));
 
 // IMPORTANT: expiresAt is a BLOCK NUMBER, not a Unix timestamp.
@@ -757,10 +940,10 @@ const txHash = await walletClient.writeContract({
 
 ### Check Access
 
-`checkAccess` now returns both a boolean and the `SecretsAccessPolicy` associated with the grant:
+`checkAccess` returns both a boolean and the `SecretsAccessPolicy` associated with the grant:
 
 ```typescript
-const SECRETS_AC = '0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD' as const;
+const SECRETS_AC = '0x0cEae62e2082829226eF5821Bb662483Db17A71F' as const;
 
 const [hasAccess, policy] = await publicClient.readContract({
   address: SECRETS_AC,
@@ -871,28 +1054,39 @@ const hash = await walletClient.writeContract({
 
 ### Using Delegated Secrets as a Delegate
 
-The owner encrypts secrets, grants you access via `grantAccess`, and shares the encrypted blob + their EIP-191 signature off-chain. Your transaction includes these in the precompile call:
+The owner encrypts secrets (owner-bound envelope), grants you access via `grantAccess`, and shares the encrypted blob, their address, and their EIP-191 signature (over the domain-separated authorization payload) off-chain. Your transaction includes these in the precompile call — declaring the owner explicitly in `secretOwners`:
 
 ```typescript
-// ownerEncryptedSecrets and ownerSignature are provided by the secret owner
+// ownerEncryptedSecrets and ownerSignature are provided by the secret owner.
+// ownerAddress is the secret owner's address, declared explicitly in secretOwners.
 const encoded = encodeAbiParameters(HTTP_CALL_ABI, [
   executorAddress,
+  account.address,           // sponsor (the delegate's RitualWallet account backing payment)
+  [ownerAddress],            // secretOwners — the explicit per-blob owner(s), parallel to ownerEncryptedSecrets
   ownerEncryptedSecrets,     // the owner's encrypted blob (unchanged)
   100n,
-  [ownerSignature],          // owner's EIP-191 signature — REQUIRED for delegation
+  [ownerSignature],          // owner's EIP-191 signature over the authorization payload — REQUIRED for delegation
   '0x',
   'https://api.example.com/data',
   1,                         // GET
   ['Authorization'],
   ['Bearer API_KEY'],
-  new Uint8Array(0),
+  '0x',
+  0n,                        // dkmsKeyIndex
+  0,                         // dkmsKeyFormat
   false,                     // piiEnabled (optional, unrelated)
+  ['', '', ''],              // outputStorageRef (empty = inline output)
 ]);
 
-// tx.origin = your address (the delegate)
+// sponsor = the RitualWallet payer (here, your EOA). It may be different from
+// the delegate. For mediated calls, the consuming contract is the delegate
+// because it is the immediate precompile caller; the payer may be another
+// contract such as a sponsor vault.
 // The executor:
-//   1. Recovers signer from ownerSignature → ownerAddress
-//   2. Calls checkAccess(ownerAddress, tx.origin, secretsHash)
+//   1. Reads the owner from secretOwners[i] and verifies ownerSignature[i]
+//      recovers to that owner over the domain-separated authorization payload
+//   2. Calls checkAccess(secretOwners[i], delegate, secretsHash), where the
+//      delegate is the caller/sender (not the payment sponsor)
 //   3. If granted and not expired, proceeds with decryption
 const hash = await walletClient.sendTransaction({
   to: '0x0000000000000000000000000000000000000801',
@@ -923,6 +1117,15 @@ const hash = await walletClient.sendTransaction({
   │                │            │ before decrypting     │
   └────────────────┘            └───────────────────────┘
 ```
+
+### End-to-End Role Topologies
+
+| Topology | Secret owner | Delegate (immediate precompile caller) | Sponsor | Important consequence |
+|---|---|---|---|---|
+| User-owned secret through a router | Owner EOA | Router contract | Separate sponsor vault | An upstream buyer or caller does not gain secret access; the owner grants the router and signs each executor-bound blob |
+| Scheduled manager request | Owner EOA | Manager contract | Manager contract | The Scheduler transports the typed callback, but the manager remains the delegate when it invokes the async precompile |
+
+Do not implement an EOA-owned grant extension through a registry or manager contract. When that contract calls `grantAccess`, `msg.sender` is the contract, so the grant is written in the contract's owner namespace rather than the original EOA owner's namespace. The EOA owner must submit the re-grant.
 
 ## Solidity Contract with Secrets
 
@@ -960,16 +1163,16 @@ interface ISecretsAccessControl {
 }
 
 interface IRitualWallet {
-    function balanceOf(address user) external view returns (uint256);
-    function deposit(uint256 lockDuration) external payable;
+    function availableBalance(address account) external view returns (uint256);
+    function deposit() external payable;
 }
 
 contract SecretConsumer {
     ISecretsAccessControl public constant SECRETS_AC =
-        ISecretsAccessControl(0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD);
+        ISecretsAccessControl(0x0cEae62e2082829226eF5821Bb662483Db17A71F);
 
     IRitualWallet public constant RITUAL_WALLET =
-        IRitualWallet(0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948);
+        IRitualWallet(0xF04076756d8129Baec46Dc0F1c526Baec490C393);
 
     address public constant HTTP_PRECOMPILE =
         0x0000000000000000000000000000000000000801;
@@ -977,7 +1180,7 @@ contract SecretConsumer {
     address public owner;
     bytes32 public secretsHash;
 
-    event RequestSubmitted(bytes32 indexed jobId);
+    event ResponseReceived(bytes actualOutput);
     event SecretHashUpdated(bytes32 oldHash, bytes32 newHash);
 
     modifier onlyOwner() {
@@ -1004,7 +1207,7 @@ contract SecretConsumer {
     ) external onlyOwner {
         require(verifySecretAccess(), "No secret access");
 
-        uint256 balance = RITUAL_WALLET.balanceOf(address(this));
+        uint256 balance = RITUAL_WALLET.availableBalance(address(this));
         require(balance > 0, "Deposit required");
 
         (bool success, bytes memory result) = HTTP_PRECOMPILE.call(
@@ -1012,7 +1215,8 @@ contract SecretConsumer {
         );
         require(success, "Precompile call failed");
 
-        emit RequestSubmitted(bytes32(result));
+        (, bytes memory actualOutput) = abi.decode(result, (bytes, bytes));
+        emit ResponseReceived(actualOutput);
     }
 
     function updateSecretsHash(bytes32 _newHash) external onlyOwner {
@@ -1022,18 +1226,18 @@ contract SecretConsumer {
     }
 
     function deposit() external payable {
-        RITUAL_WALLET.deposit{value: msg.value}(5000);
+        RITUAL_WALLET.deposit{value: msg.value}();
     }
 
     receive() external payable {
-        RITUAL_WALLET.deposit{value: msg.value}(5000);
+        RITUAL_WALLET.deposit{value: msg.value}();
     }
 }
 ```
 
 ### DAO Shared Secrets Contract
 
-> **Warning: This pattern is broken as-written.** When `DAOSecretManager` calls `SECRETS_AC.grantAccess()`, `msg.sender` is the contract — not the admin EOA. The grant is stored under the contract's address. But the executor recovers the signer from the encrypted blob's EIP-191 signature (the admin EOA), and calls `checkAccess(adminEOA, consumer, hash)` — which returns `false` because the grant is under the contract. Contracts cannot produce EIP-191 signatures, so this mismatch cannot be resolved. **Fix:** Have the admin EOA call `grantAccess` directly instead of through a contract intermediary.
+> **Warning: This pattern is broken as-written.** When `DAOSecretManager` calls `SECRETS_AC.grantAccess()`, `msg.sender` is the contract — not the admin EOA. The grant is stored under the contract's address. But the secret blob declares the admin EOA as its `secret_owners[i]`, and the executor verifies the EIP-191 signature (over the domain-separated authorization payload) recovers to that admin EOA, then calls `checkAccess(adminEOA, consumer, hash)` — which returns `false` because the grant is under the contract, not the admin EOA. Contracts cannot produce EIP-191 owner signatures, so this mismatch cannot be resolved. **Fix:** Have the admin EOA call `grantAccess` directly instead of through a contract intermediary.
 
 ```solidity
 // SPDX-License-Identifier: MIT
@@ -1068,7 +1272,7 @@ interface ISecretsAccessControl {
 
 contract DAOSecretManager {
     ISecretsAccessControl public constant SECRETS_AC =
-        ISecretsAccessControl(0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD);
+        ISecretsAccessControl(0x0cEae62e2082829226eF5821Bb662483Db17A71F);
 
     address public admin;
     mapping(bytes32 => bool) public registeredSecrets;
@@ -1139,57 +1343,17 @@ pragma solidity ^0.8.20;
 contract PrivateOutputConsumer {
     address public constant HTTP_PRECOMPILE =
         0x0000000000000000000000000000000000000801;
-    address public constant ASYNC_DELIVERY_SENDER =
-        0x5A16214fF555848411544b005f7Ac063742f39F6;
-    // NOTE: 0xfA9E is tx.origin for settlement transactions.
-    // msg.sender for callbacks is the AsyncDelivery proxy at the address above.
 
-    struct PrivateRequest {
-        address requester;
-        bytes userPublicKey;
-        uint256 timestamp;
-    }
+    event PrivateResultReady(address indexed requester, bytes encryptedResult);
 
-    mapping(bytes32 => PrivateRequest) public requests;
-
-    event PrivateRequestSubmitted(
-        bytes32 indexed jobId,
-        address indexed requester
-    );
-
-    event PrivateResultReady(
-        bytes32 indexed jobId,
-        bytes encryptedResult
-    );
-
-    function submitPrivateRequest(
-        bytes calldata encodedRequest,
-        bytes calldata userPublicKey
-    ) external {
-        (bool success, bytes memory result) = HTTP_PRECOMPILE.call(
-            encodedRequest
-        );
+    function submitPrivateRequest(bytes calldata encodedRequest) external {
+        (bool success, bytes memory result) = HTTP_PRECOMPILE.call(encodedRequest);
         require(success, "Precompile call failed");
 
-        bytes32 jobId = bytes32(result);
-        requests[jobId] = PrivateRequest({
-            requester: msg.sender,
-            userPublicKey: userPublicKey,
-            timestamp: block.timestamp
-        });
-
-        emit PrivateRequestSubmitted(jobId, msg.sender);
-    }
-
-    function handleCallback(
-        bytes32 jobId,
-        bytes calldata encryptedResult
-    ) external {
-        require(msg.sender == ASYNC_DELIVERY_SENDER, "Unauthorized callback");
-        PrivateRequest memory req = requests[jobId];
-        require(req.requester != address(0), "Unknown job");
-
-        emit PrivateResultReady(jobId, encryptedResult);
+        // Short-running HTTP returns its settled output inline, without a callback.
+        (, bytes memory actualOutput) = abi.decode(result, (bytes, bytes));
+        bytes memory encryptedResult = abi.decode(actualOutput, (bytes));
+        emit PrivateResultReady(msg.sender, encryptedResult);
     }
 }
 ```
@@ -1203,16 +1367,18 @@ contract PrivateOutputConsumer {
 4. **`expiresAt` is a block number, not a timestamp** — use `currentBlock + 10_286n` (~1h) or `currentBlock + 246_858n` (~24h) at ~350ms baseline. Confirm with recent block measurements via `ritual-dapp-block-time`.
 5. **Rotate secrets** by granting access with the new hash, then revoking the old hash in separate transactions.
 6. **Generate fresh ephemeral keypairs** for each private output request — never reuse.
-7. **Sign encrypted blobs for delegated access** — omitting signatures when `tx.origin` ≠ secret owner causes silent 402 errors.
+7. **Sign every encrypted blob with the owner's key** — a per-blob owner signature is REQUIRED for every non-empty encrypted blob (not only when the owner differs from the caller). The executor validates each signature against the explicitly declared `secret_owners[i]` (the owner), over the context-, chain-, executor-, owner-, and ciphertext-bound authorization payload — never against the sponsor or `tx.origin`.
+8. **Grant the immediate precompile caller** — caller/delegate authorization is separate from payment. For mediated async calls the router/manager contract that invokes the precompile must hold the grant. A sponsor vault, buyer, scheduler, or upstream EOA does not need the grant unless it is itself the immediate precompile caller.
+9. **The owner must submit its own grant** — `grantAccess` writes under `msg.sender`. A registry or manager contract cannot grant or extend an EOA's secret ownership on that EOA's behalf. Have the owner EOA submit the grant/re-grant transaction.
 
 
 ## Key Addresses
 
 | Contract | Address |
 |----------|---------|
-| SecretsAccessControl | `0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD` |
-| TEEServiceRegistry | `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` |
-| RitualWallet | `0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948` |
+| SecretsAccessControl | `0x0cEae62e2082829226eF5821Bb662483Db17A71F` |
+| TEEServiceRegistry | `0xf4495DC72143D44A93AB0ecE4d6D63a216b27839` |
+| RitualWallet | `0xF04076756d8129Baec46Dc0F1c526Baec490C393` |
 
 ## Quick Reference
 
@@ -1222,15 +1388,20 @@ import { defineChain, createPublicClient, createWalletClient, http, keccak256, t
 import { privateKeyToAccount } from 'viem/accounts';
 import { encrypt, decrypt, ECIES_CONFIG } from 'eciesjs';
 
-const SECRETS_AC = '0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD' as const;
-const TEE_SERVICE_REGISTRY = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F' as const;
+const SECRETS_AC = '0x0cEae62e2082829226eF5821Bb662483Db17A71F' as const;
+const TEE_SERVICE_REGISTRY = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839' as const;
 
 // Mandatory for Ritual encrypted-secret compatibility. Do NOT use 16.
 ECIES_CONFIG.symmetricNonceLength = 12;
 
-// Encrypt secrets: encrypt(executorPubKey, secretsJson) via eciesjs
+// Encrypt secrets: secretsJson must be the owner-bound envelope {version:1, secret_owner:<owner>, secrets:{...}}
+//   (canonical JSON, sorted keys) → encrypt(executorPubKey, secretsJson) via eciesjs.
+//   The request carries a parallel secret_owners address[] (one owner per blob) matching the envelope owner.
 // Compute hash: keccak256(toBytes(encryptedHex))
-// Signatures: one signature per encrypted blob over raw bytes via signMessage({ message: { raw: blob } })
+// Signatures: one signature per encrypted blob over the domain-separated authorization payload
+//   (RITUAL_SECRET_AUTHORIZATION_V1 || uint16(len(useContext)) || useContext || uint256(chainId) || executor || owner || keccak256(blob)),
+//   personal-signed by the blob OWNER via signMessage({ message: { raw: payload } }). useContext is per-precompile,
+//   e.g. 'precompile:0x0000000000000000000000000000000000000801' for HTTP. NOT a signature over the raw blob.
 // Executor endpoint is not part of this flow; use executor address + public key only.
 
 // Grant delegation: walletClient.writeContract on SECRETS_AC.grantAccess(delegate, hash, expiry, policy)
@@ -1244,12 +1415,14 @@ ECIES_CONFIG.symmetricNonceLength = 12;
 // Template substitution: use key names in URL, headers, or body (for example API_KEY)
 // Executor decrypts and replaces matching key names at runtime
 // piiEnabled is independent; keep false unless you explicitly need PII redaction
+// RITHTTP1: keep false; use storage:* aliases for DA credentials and http:* aliases for injected values.
+// Expansion occurs after the executor hydrates exact {"$ritual_da":N} JSON nodes.
 
-// HTTP precompile ABI (13 fields):
-// (address executor, bytes[] encryptedSecrets, uint256 ttl, bytes[] secretSignatures,
-//  bytes userPublicKey, string url, uint8 method, string[] headersKeys,
+// HTTP precompile ABI (16 fields):
+// (address executor, address sponsor, address[] secretOwners, bytes[] encryptedSecrets, uint256 ttl,
+//  bytes[] secretSignatures, bytes userPublicKey, string url, uint8 method, string[] headersKeys,
 //  string[] headersValues, bytes body, uint256 dkmsKeyIndex, uint8 dkmsKeyFormat,
-//  bool piiEnabled)
+//  bool piiEnabled, (string,string,string) outputStorageRef)
 
 // Private output: include userPublicKey in the ABI-encoded request
 // Executor encrypts response with that key

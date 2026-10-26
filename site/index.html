@@ -1355,7 +1355,7 @@ footer a { color: var(--accent); }
   <div class="ref-grid" style="margin-bottom:40px;">
     <div class="ref-item">
       <div class="ref-label">Chain ID</div>
-      <div class="ref-value">1979</div>
+      <div class="ref-value">784</div>
     </div>
     <div class="ref-item">
       <div class="ref-label">Currency</div>
@@ -1387,27 +1387,27 @@ footer a { color: var(--accent); }
   <div class="ref-grid">
     <div class="ref-item">
       <div class="ref-label">RitualWallet</div>
-      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948" target="_blank">0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948</a></div>
+      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0xF04076756d8129Baec46Dc0F1c526Baec490C393" target="_blank">0xF04076756d8129Baec46Dc0F1c526Baec490C393</a></div>
     </div>
     <div class="ref-item">
       <div class="ref-label">AsyncJobTracker</div>
-      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5" target="_blank">0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5</a></div>
+      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0xf00385449fD961925A0B125F5f30b29B682D4bFb" target="_blank">0xf00385449fD961925A0B125F5f30b29B682D4bFb</a></div>
     </div>
     <div class="ref-item">
       <div class="ref-label">TEEServiceRegistry</div>
-      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F" target="_blank">0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F</a></div>
+      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0xf4495DC72143D44A93AB0ecE4d6D63a216b27839" target="_blank">0xf4495DC72143D44A93AB0ecE4d6D63a216b27839</a></div>
     </div>
     <div class="ref-item">
       <div class="ref-label">Scheduler</div>
-      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0x56e776BAE2DD60664b69Bd5F865F1180ffB7D58B" target="_blank">0x56e776BAE2DD60664b69Bd5F865F1180ffB7D58B</a></div>
+      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0x4E0abeE2233D73E66382b45244F7459B34E1490E" target="_blank">0x4E0abeE2233D73E66382b45244F7459B34E1490E</a></div>
     </div>
     <div class="ref-item">
       <div class="ref-label">SecretsACL</div>
-      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD" target="_blank">0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD</a></div>
+      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0x0cEae62e2082829226eF5821Bb662483Db17A71F" target="_blank">0x0cEae62e2082829226eF5821Bb662483Db17A71F</a></div>
     </div>
     <div class="ref-item">
       <div class="ref-label">AsyncDelivery</div>
-      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0x5A16214fF555848411544b005f7Ac063742f39F6" target="_blank">0x5A16214fF555848411544b005f7Ac063742f39F6</a></div>
+      <div class="ref-value"><a href="https://explorer.ritualfoundation.org/address/0x508f57AE70967Da28AE0Ab6b95532878c4D0F440" target="_blank">0x508f57AE70967Da28AE0Ab6b95532878c4D0F440</a></div>
     </div>
   </div>
 </section>
@@ -1580,27 +1580,27 @@ const SKILLS = {
     {name:"Overview",addr:"",desc:"Chain architecture, 3 execution models, 9-state async lifecycle, TEE trust model",
      detail:`<h3>What it teaches</h3><p>The complete Ritual Chain mental model. Three execution models (synchronous, short-running async, long-running async), the 9-state async transaction lifecycle, TEE trust model, executor selection, and all system contracts.</p><h3>Prior Correction</h3><p>8 Ethereum assumptions that are <strong>wrong</strong> on Ritual:</p><ul><li><code>writeContractAsync</code> breaks on async precompiles. Use <code>useSendTransaction</code></li><li><code>msg.sender</code> in callbacks = AsyncDelivery proxy, not the user</li><li>Only one short-running async call per transaction</li><li>Fees are RitualWallet deposits, not gas</li><li>Block time is ~350ms, not 12s</li><li>Receipts have <code>spcCalls</code> field with precompile results</li><li>Sender lock: one async job per EOA at a time</li><li>No Chainlink/ERC-4337/Gelato. Ritual has native equivalents</li></ul>`,exec:''},
     {name:"Precompiles ABI",addr:"16 addresses",desc:"Complete ABI reference for all precompiles with encoding examples",
-     detail:`<h3>What it teaches</h3><p>Input/output ABI for every precompile, with field counts, Solidity encoding, and viem TypeScript patterns.</p><h3>Precompile Categories</h3><span class="exec-model exec-sync">Synchronous</span> <span style="font-size:12px;color:var(--text-muted)">ONNX (0x0800), JQ (0x0803), SECP256R1 (0x0100)</span><br><span class="exec-model exec-spc">Short-running async</span> <span style="font-size:12px;color:var(--text-muted)">HTTP (0x0801), LLM (0x0802), DKMS (0x081B)</span><br><span class="exec-model exec-twophase">Long-running async</span> <span style="font-size:12px;color:var(--text-muted)">Long HTTP (0x0805), ZK (0x0806), Sovereign (0x080C), Image (0x0818), Audio (0x0819), Video (0x081A), Persistent (0x0820)</span>`,exec:''},
+     detail:`<h3>What it teaches</h3><p>Input/output ABI for every precompile, with field counts, Solidity encoding, and viem TypeScript patterns.</p><h3>Precompile Categories</h3><span class="exec-model exec-sync">Synchronous</span> <span style="font-size:12px;color:var(--text-muted)">JQ (0x0803), SECP256R1 (0x0100)</span><br><span class="exec-model exec-spc">Short-running async</span> <span style="font-size:12px;color:var(--text-muted)">HTTP (0x0801), LLM (0x0802), DKMS (0x081B)</span><br><span class="exec-model exec-twophase">Long-running async</span> <span style="font-size:12px;color:var(--text-muted)">Long HTTP (0x0805), ZK (0x0806), Sovereign (0x080C), Image (0x0818), Audio (0x0819), Video (0x081A), Persistent (0x0820)</span>`,exec:''},
     {name:"Deploy",addr:"",desc:"Chain config, Foundry/Hardhat setup, deployment scripts, system addresses",
-     detail:`<h3>What it teaches</h3><p>Chain ID 1979, RITUAL currency, EIP-1559 only. Complete Foundry and Hardhat configuration templates. System contract addresses. Deployment scripts with explorer verification. RPC endpoints for HTTP and WebSocket.</p>`,exec:''},
+     detail:`<h3>What it teaches</h3><p>Chain ID 784, RITUAL currency, EIP-1559 only. Complete Foundry and Hardhat configuration templates. System contract addresses. Deployment scripts with explorer verification. RPC endpoints for HTTP and WebSocket.</p>`,exec:''},
     {name:"Design System",addr:"",desc:"Dark-mode-first terminal aesthetic, typography, color semantics, accessibility",
      detail:`<h3>What it teaches</h3><p>The Ritual visual language: dark-mode-first terminal aesthetic. Fonts: Izoard (display), Barlow (body), JetBrains Mono (code). Color semantics: green = trust/success, pink = AI/compute, lime = data, gold = value. 9-state lifecycle UI components. WCAG 2.1 AA accessibility with focus-visible rings.</p>`,exec:''},
   ],
   "Precompile Features": [
-    {name:"HTTP",addr:"0x0801",desc:"External HTTP calls on-chain: APIs, price feeds, webhooks",
-     detail:`<h3>What it teaches</h3><p>The HTTP Call precompile. Short-running async model: result arrives in the same transaction via <code>spcCalls</code>.</p><span class="exec-model exec-spc">Short-running async: result in same TX</span><h3>Key patterns</h3><ul><li><code>SECRET</code> string replacement for API keys</li><li><code>piiEnabled</code> flag for secret string replacement and PII redaction</li><li>JQ post-processing via the JQ precompile (0x0803)</li><li>Method codes: GET=1, POST=2, PUT=3, DELETE=4, PATCH=5</li><li>One short-running async call per TX. Cannot chain with LLM in same TX</li></ul>`,exec:'spc'},
+    {name:"HTTP",addr:"0x0801",desc:"External HTTP calls, DA-backed JSON, output fan-out, and selected SSE",
+     detail:`<h3>What it teaches</h3><p>The unchanged HTTP Call precompile ABI plus the executor-owned RITHTTP1 body extension.</p><span class="exec-model exec-spc">Short-running async: result in same TX</span><h3>Key patterns</h3><ul><li>Public or encrypted DA inputs for exact <code>{"$ritual_da":N}</code> nodes</li><li><code>storage:*</code> credentials and post-hydration <code>http:*</code> secrets</li><li>Bounded string selectors and independent CONTRACT/STREAM/DA pipes with per-pipe encoding and recipient keys</li><li><code>RITOUT1</code> result and artifact commitments</li><li>Selected public/private RITPIPE1 frames plus independently collected DA output</li><li>Executor-key, admission, settlement, and history trust checks</li></ul>`,exec:'spc'},
     {name:"LLM",addr:"0x0802",desc:"On-chain AI inference: chat, tool calling, structured output, streaming",
      detail:`<h3>What it teaches</h3><p>The LLM precompile. 30-field ABI input. OpenAI-compatible chat completions with tool/function calling and structured output (JSON mode).</p><span class="exec-model exec-spc">Short-running async: result in same TX</span><h3>Key patterns</h3><ul><li>SSE streaming via EIP-712 signed events</li><li>Temperature and topP scaled ×1000 (0.7 = 700)</li><li>Private LLM via ECIES encryption to executor</li><li>Model selection via TEEServiceRegistry capability query</li></ul>`,exec:'spc'},
     {name:"Agents",addr:"0x0820 / 0x080C",desc:"Multi-step AI agents: persistent memory or sovereign execution",
      detail:`<h3>What it teaches</h3><p>Two agent precompiles: Persistent Agent (0x0820) for stateful with memory, Sovereign Agent (0x080C) for autonomous execution.</p><span class="exec-model exec-twophase">Long-running async: callback delivery</span><h3>Key patterns</h3><ul><li>2-phase submit → callback with tools (web_search, code_execution)</li><li>Storage references for persistent state across sessions</li><li>Delivery config: target address + selector + gas limit</li></ul>`,exec:'twophase'},
-    {name:"Long-Running HTTP",addr:"0x0805",desc:"Minutes-to-hours async HTTP jobs with polling",
-     detail:`<h3>What it teaches</h3><p>The Long HTTP precompile for operations that take minutes to hours.</p><span class="exec-model exec-twophase">Long-running async: submit/poll/deliver</span><h3>Key patterns</h3><ul><li>Submit → poll → deliver with JQ extraction</li><li><code>pollIntervalBlocks</code> + <code>maxPollBlock</code> configuration</li><li><code>taskIdMarker</code> for result identification</li><li>Scheduler integration for recurring long jobs</li></ul>`,exec:'twophase'},
+    {name:"Long-Running HTTP",addr:"0x0805",desc:"Minutes-to-hours task polling or one held HTTP response",
+     detail:`<h3>What it teaches</h3><p>The unchanged Long HTTP ABI with two executor completion modes.</p><span class="exec-model exec-twophase">Long-running async: callback delivery</span><h3>Key patterns</h3><ul><li>Legacy submit → poll → deliver for task-ID APIs</li><li>RITHTTP1 <code>AWAIT_RESPONSE</code> for one cancellable persistent request</li><li>Cached delivery retry without repeating the upstream call</li><li>Public or encrypted DA hydration and output fan-out</li><li>Selected SSE before callback with per-pipe commitments and preserved usage on stream failure</li><li><code>maxPollBlock</code> is the held-response deadline</li></ul>`,exec:'twophase'},
     {name:"Multimodal",addr:"0x0818 / 0x0819 / 0x081A",desc:"AI image, audio, and video generation on-chain",
      detail:`<h3>What it teaches</h3><p>Image (0x0818), Audio (0x0819), and Video (0x081A) precompiles.</p><span class="exec-model exec-twophase">Long-running async: callback delivery</span><h3>Key patterns</h3><ul><li>Encrypted storage credentials for S3/IPFS/Arweave</li><li>Output: URI + content hash</li><li>Executor Capability IDs: 7 (image), 8 (audio), 9 (video)</li></ul>`,exec:'twophase'},
-    {name:"Scheduler",addr:"0x56e7…D58B",desc:"Block-based delayed and recurring on-chain execution",
-     detail:`<h3>What it teaches</h3><p>How to use the Scheduler contract (<code>0x56e776BAE2DD60664b69Bd5F865F1180ffB7D58B</code>) to schedule delayed and recurring precompile calls on Ritual Chain. Execution is block-based, not time-based.</p><h3>Key patterns</h3><ul><li><code>setTimeout</code> / <code>setInterval</code> for Solidity: delayed and recurring on-chain calls</li><li>FSM: SCHEDULED → EXECUTING → COMPLETED/FAILED</li><li>Uses <code>TxScheduled</code> (type 0x10) system tx from sender <code>0x0000...00fa7e</code></li><li>Predicates for conditional execution (only run when a condition is true)</li><li>RitualWallet must be funded before each execution (just-in-time deposits supported)</li></ul>`,exec:''},
-    {name:"Secrets",addr:"",desc:"ECIES encryption, secret string replacement, delegated access control",
-     detail:`<h3>What it teaches</h3><p>Secret management for Ritual precompiles.</p><h3>Key patterns</h3><ul><li>ECIES encryption to executor public key</li><li><code>SECRET</code> string replacement in precompile inputs</li><li>Private outputs via <code>userPublicKey</code> field</li><li><a href="https://explorer.ritualfoundation.org/address/0xf9BF1BC8A3e79B9EBeD0fa2Db70D0513fecE32FD" target="_blank">SecretsAccessControl</a> for delegated access</li><li>Contract-owned vs EOA-owned secrets with different <code>msg.sender</code> rules</li></ul>`,exec:''},
+    {name:"Scheduler",addr:"0x4E0a…490E",desc:"Block-based delayed and recurring on-chain execution",
+     detail:`<h3>What it teaches</h3><p>How to use the Scheduler contract (<code>0x4E0abeE2233D73E66382b45244F7459B34E1490E</code>) to schedule delayed and recurring precompile calls on Ritual Chain. Execution is block-based, not time-based.</p><h3>Key patterns</h3><ul><li><code>setTimeout</code> / <code>setInterval</code> for Solidity: delayed and recurring on-chain calls</li><li>FSM: SCHEDULED → EXECUTING → COMPLETED/FAILED</li><li>Uses <code>TxScheduled</code> (type 0x10) system tx from sender <code>0x0000...00fa7e</code></li><li>Predicates for conditional execution (only run when a condition is true)</li><li>RitualWallet must be funded before each execution (just-in-time deposits supported)</li></ul>`,exec:''},
+    {name:"Secrets",addr:"",desc:"ECIES encryption, legacy and post-hydration secrets, delegated access control",
+     detail:`<h3>What it teaches</h3><p>Secret management for Ritual precompiles.</p><h3>Key patterns</h3><ul><li>Owner-bound credentials encrypted to the executor</li><li>Encrypted DA content uses a separate random DEK and recipient set</li><li>Legacy replacement and RITHTTP1 post-DA <code>http:*</code> expansion</li><li>Explicit per-pipe output recipient keys, including CONTRACT</li><li><a href="https://explorer.ritualfoundation.org/address/0x0cEae62e2082829226eF5821Bb662483Db17A71F" target="_blank">SecretsAccessControl</a> for delegated access</li><li>Owner, delegate, sponsor, executor, and user recipient remain distinct</li></ul>`,exec:''},
     {name:"X402 Payments",addr:"via 0x0801 / 0x0805",desc:"Micropayments for paid API access",
      detail:`<h3>What it teaches</h3><p>X402 micropayment protocol for paid APIs via the HTTP and Long-Running HTTP precompiles.</p><h3>Key patterns</h3><ul><li>ECIES-encrypted payment credentials</li><li>Budget management per API call</li><li>Shared credential patterns</li><li>Flows through HTTP (0x0801) and Long-Running HTTP (0x0805), not a separate precompile</li></ul>`,exec:''},
     {name:"Passkey / WebAuthn",addr:"",desc:"Sign transactions with Face ID, fingerprint, or hardware keys",
@@ -1978,7 +1978,7 @@ var fpGo, exitSlideMode;
       { think: 400, text: '  ✓ Built. It reads, thinks, and posts.', color: '#22c55e' },
       { break: true },
       { think: 350, text: '■ Phase 4: Deploy', color: '#22c55e' },
-      { think: 600, text: '  Deploying to Ritual Chain (ID: 1979)...', color: '#71717a' },
+      { think: 600, text: '  Deploying to Ritual Chain (ID: 784)...', color: '#71717a' },
       { think: 300, text: '  ✓ SovereignAgent: 0x7a3F...c91E', color: '#22c55e' },
       { think: 200, text: '  ✓ AgentActions: 0x2eB1...4d8A', color: '#22c55e' },
       { think: 200, text: '  ✓ Verified on explorer.ritualfoundation.org', color: '#22c55e' },
@@ -2038,60 +2038,71 @@ var fpGo, exitSlideMode;
       document.head.appendChild(s);
     }
 
+    let replayPromise = null;
+
     async function runReplay() {
-      el.innerHTML = '';
+      while (true) {
+        el.innerHTML = '';
 
-      const teaserDiv = document.createElement('div');
-      teaserDiv.style.color = '#555';
-      teaserDiv.style.minHeight = '1.7em';
-      el.appendChild(teaserDiv);
-
-      const spinner = createSpinner();
-      teaserDiv.appendChild(spinner.el);
-      const teaserText = document.createElement('span');
-      teaserDiv.appendChild(teaserText);
-      const cursor = createCursor();
-      teaserDiv.appendChild(cursor);
-
-      // Type "jestermaxxing..."
-      await streamText(teaserText, 'jestermaxxing...', 9);
-      await new Promise(r => setTimeout(r, 600));
-      // Delete it
-      await deleteText(teaserText, 25);
-      await new Promise(r => setTimeout(r, 300));
-
-      // Remove teaser line, spinner, cursor
-      spinner.stop();
-      cursor.remove();
-      teaserDiv.remove();
-
-      for (const line of lines) {
-        if (line.break) {
-          el.appendChild(document.createElement('br'));
-          await new Promise(r => setTimeout(r, 100));
-          continue;
-        }
-        const div = document.createElement('div');
-        div.style.color = line.color;
-        div.style.minHeight = '1.7em';
-        el.appendChild(div);
+        const teaserDiv = document.createElement('div');
+        teaserDiv.style.color = '#555';
+        teaserDiv.style.minHeight = '1.7em';
+        el.appendChild(teaserDiv);
 
         const spinner = createSpinner();
-        div.appendChild(spinner.el);
+        teaserDiv.appendChild(spinner.el);
+        const teaserText = document.createElement('span');
+        teaserDiv.appendChild(teaserText);
+        const cursor = createCursor();
+        teaserDiv.appendChild(cursor);
 
-        await new Promise(r => setTimeout(r, line.think));
+        // Type "jestermaxxing..."
+        await streamText(teaserText, 'jestermaxxing...', 9);
+        await new Promise(r => setTimeout(r, 600));
+        // Delete it
+        await deleteText(teaserText, 25);
+        await new Promise(r => setTimeout(r, 300));
 
-        const span = document.createElement('span');
-        div.appendChild(span);
-        await streamText(span, line.text, 9);
-
+        // Remove teaser line, spinner, cursor
         spinner.stop();
-        await new Promise(r => setTimeout(r, 40));
+        cursor.remove();
+        teaserDiv.remove();
+
+        for (const line of lines) {
+          if (line.break) {
+            el.appendChild(document.createElement('br'));
+            await new Promise(r => setTimeout(r, 100));
+            continue;
+          }
+          const div = document.createElement('div');
+          div.style.color = line.color;
+          div.style.minHeight = '1.7em';
+          el.appendChild(div);
+
+          const spinner = createSpinner();
+          div.appendChild(spinner.el);
+
+          await new Promise(r => setTimeout(r, line.think));
+
+          const span = document.createElement('span');
+          div.appendChild(span);
+          await streamText(span, line.text, 9);
+
+          spinner.stop();
+          await new Promise(r => setTimeout(r, 40));
+        }
+        await new Promise(r => setTimeout(r, 3000));
       }
-      await new Promise(r => setTimeout(r, 3000));
-      runReplay();
     }
-    window._startAgentReplay = runReplay;
+
+    window._startAgentReplay = () => {
+      if (!replayPromise) {
+        replayPromise = runReplay()
+          .catch(error => { console.error('Agent replay stopped:', error); })
+          .finally(() => { replayPromise = null; });
+      }
+      return replayPromise;
+    };
   })();
 
   // Nav links — once in normal scroll mode, just scroll to target
