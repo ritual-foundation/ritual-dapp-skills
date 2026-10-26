@@ -51,6 +51,11 @@ Complete these steps before submitting any HTTP call transaction.
 
 Query the `TEEServiceRegistry` for executors with `HTTP_CALL` capability. The `teeAddress` is what you pass as the `executor` field. The `publicKey` is needed if you encrypt secrets.
 
+> **Resolve the executor off-chain.** Query `TEEServiceRegistry` from your client or
+> script and pass `teeAddress` into your contract as an argument. Do not look the
+> executor up from inside the contract function that issues the 0x0801 call. Avoid
+> an on-chain lookup at that point; the HTTP call may fail without a clear error.
+
 ```typescript
 import { createPublicClient, http, defineChain } from 'viem';
 import type { Address, Hex } from 'viem';
