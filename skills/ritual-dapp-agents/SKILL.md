@@ -5,10 +5,18 @@ description: Persistent agent and sovereign agent patterns for Ritual dApps. Use
 
 # Persistent Agent & Sovereign Agent Patterns
 
+For reactive Hermes application integration after launch, read [Agent Link](../ritual-dapp-agent-link/SKILL.md). It covers explicit UAHI events/cadence/hybrid modes, pinned manifests, connector credentials, HTTP/WebSocket command and event transport, approvals, Stop, and reconnects.
+
 > **Runnable examples:**
-> - `examples/sovereign-agent/` demonstrates direct precompile caller mode (`0x080C`) for one-shot sovereign jobs.
-> - `examples/persistent-agent/` demonstrates direct precompile caller mode (`0x0820`) for one-shot persistent spawn.
-> - This skill also documents the contract-harness factory mode (recommended in production) where child harness/launcher contracts are deployed and managed through factory contracts.
+> - `examples/sovereign-agent/` deploys its own consumer and submits directly to `0x080C`.
+> - `examples/persistent-agent/` deploys its own consumer and submits directly to `0x0820`.
+>
+> **This skill covers how to *launch* an agent.** For how a launched agent actually does useful work over time — shaping behavior through the workspace md files (`SOUL.md`/`AGENTS.md`/`TOOLS.md`), choosing a run mode, defining outcome proof, and rehearsing the loop locally before spending a launch — see `skills/ritual-meta-agent-orchestration/SKILL.md`.
+
+> For a durable launch timeline, evidence at each stage and timeout recovery, read
+> [launch diagnostics](references/launch-diagnostics.md). For executable Hermes
+> skills, Jev and the distinction between encrypted secrets and runtime env, read
+> [Hermes tools and secrets](references/hermes-tools-and-secrets.md).
 
 > **Before running either example — required user-supplied inputs (elicit these upfront):**
 >
@@ -18,18 +26,18 @@ description: Persistent agent and sovereign agent patterns for Ritual dApps. Use
 > scripts on behalf of a user, ask the user for the following before invoking
 > `bash run.sh`:
 >
+> - `EXPECTED_CHAIN_ID` — persistent example: independently verified target deployment chain ID
 > - `PRIVATE_KEY` — funded 0x-prefixed key on Ritual Chain
 > - `RPC_URL` — RPC endpoint (e.g. `https://rpc.ritualfoundation.org`)
-> - `LLM_PROVIDER` — one of `anthropic` / `openai` / `gemini` / `openrouter` / `ritual` (the executor rejects calls where this is unset). Sovereign agents may also use `ritual`, which needs no API key.
-> - Exactly one matching LLM API key (skip if `LLM_PROVIDER=ritual`): `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY`
-> - `MODEL` — exact provider-routable model id (e.g. `claude-sonnet-4-5-20250929` for Anthropic, `gemini-2.5-flash` for Gemini, `zai-org/GLM-4.7-FP8` for the Ritual gateway)
-> - **Sovereign agent additionally requires:** `HF_TOKEN` + `HF_REPO_ID` (a HuggingFace dataset the user owns, in `user/repo` form). The example stores convo history, artifacts, and the system prompt under this repo; there are no defaults.
+> - Exactly one LLM API key: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY`. The scripts infer the provider from which key is set — do NOT ask the user for a separate `LLM_PROVIDER` value. The keyless `ritual` provider mode is not supported by the examples.
+> - `MODEL` — exact provider-routable model id (e.g. `claude-sonnet-4-5-20250929` for Anthropic, `gemini-2.5-flash` for Gemini). **Required for sovereign; optional for persistent** (the persistent helper defaults a model per provider).
+> - **Sovereign agent additionally requires** DA storage — `HF_TOKEN` + `HF_REPO_ID` (a HuggingFace dataset the user owns, in `user/repo` form) **or** `GCS_DA_SERVICE_ACCOUNT_JSON` + `GCS_DA_BUCKET` (a bucket the user owns). Default to hf (one token + one repo) when the user has no constraint. The example stores convo history, artifacts, and the system prompt here.
 > - **Persistent agent additionally requires** one DA provider configured:
 >   - `DA_PROVIDER=hf` → `HF_TOKEN` + `HF_REPO_ID`
 >   - `DA_PROVIDER=gcs` → `GCS_DA_SERVICE_ACCOUNT_JSON` + `GCS_DA_BUCKET` (a bucket the user owns)
 >   - `DA_PROVIDER=pinata` → `DA_PINATA_JWT`
 >
-> Do not guess or fill in placeholder values for any of these. Ask the user.
+> Do not guess or fill in placeholder values for the secrets above (private key, API keys, DA tokens) — ask the user for those. Everything else has a working default in the scripts.
 
 > **Scope note:** This skill focuses on the two agent primitives most builders will use directly: Persistent Agent (`0x0820`) and Sovereign Agent (`0x080C`).
 
@@ -40,7 +48,7 @@ Ritual Chain provides two enshrined agent primitives for on-chain AI execution:
 | Persistent Agent | `0x0820` | Long-lived, monitored, revivable agent instance with identity, memory, and DA-backed continuity |
 | Sovereign Agent | `0x080C` | High-powered async agent job with skills, tools, convo history, and artifact outputs |
 
-Both follow the async executor pattern: submit a request on-chain, an executor picks it up, runs the agent in a TEE, and delivers the result via callback. Phase 1 of the transaction settles synchronously — the caller's original transaction receives the job identifier as the precompile output. Phase 2 delivers the final result asynchronously via callback once the executor completes.
+Both follow the async executor pattern: submit a request on-chain, an executor picks it up, runs the agent in a TEE, and delivers the result via callback. The origin transaction hash identifies the job. After async commitment and executor Phase-1 settlement, the settled receipt exposes the task/prelaunch result; Phase 2 delivers the final result through the consumer callback.
 
 The critical product distinction is this:
 
@@ -88,1060 +96,51 @@ Both Persistent Agent and Sovereign Agent executors run on HTTP call capability 
 
 ---
 
-## Factory-First Agent Deployment (Recommended)
+## ⚠ Launch Gate — Silent-Failure Checklist (read this before you submit)
 
-Ritual agent deployment now has two distinct operation modes. Do not mix them conceptually:
+Agent launches fail **silently** far more often than they revert: the tx looks fine (or is quietly dropped) and **no error surfaces on-chain**. Every row below is a *silent* failure — check all of them before the first submit. Each links to a deeper section; this is the gate.
 
-| Mode | What you control | Contract surface | Best use |
-|------|------------------|------------------|----------|
-| Direct precompile caller | A consumer contract/EOA that calls precompile directly | `0x080C` (sovereign), `0x0820` (persistent) | Fast prototyping, ABI debugging, minimal demos |
-| Factory-backed contract harness | A deterministic child contract per agent workflow | `SovereignAgentFactory -> SovereignAgentHarness`, `PersistentAgentFactory -> PersistentAgentLauncher` | Production launches, recoverable lifecycle control, deterministic ownership/context |
+| # | Silent failure | One-line check / rule | Symptom if wrong |
+|---|---|---|---|
+| 1 | **Origin lock: prior async job has not Phase-1 settled or expired.** | Wait for the prior job to Phase-1 settle before the next EOA transaction. Use separate funded origins for concurrent jobs. `hasPendingJobForTxOrigin` alone can remain true after Phase 1 for a long-running job. | Next transaction does not mine until the origin lock is released. |
+| 2 | **ECIES nonce ≠ 12 / wrong pubkey** — executor can't decrypt secrets, silently drops the job; Phase 1 never settles. | Encrypt per `ritual-dapp-secrets`: nonce length **12** (not the library default 16), to `node.executorSecretsAuthPublicKey` (NOT `teeAddress`/`paymentAddress`). Decrypt-test locally first. | Commitment mines, `hasPendingJobForTxOrigin`=true, Phase 1 hangs forever. |
+| 3 | **Under-funded RitualWallet** — commitment can't reserve the fee. | `availableBalance(sponsor) >= reserve` (executor + commitment + inclusion + Phase-2 callback). If sponsor≠caller, also `allowance(sponsor, caller) >= reserve`. | Silent reject / `insufficient wallet balance`. Deposit + approve. |
+| 4 | **Wrong model string / bad cliType** — job fails inside the executor. | `model` = exact provider-routable id (no shorthand aliases). `cliType` ∈ {0 ClaudeCode, 5 Crush, 6 ZeroClaw}; 1–4 are unsupported. | Empty / failed run. Preflight the model provider-side. |
+| 5 | **Phase-2 deadline offset = 0** — rejected at RPC. | `phase2Ttl` (envelope field 3) non-zero and ≤ 70,000 (may be < `ttl`). | `Phase 2 deadline offset must be non-zero`. |
+| 6 | **Persistent: preflight skipped** — container spawns but is DEAD (no heartbeat), yet still returns a container ID. | DA configured, heartbeat/DKMS address funded with native RITUAL, and `RitualWallet.approve(AgentHeartbeat, max)` set. Run the Persistent Agent Preflight (Hard-Stop) first. | Container ID returned, agent never heartbeats. |
+| 7 | **Container started, then EXITED → FAILED** (ran a few cycles, then heartbeat FSM flips ACTIVE→FAILED) — the agent's OWN code/config crashed the runtime. | After it's live, read `getAssignment(agentId).revivalStatus`. If FAILED, pull the executor/container logs and inspect the agent's own outbound calls. Common causes: a **channel/config force-enabled that the runtime can't handle**, and **unescaped LLM output breaking a JSON body the agent POSTs** — always JSON-encode/validate model output before putting it in a request. | Agent goes FAILED after being ACTIVE; revival retries up to `MAX_REVIVAL_ATTEMPTS` (3), then the slot is removed. Fix the agent, not the chain. |
+| 8 | **Sovereign phase-one or phase-two deadline exceeded** — the commitment TTL covers phase-one settlement; the container/CLI, LLM turns, and external calls run in phase two after settlement. | Keep phase-one settlement inside `ttl` (maximum 500 blocks). Size `phase2Ttl` separately for execution and delivery; its deadline is the phase-one settlement block plus the offset. | Check phase-one settlement first. If it succeeded, investigate the phase-two deadline and executor/container timeout logs; increasing phase-one TTL does not extend phase two. |
+| 9 | **Two Phase-1 failure families — two different silences.** Authz/decode failures → job **dropped** (`Success:false`): commitment mines but nothing ever settles on-chain. Secrets/DKMS/DA failures → job **settled WITH an error string** (`Success:true` + `errorMessage`, Phase-1 fee charged). | "No Phase 2" alone doesn't identify which happened — check whether the job settled with an `errorMessage` (fix secrets/DKMS/DA) or never settled at all (fix authz/encoding). | Dropped: `hasPendingJobForTxOrigin` stays true until TTL. Settled-with-error: fee charged, `errorMessage` populated, no container. |
+| 10 | **Multiple secret owners** — all `encrypted_secrets` blobs must share exactly **ONE** secret owner; multiple distinct `secretOwners` is rejected inside the executor. | Use a single owner address across every blob in `secretOwners[]`. | Settled-with-error (`Success:true` + error string); Phase-1 fee charged, no spawn. |
+| 11 | **Prelaunch funding window missed** — after Phase-1 settlement the executor polls the prelaunch primary wallet (returned in the Phase-1 response's `gateway_token` field) every 1 s for a **120 s window**, requiring **≥ 0.01 RIT**. | Watch for Phase-1 settlement in the origin transaction receipt, decode the prelaunch wallet address, and fund it ≥ 0.01 RIT within 2 minutes. | `PRELAUNCH_FUNDING_FAILED` — **non-retryable**; the launch is dead. |
+| 12 | **Failure-delivery shedding** — a saturated executor sheds failure deliveries; a shed failure never reaches the chain. | Don't treat "pure TTL timeout with nothing on-chain" as proof of an executor outage — a failed spawn can present exactly this way. Check the executor's `/health` and logs. | Failed spawn presents as a pure TTL timeout with no error anywhere on-chain. |
+| 13 | **Success gate: the claim, not the Phase-2 event.** Phase-2 delivery is event-only (observability, not state). The agent exists operationally only once its runtime has claimed the heartbeat slot. | `AgentHeartbeat.getAssignment(agentId).state == ACTIVE && agentAddress != 0` — this is the launch success test. | Phase-2 event received, but the agent never claimed: slot VACANT, no heartbeats, and no revival lifeline. |
 
-The key terminology distinction:
+**The #1 launch bug, by far, is row 1: reusing one wallet for two agents.** If you launch (or retry) a second agent from a sender that already has an in-flight job, it silently vanishes. **One wallet ⇒ one in-flight agent job.** Running N agents concurrently ⇒ N distinct wallets.
 
-- **Contract harness/launcher** (deployment primitive): on-chain child contracts created by factories.
-- **Agent/tool harness** (runtime primitive): the in-container CLI/tooling runtime (`cliType`, tools policy, model/provider).
+---
 
-When this skill says "factory-backed", it means **contract harness/launcher mode**.
+## Direct Consumer Deployment
 
-### Where The Factory Contracts Are
+Deploy an application-owned consumer that forwards the canonical envelope to `0x080C` or `0x0820` and authenticates callbacks from the configured `AsyncDelivery` contract. The examples include the complete Solidity consumer, minimal public system ABIs, local compilation, secret sealing, and receipt decoding; they do not require private contract artifacts or an SDK:
 
-Factory contracts are chain contracts. Keep them in your app config and verify at startup.
+- [Sovereign example](../../examples/sovereign-agent/README.md): `SovereignAgentConsumer.callSovereignAgent(bytes input)`.
+- [Persistent example](../../examples/persistent-agent/README.md): `PersistentAgentConsumer.callPersistentAgent(uint256 agentId, uint64 revision, bytes input)`.
 
-Known addresses:
+### Launch sequence
 
-```bash
-RPC_URL=https://rpc.ritualfoundation.org
-SOVEREIGN_FACTORY_ADDRESS=0x9dC4C054e53bCc4Ce0A0Ff09E890A7a8e817f304
-PERSISTENT_FACTORY_ADDRESS=0xD4AA9D55215dc8149Af57605e70921Ea16b73591
-```
+1. Verify the selected chain and configured system-contract bytecode. Deploy the included consumer with the chain's `AsyncDelivery` address. Its immutable owner authorizes submission; its callback target is the consumer itself.
+2. For persistent agents, the EOA owner allocates `agentId` in a separate committed transaction using `AgentIdentityRegistry.allocateAgentId(owner)`, then approves the consumer with `setAgentOperator(agentId, consumer, true)`. Bind `applicationContext = keccak256(abi.encode(agentId, revision))` and the same id/revision in the 21-field payload. Sovereign calls need no persistent identity.
+3. Select an eligible executor from the public registry. Seal the owner-bound secrets to that executor's registered encryption public key. Grant `SecretsAccessControl` access for each ciphertext hash to the **consumer**, because it is the immediate precompile caller. The secret owner, consumer operator, and fee sponsor are distinct roles.
+4. Deposit the fee reserve into the sponsor's `RitualWallet` account and approve the consumer as spender when the sponsor is the EOA. Set the envelope sponsor to that funded EOA, callback target to the consumer, callback enabled, and callback value to zero.
+5. Encode the canonical flat 13-field `AgentAsyncEnvelope`, carrying the 16-field sovereign or 21-field persistent payload, and submit it through the consumer. Wait for Phase-1 settlement before sending another transaction from the same origin. A previous Phase-1-settled long-running job does not keep the origin locked merely because its final callback is pending.
+6. Read `spcCalls` from the settled receipt. Its `output` is the **bare executor result**, not the `(bytes,bytes)` return wrapper used by a Solidity precompile call. Sovereign Phase 1 returns `(string taskId)`. Persistent Phase 1 returns `(string instanceId,string gatewayURL,string containerId,string checkpointCID,string errorMessage,string gatewayToken)`; fail on a nonempty error and never log the token. During persistent prelaunch, fund the returned primary wallet within the documented funding window; then wait for the authenticated callback and an ACTIVE heartbeat assignment.
 
-Verify both addresses are real contracts before any launch:
+The executor bootstraps persistent agent-scoped DKMS internally from the admitted job. Sovereign execution also derives its DA key internally and accepts secrets sealed to the registered executor key. Neither launch sequence needs a separate `0x081B` request or a preliminary DKMS-wallet cushion.
 
-```bash
-cast code "0x9dC4C054e53bCc4Ce0A0Ff09E890A7a8e817f304" --rpc-url "$RPC_URL"
-cast code "0xD4AA9D55215dc8149Af57605e70921Ea16b73591" --rpc-url "$RPC_URL"
-```
+### Results and teardown
 
-The result must not be `0x`.
-
-### Factory Wiring Preflight
-
-Verify factory wiring to core system contracts:
-
-```bash
-# Sovereign factory wiring
-cast call "$SOVEREIGN_FACTORY_ADDRESS" "scheduler()(address)" --rpc-url "$RPC_URL"
-cast call "$SOVEREIGN_FACTORY_ADDRESS" "ritualWallet()(address)" --rpc-url "$RPC_URL"
-cast call "$SOVEREIGN_FACTORY_ADDRESS" "teeRegistry()(address)" --rpc-url "$RPC_URL"
-cast call "$SOVEREIGN_FACTORY_ADDRESS" "asyncDelivery()(address)" --rpc-url "$RPC_URL"
-
-# Persistent factory wiring
-cast call "$PERSISTENT_FACTORY_ADDRESS" "scheduler()(address)" --rpc-url "$RPC_URL"
-cast call "$PERSISTENT_FACTORY_ADDRESS" "ritualWallet()(address)" --rpc-url "$RPC_URL"
-cast call "$PERSISTENT_FACTORY_ADDRESS" "asyncDelivery()(address)" --rpc-url "$RPC_URL"
-```
-
-### Deterministic Child Address + DKMS Context
-
-Both factories deterministically derive child contracts from `(owner, userSalt)`. Always predict first, then launch.
-
-```bash
-# `USER_SALT` is bytes32 (example: cast keccak "my-agent-1")
-USER_SALT=$(cast keccak "my-agent-1")
-OWNER=0xYourEOAOrController
-
-cast call "$SOVEREIGN_FACTORY_ADDRESS" \
-  "predictHarness(address,bytes32)(address,bytes32)" \
-  "$OWNER" "$USER_SALT" \
-  --rpc-url "$RPC_URL"
-
-cast call "$PERSISTENT_FACTORY_ADDRESS" \
-  "predictLauncher(address,bytes32)(address,bytes32)" \
-  "$OWNER" "$USER_SALT" \
-  --rpc-url "$RPC_URL"
-
-cast call "$SOVEREIGN_FACTORY_ADDRESS" \
-  "getDkmsDerivation(address,bytes32)(address,uint256,uint8)" \
-  "$OWNER" "$USER_SALT" \
-  --rpc-url "$RPC_URL"
-
-cast call "$PERSISTENT_FACTORY_ADDRESS" \
-  "getDkmsDerivation(address,bytes32)(address,uint256,uint8)" \
-  "$OWNER" "$USER_SALT" \
-  --rpc-url "$RPC_URL"
-```
-
-Builder rule: in both sovereign and persistent payloads, `deliveryTarget` must be the predicted child contract (harness/launcher), not the factory.
-
-### Sovereign Factory Configuration Surface
-
-`SovereignAgentFactory` supports a two-step child flow and compressed one-shot flow.
-
-**Two-step (recommended for observability/control):**
-1. `deployHarness(userSalt)`
-2. `SovereignAgentHarness.configureFundAndStart(params, schedule, rolling, lockDuration)`
-
-**Compressed (single tx):**
-- `launchSovereignCompressed(...)`
-- `launchSovereignWithDerivedDkms(...)`
-
-All sovereign factory launch config:
-
-| Group | Field | Type | Notes |
-|------|-------|------|------|
-| Identity | `userSalt` | `bytes32` | Per-agent deterministic namespace |
-| DKMS | `executor` | `address` | Executor for DKMS extraction |
-| DKMS | `dkmsTtl` | `uint64` | DKMS extraction TTL |
-| DKMS | `dkmsFunding` | `uint256` | Optional native funding for derived DKMS payment address |
-| Payload | `params` | `SovereignAgentParams` | Full sovereign request (23-field payload) |
-| Scheduler | `schedule.schedulerGas` | `uint32` | Gas for scheduled execute callback |
-| Scheduler | `schedule.frequency` | `uint32` | Must be `> 0` |
-| Scheduler | `schedule.schedulerTtl` | `uint32` | Scheduler TTL |
-| Scheduler | `schedule.maxFeePerGas` | `uint256` | EIP-1559 max fee for scheduler |
-| Scheduler | `schedule.maxPriorityFeePerGas` | `uint256` | EIP-1559 tip for scheduler |
-| Scheduler | `schedule.value` | `uint256` | Native value sent during scheduled execution |
-| Scheduler wallet | `schedulerLockDuration` | `uint256` | RitualWallet lock duration for child payer |
-| Scheduler wallet | `schedulerFunding` | `uint256` | Native value deposited into child RitualWallet |
-| Rolling mode | `windowNumCalls` | `uint32` | Required in compressed launch; must be `> 0` |
-| Rolling mode | `rolling.windowNumCalls` | `uint32` | Number of calls in current rolling window |
-| Rolling mode | `rolling.rolloverThresholdBps` | `uint16` | Rollover threshold in bps (1..10000) |
-| Rolling mode | `rolling.rolloverRetryEveryCalls` | `uint16` | Retry cadence for successor scheduling |
-
-`SovereignAgentHarness` currently supports wake mode:
-- `NONE`
-- `ROLLING_FIXED_WINDOW`
-
-No other sovereign wake mode should be treated as active.
-
-### Rolling Window Semantics
-
-The rolling window controls how the harness repeatedly invokes the sovereign agent precompile. Every scheduled callback calls `0x080C` — the threshold only controls when the **next window** gets scheduled.
-
-**How `wakeUp` works on each scheduled callback:**
-
-1. Window promotion: if the pending successor window is now active, promote it.
-2. Retired call cleanup: cancel the previous window's leftover schedule.
-3. Successor scheduling: if `executionIndex >= thresholdIndex`, attempt to schedule the next window.
-4. **Precompile invocation: call `0x080C` with the configured `SovereignAgentParams`. This happens on every callback.**
-
-The threshold does NOT determine whether the precompile gets called. It determines when the harness starts scheduling the next window to ensure continuity.
-
-**`rolloverThresholdBps` explained:** At 5000 (50%) with `windowNumCalls=5`, successor scheduling begins at call 3 of 5 (`thresholdIndex = ceil(5·5000/10000) − 1 = 2`). Higher thresholds (8000 = 80%) mean the harness waits longer before scheduling the next window, leaving fewer retry attempts if successor scheduling fails (executor down, insufficient balance, etc.). Lower thresholds (3000 = 30%) give more retry opportunities but overlap two windows longer.
-
-**`MAX_LIFESPAN` constraint:** The Scheduler enforces `MAX_LIFESPAN = 10,000 blocks` on the recurring schedule horizon:
-
-```
-lifespan = frequency × numCalls
-lifespan <= 10,000
-```
-
-This means `numCalls` is bounded by `frequency`:
-
-```
-numCalls <= 10,000 / frequency
-```
-
-`ttl` remains a separate per-execution drift/expiry window and is still capped by Scheduler `MAX_TTL`.
-
-| `frequency` | Max `numCalls` |
-|-------------|----------------|
-| `2000` (default) | `5` |
-
-**Choosing `frequency`:** Each sovereign agent invocation is an async round trip (~60-90s). Set `frequency` to cover this so the next call fires after the previous one settles. With ~350ms block time:
-
-| `frequency` | Wall time | Notes |
-|-------------|-----------|-------|
-| `2000` | ~11.7 min | **Safe default.** |
-| `500` | ~175s | Smaller deployments. |
-
-**Recommended starting values:**
-
-| Field | Value | Rationale |
-|-------|-------|-----------|
-| `windowNumCalls` | `5` | 5 invocations per window (~58 min from scheduling through the final slot at frequency=2000). Capped by `MAX_LIFESPAN = 10_000`: `2000·5 = 10_000`. |
-| `frequency` | `2000` | ~11.7 min between calls. Safe default. |
-| `rolloverThresholdBps` | `5000` | Successor scheduling starts at call 3 (index 2), giving 3 retry attempts (wakes 3, 4, 5). |
-| `rolloverRetryEveryCalls` | `1` | Retry every call past threshold |
-| `schedulerTtl` | `500` | Covers drift + async settlement |
-
-### Factory Launch Preflight Checklist
-
-Run these checks before calling `configureFundAndStart` or any compressed launch function.
-
-1. **Factory address verified**: `cast code "$SOVEREIGN_FACTORY_ADDRESS"` returns non-empty bytecode.
-2. **Factory wiring verified**: `scheduler()`, `ritualWallet()`, `teeRegistry()`, `asyncDelivery()` return correct system contract addresses.
-3. **Harness address computed**: `predictHarness` (two-step) or `predictCompressedHarness` (compressed).
-4. **`deliveryTarget` == predicted harness**: `SovereignAgentParams.deliveryTarget` must equal the predicted child. Mismatch reverts with `InvalidDeliveryTarget()`.
-5. **Executor discovered**: `TEEServiceRegistry.getServicesByCapability(0, true)` returns at least one valid executor. Use `node.teeAddress`.
-6. **Secrets encrypted correctly**: ECIES with `symmetricNonceLength = 12` to executor's `node.publicKey`. Wrong nonce = silent failure.
-7. **`frequency` default 2000**: sovereign agent round trips take ~60-90s. Default **2000** is the safe starting value. `frequency=1` fires every block; sender lock blocks concurrent async jobs, causing precompile reverts.
-8. **Lifespan check**: `frequency × numCalls <= 10,000` (Scheduler `MAX_LIFESPAN`). Exceeding this reverts with `ScheduleLifespanExceeded()`.
-9. **`schedulerFunding` sufficient**: deposited into harness RitualWallet. Must cover `windowNumCalls` executions. Recommended: 5+ RITUAL for testing.
-10. **Gas limit for `configureFundAndStart` >= 3,000,000**: uses ~2.5M gas. Default estimation fails.
-11. **`model` is a valid provider-routable identifier**: verify with a direct API call before submitting on-chain.
-12. **`schedulerTtl` >= async settlement time**: recommended `500`. Must be large enough for the TxScheduled replay to pass the TTL check after async settlement.
-13. **LLM API key has credits**: test the key directly (e.g., `curl` Gemini/Anthropic API) before encrypting it on-chain.
-
-### Sovereign Factory Struct Definitions
-
-```solidity
-struct SovereignAgentParams {
-    address executor;
-    uint256 ttl;
-    bytes userPublicKey;
-    uint64 pollIntervalBlocks;
-    uint64 maxPollBlock;
-    string taskIdMarker;
-    address deliveryTarget;
-    bytes4 deliverySelector;
-    uint256 deliveryGasLimit;
-    uint256 deliveryMaxFeePerGas;
-    uint256 deliveryMaxPriorityFeePerGas;
-    uint16 agentType;
-    string prompt;
-    bytes encryptedSecrets;
-    SovereignStorageRef convoHistory;
-    SovereignStorageRef output;
-    SovereignStorageRef[] skills;
-    SovereignStorageRef systemPrompt;
-    string model;
-    string[] tools;
-    uint16 maxTurns;
-    uint32 maxTokens;
-    string rpcUrls;
-}
-
-struct SovereignStorageRef {
-    string platform;
-    string path;
-    string keyRef;
-}
-
-struct SovereignScheduleConfig {
-    uint32 schedulerGas;
-    uint32 frequency;
-    uint32 schedulerTtl;
-    uint256 maxFeePerGas;
-    uint256 maxPriorityFeePerGas;
-    uint256 value;
-}
-
-struct SovereignRollingConfig {
-    uint32 windowNumCalls;
-    uint16 rolloverThresholdBps;
-    uint16 rolloverRetryEveryCalls;
-}
-```
-
-### Sovereign Factory ABI (TypeScript)
-
-```typescript
-const SOVEREIGN_FACTORY = '0x9dC4C054e53bCc4Ce0A0Ff09E890A7a8e817f304' as const;
-
-const StorageRefTuple = {
-  type: 'tuple' as const,
-  components: [
-    { name: 'platform', type: 'string' },
-    { name: 'path', type: 'string' },
-    { name: 'keyRef', type: 'string' },
-  ],
-};
-
-const SovereignAgentParamsTuple = {
-  name: 'params',
-  type: 'tuple' as const,
-  components: [
-    { name: 'executor', type: 'address' },
-    { name: 'ttl', type: 'uint256' },
-    { name: 'userPublicKey', type: 'bytes' },
-    { name: 'pollIntervalBlocks', type: 'uint64' },
-    { name: 'maxPollBlock', type: 'uint64' },
-    { name: 'taskIdMarker', type: 'string' },
-    { name: 'deliveryTarget', type: 'address' },
-    { name: 'deliverySelector', type: 'bytes4' },
-    { name: 'deliveryGasLimit', type: 'uint256' },
-    { name: 'deliveryMaxFeePerGas', type: 'uint256' },
-    { name: 'deliveryMaxPriorityFeePerGas', type: 'uint256' },
-    { name: 'cliType', type: 'uint16' },
-    { name: 'prompt', type: 'string' },
-    { name: 'encryptedSecrets', type: 'bytes' },
-    { ...StorageRefTuple, name: 'convoHistory' },
-    { ...StorageRefTuple, name: 'output' },
-    { name: 'skills', type: 'tuple[]', components: StorageRefTuple.components },
-    { ...StorageRefTuple, name: 'systemPrompt' },
-    { name: 'model', type: 'string' },
-    { name: 'tools', type: 'string[]' },
-    { name: 'maxTurns', type: 'uint16' },
-    { name: 'maxTokens', type: 'uint32' },
-    { name: 'rpcUrls', type: 'string' },
-  ],
-};
-
-const SovereignScheduleConfigTuple = {
-  name: 'schedule',
-  type: 'tuple' as const,
-  components: [
-    { name: 'schedulerGas', type: 'uint32' },
-    { name: 'frequency', type: 'uint32' },
-    { name: 'schedulerTtl', type: 'uint32' },
-    { name: 'maxFeePerGas', type: 'uint256' },
-    { name: 'maxPriorityFeePerGas', type: 'uint256' },
-    { name: 'value', type: 'uint256' },
-  ],
-};
-
-const SovereignRollingConfigTuple = {
-  name: 'rolling',
-  type: 'tuple' as const,
-  components: [
-    { name: 'windowNumCalls', type: 'uint32' },
-    { name: 'rolloverThresholdBps', type: 'uint16' },
-    { name: 'rolloverRetryEveryCalls', type: 'uint16' },
-  ],
-};
-
-const sovereignFactoryAbi = [
-  {
-    name: 'deployHarness',
-    type: 'function',
-    stateMutability: 'nonpayable',
-    inputs: [{ name: 'userSalt', type: 'bytes32' }],
-    outputs: [{ name: 'harness', type: 'address' }],
-  },
-  {
-    name: 'predictHarness',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'owner', type: 'address' },
-      { name: 'userSalt', type: 'bytes32' },
-    ],
-    outputs: [
-      { name: 'harness', type: 'address' },
-      { name: 'childSalt', type: 'bytes32' },
-    ],
-  },
-  {
-    name: 'predictCompressedHarness',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'owner', type: 'address' },
-      { name: 'userSalt', type: 'bytes32' },
-    ],
-    outputs: [
-      { name: 'harness', type: 'address' },
-      { name: 'compressedSalt', type: 'bytes32' },
-      { name: 'childSalt', type: 'bytes32' },
-    ],
-  },
-  {
-    name: 'getDkmsDerivation',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'owner', type: 'address' },
-      { name: 'userSalt', type: 'bytes32' },
-    ],
-    outputs: [
-      { name: 'dkmsOwner', type: 'address' },
-      { name: 'keyIndex', type: 'uint256' },
-      { name: 'keyFormat', type: 'uint8' },
-    ],
-  },
-  {
-    name: 'launchSovereignCompressed',
-    type: 'function',
-    stateMutability: 'payable',
-    inputs: [
-      { name: 'userSalt', type: 'bytes32' },
-      { name: 'executor', type: 'address' },
-      { name: 'dkmsTtl', type: 'uint64' },
-      { name: 'dkmsFunding', type: 'uint256' },
-      SovereignAgentParamsTuple,
-      SovereignScheduleConfigTuple,
-      { name: 'schedulerLockDuration', type: 'uint256' },
-      { name: 'schedulerFunding', type: 'uint256' },
-      { name: 'windowNumCalls', type: 'uint32' },
-    ],
-    outputs: [
-      { name: 'harness', type: 'address' },
-      { name: 'dkmsPaymentAddress', type: 'address' },
-      { name: 'schedulerCallId', type: 'uint256' },
-    ],
-  },
-  {
-    name: 'launchSovereignWithDerivedDkms',
-    type: 'function',
-    stateMutability: 'payable',
-    inputs: [
-      { name: 'userSalt', type: 'bytes32' },
-      { name: 'dkmsPaymentAddress', type: 'address' },
-      { name: 'dkmsFunding', type: 'uint256' },
-      SovereignAgentParamsTuple,
-      SovereignScheduleConfigTuple,
-      { name: 'schedulerLockDuration', type: 'uint256' },
-      { name: 'schedulerFunding', type: 'uint256' },
-      { name: 'windowNumCalls', type: 'uint32' },
-    ],
-    outputs: [
-      { name: 'harness', type: 'address' },
-      { name: 'schedulerCallId', type: 'uint256' },
-    ],
-  },
-] as const;
-
-// Harness ABI (deployed by factory)
-const sovereignHarnessAbi = [
-  {
-    name: 'configureFundAndStart',
-    type: 'function',
-    stateMutability: 'payable',
-    inputs: [
-      SovereignAgentParamsTuple,
-      SovereignScheduleConfigTuple,
-      SovereignRollingConfigTuple,
-      { name: 'schedulerLockDuration', type: 'uint256' },
-    ],
-    outputs: [{ name: 'schedulerCallId', type: 'uint256' }],
-  },
-  {
-    name: 'onSovereignAgentResult',
-    type: 'function',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: 'jobId', type: 'bytes32' },
-      { name: 'result', type: 'bytes' },
-    ],
-    outputs: [],
-  },
-  {
-    name: 'owner',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ type: 'address' }],
-  },
-  {
-    name: 'configured',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ type: 'bool' }],
-  },
-  {
-    name: 'stop',
-    type: 'function',
-    stateMutability: 'nonpayable',
-    inputs: [],
-    outputs: [],
-  },
-  {
-    name: 'restart',
-    type: 'function',
-    stateMutability: 'nonpayable',
-    inputs: [],
-    outputs: [],
-  },
-] as const;
-```
-
-### Sovereign Factory Function Selectors
-
-| Selector | Function |
-|----------|----------|
-| `0x3293993b` | `deployHarness(bytes32)` |
-| `0x78165f40` | `predictHarness(address,bytes32)` |
-| `0x1b95bb00` | `predictCompressedHarness(address,bytes32)` |
-| `0x08ef770d` | `getDkmsDerivation(address,bytes32)` |
-| `0x2ea5a636` | `launchSovereignCompressed(...)` |
-| `0x9331a9c0` | `launchSovereignWithDerivedDkms(...)` |
-| `0x7c041adf` | `launchSovereignCompressedRolling(...)` |
-| `0x97e1b064` | `launchSovereignWithDerivedDkmsRolling(...)` |
-| `0xb1906702` | `SovereignAgentHarness.configureFundAndStart(...)` |
-| `0x8ca12055` | `SovereignAgentHarness.onSovereignAgentResult(bytes32,bytes)` |
-
-### Gas Estimates
-
-| Function | Typical Gas | Notes |
-|----------|------------|-------|
-| `deployHarness(bytes32)` | ~400,000 | CREATE3 deployment |
-| `configureFundAndStart(...)` | ~2,500,000 | Deposits into RitualWallet + creates schedule. **Set gas limit >= 3,000,000.** |
-| `launchSovereignCompressed(...)` | ~3,500,000 | DKMS + deploy + configure in one tx. **Set gas limit >= 5,000,000.** |
-| `launchSovereignWithDerivedDkms(...)` | ~3,000,000 | Deploy + configure (no DKMS). **Set gas limit >= 4,000,000.** |
-
-Default gas estimation will fail for `configureFundAndStart` and compressed launch functions. Always set an explicit gas limit.
-
-### Sovereign Factory Source
-
-```solidity
-// SPDX-License-Identifier: BSD-3-Clause-Clear
-pragma solidity ^0.8.28;
-
-import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {ICREATE3Factory} from "./ICREATE3Factory.sol";
-import {SovereignAgentHarness} from "./SovereignAgentHarness.sol";
-import {SovereignAgentParams, SovereignRollingConfig, SovereignScheduleConfig} from "./SovereignAgentHarness.sol";
-import {DkmsKeyResolver} from "./DkmsKeyResolver.sol";
-
-/// @title SovereignAgentFactory
-/// @notice Deterministically deploys one child harness per sovereign agent workflow.
-contract SovereignAgentFactory is Initializable, UUPSUpgradeable, OwnableUpgradeable, DkmsKeyResolver {
-    uint256 private constant _NOT_ENTERED = 1;
-    uint256 private constant _ENTERED = 2;
-
-    ICREATE3Factory public create3Factory;
-    address public scheduler;
-    address public ritualWallet;
-    address public teeRegistry;
-    address public asyncDelivery;
-
-    event HarnessPredicted(address indexed owner, bytes32 indexed userSalt, bytes32 indexed childSalt, address harness);
-    event HarnessDeployed(address indexed owner, bytes32 indexed userSalt, bytes32 indexed childSalt, address harness);
-    event SovereignLaunchCompressed(
-        address indexed owner, bytes32 indexed userSalt, address indexed harness,
-        address dkmsPaymentAddress, uint32 windowNumCalls, uint16 rolloverThresholdBps,
-        uint16 rolloverRetryEveryCalls, uint256 schedulerCallId
-    );
-    event SovereignLaunchFromDerivedDkms(
-        address indexed owner, bytes32 indexed userSalt, address indexed harness,
-        address dkmsPaymentAddress, uint32 windowNumCalls, uint16 rolloverThresholdBps,
-        uint16 rolloverRetryEveryCalls, uint256 schedulerCallId
-    );
-
-    error HarnessAddressMismatch();
-    error InvalidValue();
-    error InvalidDeliveryTarget();
-    error InvalidDkmsOutput();
-    error DkmsFundingTransferFailed();
-    error InvalidSovereignMode();
-    error InvalidCreate3Factory();
-    error InvalidScheduler();
-    error InvalidRitualWallet();
-    error InvalidTeeRegistry();
-    error InvalidAsyncDelivery();
-    error ReentrantCall();
-
-    modifier nonReentrantLaunch() {
-        if (_launchStatus == _ENTERED) revert ReentrantCall();
-        _launchStatus = _ENTERED;
-        _;
-        _launchStatus = _NOT_ENTERED;
-    }
-
-    constructor() { _disableInitializers(); }
-
-    function initialize(
-        address _initialOwner, address _create3Factory, address _scheduler,
-        address _ritualWallet, address _teeRegistry, address _asyncDelivery
-    ) external initializer {
-        if (_create3Factory == address(0)) revert InvalidCreate3Factory();
-        if (_scheduler == address(0)) revert InvalidScheduler();
-        if (_ritualWallet == address(0)) revert InvalidRitualWallet();
-        if (_teeRegistry == address(0)) revert InvalidTeeRegistry();
-        if (_asyncDelivery == address(0)) revert InvalidAsyncDelivery();
-        __Ownable_init(_initialOwner);
-        __UUPSUpgradeable_init();
-        create3Factory = ICREATE3Factory(_create3Factory);
-        scheduler = _scheduler;
-        ritualWallet = _ritualWallet;
-        teeRegistry = _teeRegistry;
-        asyncDelivery = _asyncDelivery;
-    }
-
-    function _authorizeUpgrade(address) internal override onlyOwner {}
-
-    function deriveChildSalt(address owner, bytes32 userSalt) public pure returns (bytes32) {
-        return keccak256(abi.encode(owner, userSalt));
-    }
-
-    function predictHarness(address owner, bytes32 userSalt) public view returns (address harness, bytes32 childSalt) {
-        childSalt = deriveChildSalt(owner, userSalt);
-        harness = create3Factory.getDeployed(address(this), childSalt);
-    }
-
-    function predictCompressedHarness(address owner, bytes32 userSalt)
-        public view returns (address harness, bytes32 compressedSalt, bytes32 childSalt)
-    {
-        compressedSalt = keccak256(abi.encode(owner, userSalt));
-        (harness, childSalt) = predictHarness(address(this), compressedSalt);
-    }
-
-    function getDkmsDerivation(address owner, bytes32 userSalt)
-        external view returns (address dkmsOwner, uint256 keyIndex, uint8 keyFormat)
-    {
-        (dkmsOwner,) = predictHarness(owner, userSalt);
-        return (dkmsOwner, 0, 1);
-    }
-
-    function deployHarness(bytes32 userSalt) external returns (address harness) {
-        bytes32 childSalt = deriveChildSalt(msg.sender, userSalt);
-        harness = _deployHarness(msg.sender, userSalt);
-        emit HarnessDeployed(msg.sender, userSalt, childSalt, harness);
-    }
-
-    function launchSovereignCompressed(
-        bytes32 userSalt, address executor, uint64 dkmsTtl, uint256 dkmsFunding,
-        SovereignAgentParams calldata params, SovereignScheduleConfig calldata schedule,
-        uint256 schedulerLockDuration, uint256 schedulerFunding, uint32 windowNumCalls
-    ) external payable nonReentrantLaunch
-      returns (address harness, address dkmsPaymentAddress, uint256 schedulerCallId)
-    {
-        if (windowNumCalls == 0) revert InvalidSovereignMode();
-        SovereignRollingConfig memory rolling = SovereignRollingConfig({
-            windowNumCalls: windowNumCalls, rolloverThresholdBps: 5000, rolloverRetryEveryCalls: 1
-        });
-        if (msg.value != dkmsFunding + schedulerFunding) revert InvalidValue();
-        (address predicted, bytes32 compressedSalt,) = predictCompressedHarness(msg.sender, userSalt);
-        if (params.deliveryTarget != predicted) revert InvalidDeliveryTarget();
-
-        bytes memory dkmsOutput = requestDkmsExtraction(executor, predicted, 0, 1, dkmsTtl);
-        if (dkmsOutput.length == 0) revert InvalidDkmsOutput();
-        (dkmsPaymentAddress,) = abi.decode(dkmsOutput, (address, bytes));
-        if (dkmsPaymentAddress == address(0)) revert InvalidDkmsOutput();
-        if (dkmsFunding > 0) {
-            (bool funded,) = payable(dkmsPaymentAddress).call{value: dkmsFunding}("");
-            if (!funded) revert DkmsFundingTransferFailed();
-        }
-
-        harness = _deployHarness(address(this), compressedSalt);
-        schedulerCallId = _configureStartAndTransferOwnership(
-            harness, params, schedule, rolling, schedulerLockDuration, schedulerFunding, msg.sender
-        );
-        emit SovereignLaunchCompressed(
-            msg.sender, userSalt, harness, dkmsPaymentAddress,
-            rolling.windowNumCalls, rolling.rolloverThresholdBps, rolling.rolloverRetryEveryCalls, schedulerCallId
-        );
-    }
-
-    function launchSovereignWithDerivedDkms(
-        bytes32 userSalt, address dkmsPaymentAddress, uint256 dkmsFunding,
-        SovereignAgentParams calldata params, SovereignScheduleConfig calldata schedule,
-        uint256 schedulerLockDuration, uint256 schedulerFunding, uint32 windowNumCalls
-    ) external payable nonReentrantLaunch returns (address harness, uint256 schedulerCallId) {
-        if (windowNumCalls == 0) revert InvalidSovereignMode();
-        SovereignRollingConfig memory rolling = SovereignRollingConfig({
-            windowNumCalls: windowNumCalls, rolloverThresholdBps: 5000, rolloverRetryEveryCalls: 1
-        });
-        if (msg.value != dkmsFunding + schedulerFunding) revert InvalidValue();
-        if (dkmsPaymentAddress == address(0)) revert InvalidDkmsOutput();
-        (address predicted, bytes32 compressedSalt,) = predictCompressedHarness(msg.sender, userSalt);
-        if (params.deliveryTarget != predicted) revert InvalidDeliveryTarget();
-
-        (harness, schedulerCallId) = _launchWithPreparedDkms(
-            compressedSalt, dkmsPaymentAddress, dkmsFunding, params, schedule, rolling,
-            schedulerLockDuration, schedulerFunding
-        );
-        emit SovereignLaunchFromDerivedDkms(
-            msg.sender, userSalt, harness, dkmsPaymentAddress,
-            rolling.windowNumCalls, rolling.rolloverThresholdBps, rolling.rolloverRetryEveryCalls, schedulerCallId
-        );
-    }
-
-    function _configureStartAndTransferOwnership(
-        address harness, SovereignAgentParams calldata params, SovereignScheduleConfig calldata schedule,
-        SovereignRollingConfig memory rolling, uint256 schedulerLockDuration,
-        uint256 schedulerFunding, address newOwner
-    ) internal returns (uint256 schedulerCallId) {
-        SovereignAgentHarness agent = SovereignAgentHarness(harness);
-        schedulerCallId = agent.configureFundAndStart{value: schedulerFunding}(
-            params, schedule, rolling, schedulerLockDuration
-        );
-        agent.transferOwnership(newOwner);
-    }
-
-    function _deployHarness(address owner, bytes32 userSalt) internal returns (address harness) {
-        (address predicted, bytes32 childSalt) = predictHarness(owner, userSalt);
-        bytes memory creationCode = abi.encodePacked(
-            type(SovereignAgentHarness).creationCode,
-            abi.encode(owner, scheduler, ritualWallet, teeRegistry, asyncDelivery)
-        );
-        harness = create3Factory.deploy(childSalt, creationCode);
-        if (harness != predicted) revert HarnessAddressMismatch();
-    }
-
-    function _launchWithPreparedDkms(
-        bytes32 compressedSalt, address dkmsPaymentAddress, uint256 dkmsFunding,
-        SovereignAgentParams calldata params, SovereignScheduleConfig calldata schedule,
-        SovereignRollingConfig memory rolling, uint256 schedulerLockDuration, uint256 schedulerFunding
-    ) internal returns (address harness, uint256 schedulerCallId) {
-        if (dkmsFunding > 0) {
-            (bool funded,) = payable(dkmsPaymentAddress).call{value: dkmsFunding}("");
-            if (!funded) revert DkmsFundingTransferFailed();
-        }
-        harness = _deployHarness(address(this), compressedSalt);
-        schedulerCallId = _configureStartAndTransferOwnership(
-            harness, params, schedule, rolling, schedulerLockDuration, schedulerFunding, msg.sender
-        );
-    }
-
-    uint256 private _launchStatus;
-    uint256[44] private __gap;
-}
-```
-
-### Sovereign Agent Harness Source
-
-The harness is the child contract deployed by the factory. It manages the rolling window lifecycle and invokes `0x080C` on each scheduled callback.
-
-Key functions:
-- `configureFundAndStart(params, schedule, rolling, lockDuration)` — configure + deposit + arm schedule
-- `wakeUp(executionIndex, seriesId)` — scheduler callback; handles window promotion, successor scheduling, then calls `0x080C`
-- `stop()` — cancels all tracked schedules, sets wake mode to NONE
-- `restart()` — stops then re-arms with last config
-- `onSovereignAgentResult(jobId, result)` — Phase 2 delivery callback from AsyncDelivery
-
-```solidity
-// SPDX-License-Identifier: BSD-3-Clause-Clear
-pragma solidity ^0.8.28;
-
-import {IRitualWallet} from "../wallet/IRitualWallet.sol";
-import {ITEEServiceRegistry} from "../async/ITEEServiceRegistry.sol";
-import {ITEECapabilityPolicy} from "../async/ITEECapabilityPolicy.sol";
-
-// Structs: SovereignAgentParams, SovereignScheduleConfig, SovereignRollingConfig,
-//          SovereignStorageRef (see Struct Definitions section above)
-
-enum SovereignWakeMode { NONE, ROLLING_FIXED_WINDOW }
-enum SovereignExecutorMode { PINNED, RESOLVE_AT_INVOCATION }
-
-contract SovereignAgentHarness {
-    address public constant SOVEREIGN_AGENT_PRECOMPILE = address(0x080C);
-    uint256 public constant MAX_EXECUTOR_SCAN = 1;
-
-    ISchedulerHarness public immutable scheduler;
-    IRitualWallet public immutable ritualWallet;
-    ITEEServiceRegistry public immutable teeRegistry;
-    address public immutable asyncDelivery;
-
-    address public owner;
-    bool public configured;
-    SovereignWakeMode public wakeMode;
-    SovereignExecutorMode public executorMode;
-    uint256 public activeCallId;
-    uint32 public activeNumCalls;
-    uint64 public currentSeriesId;
-    uint64 public pendingSeriesId;
-    uint64 public nextSeriesId;
-    uint256 public pendingCallId;
-    uint32 public thresholdIndex;
-    bool public hasStartConfig;
-
-    SovereignAgentParams internal params;
-    bytes internal sovereignInputTemplate;
-    SovereignScheduleConfig public scheduleConfig;
-    SovereignRollingConfig public rollingConfig;
-
-    // --- Core lifecycle ---
-
-    function configureFundAndStart(
-        SovereignAgentParams calldata p,
-        SovereignScheduleConfig calldata s,
-        SovereignRollingConfig calldata r,
-        uint256 lockDuration
-    ) external payable onlyOwner returns (uint256 callId) {
-        _configure(p, s, r);
-        if (msg.value > 0) { ritualWallet.depositFor{value: msg.value}(address(this), lockDuration); }
-        return _armRollingWindow(r.windowNumCalls);
-    }
-
-    function stop() external onlyOwner {
-        // Cancels active + pending + retired schedules, sets wakeMode = NONE
-    }
-
-    function restart() external onlyOwner returns (uint256 callId) {
-        // Stops if running, then re-arms with last config
-    }
-
-    // --- Scheduler callback ---
-
-    function wakeUp(uint256 executionIndex, uint64 seriesId) external onlyScheduler {
-        if (wakeMode == SovereignWakeMode.NONE) return;
-
-        // 1. Window promotion: if pending successor is now active, promote it
-        if (seriesId == pendingSeriesId && pendingCallId != 0) { /* promote */ }
-
-        // 2. Ignore callbacks for old (non-current) series
-        if (seriesId != currentSeriesId) return;
-
-        // 3. Clean up retired window's schedule
-        if (retiredCallId != 0) { _tryCancelRetiredCall(); }
-
-        // 4. Past threshold? Try scheduling the next window
-        if (pendingCallId == 0 && executionIndex >= thresholdIndex) {
-            _tryScheduleSuccessor();
-        }
-
-        // 5. ALWAYS invoke the sovereign agent precompile
-        _callSovereignPrecompile(executionIndex, seriesId);
-    }
-
-    // --- Delivery callback ---
-
-    function onSovereignAgentResult(bytes32 jobId, bytes calldata result)
-        external onlyAsyncDelivery
-    {
-        emit SovereignResult(jobId, result);
-    }
-
-    // --- Internal ---
-
-    function _callSovereignPrecompile(uint256 executionIndex, uint64 seriesId) internal {
-        bytes memory input = getSovereignAgentInput();
-        (bool ok, bytes memory output) = SOVEREIGN_AGENT_PRECOMPILE.call(input);
-        if (!ok) revert SovereignCallFailed();
-        emit SovereignInvoked(executionIndex, seriesId, output);
-    }
-
-    function _resolveExecutor() internal view returns (address) {
-        // Uses teeRegistry.pickServiceByCapability(HTTP_CALL, false, seed, 1)
-        // Reverts NoValidExecutor if none found
-    }
-
-    function _computeThresholdIndex(uint32 numCalls, uint16 thresholdBps) internal pure returns (uint32) {
-        uint256 thresholdCount = (uint256(numCalls) * uint256(thresholdBps) + 9999) / 10000;
-        if (thresholdCount == 0) thresholdCount = 1;
-        return uint32(thresholdCount - 1);
-    }
-}
-```
-
-### Persistent Factory Configuration Surface
-
-`PersistentAgentFactory` also supports two-step and compressed launch.
-
-**Two-step:**
-1. `deployLauncher(userSalt)` — deploy child launcher
-2. Derive DKMS address via `requestPredictedLauncherDkmsExtraction` or the DKMS precompile (0x081B) and fund it
-3. `PersistentAgentLauncher.configureFundAndArm(persistentInput, schedule, lockDuration)` — configure, deposit to RitualWallet, and arm scheduler
-
-**Compressed (single tx, recommended):**
-- `launchPersistentCompressed(...)` — performs DKMS derivation + funding + launcher deploy + configure/arm in one tx
-- `launchPersistentWithDerivedDkms(...)` — same but skips DKMS derivation (pass pre-derived address)
-
-> **Use compressed mode unless you need step-by-step observability.** The two-step flow requires manually deriving and funding the DKMS address. The compressed flow handles everything atomically.
-
-All persistent factory launch config:
-
-| Group | Field | Type | Notes |
-|------|-------|------|------|
-| Identity | `userSalt` | `bytes32` | Per-agent deterministic namespace |
-| DKMS | `executor` | `address` | Executor for DKMS extraction |
-| DKMS | `dkmsTtl` | `uint64` | DKMS extraction TTL |
-| DKMS | `dkmsFunding` | `uint256` | **Required** native funding for derived DKMS payment address — agent needs this for heartbeat registration. Use >= 1000 RITUAL for development. |
-| Payload | `persistentInput` | `bytes` | Fully ABI-encoded 0x0820 persistent request (26 fields) |
-| Scheduler | `schedule.schedulerGas` | `uint32` | Gas for one-shot scheduled launch |
-| Scheduler | `schedule.schedulerTtl` | `uint32` | Scheduler TTL |
-| Scheduler | `schedule.maxFeePerGas` | `uint256` | EIP-1559 max fee for scheduler |
-| Scheduler | `schedule.maxPriorityFeePerGas` | `uint256` | EIP-1559 tip for scheduler |
-| Scheduler | `schedule.value` | `uint256` | Native value sent during launch execution |
-| Scheduler wallet | `schedulerLockDuration` | `uint256` | RitualWallet lock duration for child payer |
-| Scheduler wallet | `schedulerFunding` | `uint256` | Native value deposited into child RitualWallet |
-
-`PersistentAgentLauncher` always arms a one-shot schedule (`numCalls=1`, `frequency=1`) to trigger persistent spawn.
-
-> **`msg.value` must equal `dkmsFunding + schedulerFunding`.** The factory enforces this with `InvalidValue()`. Any mismatch reverts.
-
-### Persistent Factory Struct Definitions
-
-```solidity
-struct PersistentLaunchSchedule {
-    uint32 schedulerGas;
-    uint32 schedulerTtl;
-    uint256 maxFeePerGas;
-    uint256 maxPriorityFeePerGas;
-    uint256 value;
-}
-```
-
-### Persistent Factory ABI (TypeScript)
-
-```typescript
-const PERSISTENT_FACTORY = '0xD4AA9D55215dc8149Af57605e70921Ea16b73591' as const;
-
-const PersistentLaunchScheduleTuple = {
-  type: 'tuple' as const,
-  components: [
-    { name: 'schedulerGas', type: 'uint32' },
-    { name: 'schedulerTtl', type: 'uint32' },
-    { name: 'maxFeePerGas', type: 'uint256' },
-    { name: 'maxPriorityFeePerGas', type: 'uint256' },
-    { name: 'value', type: 'uint256' },
-  ],
-} as const;
-
-const persistentFactoryAbi = [
-  {
-    name: 'predictLauncher',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'owner', type: 'address' },
-      { name: 'userSalt', type: 'bytes32' },
-    ],
-    outputs: [
-      { name: 'launcher', type: 'address' },
-      { name: 'childSalt', type: 'bytes32' },
-    ],
-  },
-  {
-    name: 'predictCompressedLauncher',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'owner', type: 'address' },
-      { name: 'userSalt', type: 'bytes32' },
-    ],
-    outputs: [
-      { name: 'launcher', type: 'address' },
-      { name: 'compressedSalt', type: 'bytes32' },
-      { name: 'childSalt', type: 'bytes32' },
-    ],
-  },
-  {
-    name: 'getDkmsDerivation',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'owner', type: 'address' },
-      { name: 'userSalt', type: 'bytes32' },
-    ],
-    outputs: [
-      { name: 'dkmsOwner', type: 'address' },
-      { name: 'keyIndex', type: 'uint256' },
-      { name: 'keyFormat', type: 'uint8' },
-    ],
-  },
-  {
-    name: 'deployLauncher',
-    type: 'function',
-    stateMutability: 'nonpayable',
-    inputs: [{ name: 'userSalt', type: 'bytes32' }],
-    outputs: [{ name: 'launcher', type: 'address' }],
-  },
-  {
-    name: 'launchPersistentCompressed',
-    type: 'function',
-    stateMutability: 'payable',
-    inputs: [
-      { name: 'userSalt', type: 'bytes32' },
-      { name: 'executor', type: 'address' },
-      { name: 'dkmsTtl', type: 'uint64' },
-      { name: 'dkmsFunding', type: 'uint256' },
-      { name: 'persistentInput', type: 'bytes' },
-      PersistentLaunchScheduleTuple,
-      { name: 'schedulerLockDuration', type: 'uint256' },
-      { name: 'schedulerFunding', type: 'uint256' },
-    ],
-    outputs: [
-      { name: 'launcher', type: 'address' },
-      { name: 'dkmsPaymentAddress', type: 'address' },
-      { name: 'callId', type: 'uint256' },
-    ],
-  },
-  {
-    name: 'launchPersistentWithDerivedDkms',
-    type: 'function',
-    stateMutability: 'payable',
-    inputs: [
-      { name: 'userSalt', type: 'bytes32' },
-      { name: 'dkmsPaymentAddress', type: 'address' },
-      { name: 'dkmsFunding', type: 'uint256' },
-      { name: 'persistentInput', type: 'bytes' },
-      PersistentLaunchScheduleTuple,
-      { name: 'schedulerLockDuration', type: 'uint256' },
-      { name: 'schedulerFunding', type: 'uint256' },
-    ],
-    outputs: [
-      { name: 'launcher', type: 'address' },
-      { name: 'callId', type: 'uint256' },
-    ],
-  },
-] as const;
-```
-
-### Persistent Factory Selector Table
-
-| Selector | Function |
-|----------|----------|
-| `0x40d5e4f4` | `launchPersistentCompressed(bytes32,address,uint64,uint256,bytes,(uint32,uint32,uint256,uint256,uint256),uint256,uint256)` |
-| (compute) | `launchPersistentWithDerivedDkms(bytes32,address,uint256,bytes,(uint32,uint32,uint256,uint256,uint256),uint256,uint256)` |
-| (compute) | `deployLauncher(bytes32)` |
-| `0x08ef770d` | `getDkmsDerivation(address,bytes32)` |
-| (compute) | `predictLauncher(address,bytes32)` |
-| (compute) | `predictCompressedLauncher(address,bytes32)` |
-
-### Persistent Factory Events
-
-```solidity
-event LauncherDeployed(address indexed owner, bytes32 indexed userSalt, bytes32 indexed childSalt, address launcher);
-event PersistentLaunchCompressed(
-    address indexed owner, bytes32 indexed userSalt, address indexed launcher,
-    address dkmsPaymentAddress, uint256 schedulerCallId
-);
-event PersistentLaunchFromDerivedDkms(
-    address indexed owner, bytes32 indexed userSalt, address indexed launcher,
-    address dkmsPaymentAddress, uint256 schedulerCallId
-);
-```
-
-### Persistent Factory Gas Estimates
-
-| Function | Typical Gas | Recommended Gas Limit |
-|----------|-------------|----------------------|
-| `deployLauncher` | ~500K | 1,000,000 |
-| `configureFundAndArm` | ~4.5M | 8,000,000 |
-| `launchPersistentCompressed` | ~5-7M | 10,000,000 |
-
-### Compressed vs Two-Step Flow
-
-| | Two-step | Compressed |
-|---|---|---|
-| **Transactions** | 2 (deployHarness + configureFundAndStart) | 1 (launchSovereignCompressed) |
-| **CREATE3 owner** | `msg.sender` (your EOA) | Factory contract (transfers ownership after configure) |
-| **Predict function** | `predictHarness(msg.sender, userSalt)` | `predictCompressedHarness(msg.sender, userSalt)` |
-| **Salt derivation** | `keccak256(abi.encode(owner, userSalt))` | Double-wrapped: `keccak256(abi.encode(msg.sender, userSalt))` then `keccak256(abi.encode(factory, compressedSalt))` |
-| **DKMS** | Separate tx (call `requestPredictedHarnessDkmsExtraction` or use consumer contract) | Inline — factory calls DKMS precompile during launch |
-| **When to use** | Observability, debugging, step-by-step control | Production one-shot launch |
-
-**`deliveryTarget` rules:**
-
-- **Compressed flow (sovereign):** `deliveryTarget` must equal `predictCompressedHarness(msg.sender, userSalt)` return value. The compressed flow uses the factory as the intermediate CREATE3 owner.
-- **Two-step flow (sovereign):** `deliveryTarget` must equal `predictHarness(msg.sender, userSalt)` return value. Uses msg.sender as the CREATE3 owner.
-- **Compressed flow (persistent):** `deliveryTarget` must equal `predictCompressedLauncher(msg.sender, userSalt)`.
-- **Two-step flow (persistent):** `deliveryTarget` must equal `predictLauncher(msg.sender, userSalt)`.
-
-Using the wrong predict function causes `InvalidDeliveryTarget()` revert.
-
-### Launch Sequence (Two-Step)
-
-Use this sequence for both sovereign and persistent:
-
-1. Choose `userSalt` and predict child address.
-2. Ensure payload callback `deliveryTarget` equals predicted child.
-3. Derive DKMS address (call DKMS precompile 0x081B through a consumer contract or via `requestPredictedLauncherDkmsExtraction` on the factory) and **fund it** with native RITUAL. The agent cannot heartbeat without funds.
-4. Deploy child with `deployHarness` / `deployLauncher`.
-5. Configure + fund + arm child with `configureFundAndStart` / `configureFundAndArm`.
-6. Monitor child events and callback result events.
-
-Minimal deploy step:
-
-```bash
-cast send "$SOVEREIGN_FACTORY_ADDRESS" \
-  "deployHarness(bytes32)(address)" \
-  "$USER_SALT" \
-  --private-key "$PRIVATE_KEY" \
-  --rpc-url "$RPC_URL"
-
-cast send "$PERSISTENT_FACTORY_ADDRESS" \
-  "deployLauncher(bytes32)(address)" \
-  "$USER_SALT" \
-  --private-key "$PRIVATE_KEY" \
-  --rpc-url "$RPC_URL"
-```
+The consumers record the origin job hash using `0x0830`, accept only matching pending-job callbacks from `AsyncDelivery`, and expose `results(jobId)`. A persistent Phase-2 event alone is not operational success: verify `AgentHeartbeat.getAssignment(agentId)` is ACTIVE with a nonzero runtime address. To stop a persistent agent, the identity owner calls `AgentHeartbeat.recall(agentId)` and verifies the assignment is vacant; an authorized runtime operator then removes the associated runtime instance. A sovereign invocation ends after its result callback.
 
 ---
 
@@ -1151,31 +150,35 @@ Agent precompiles use a long-running (2-phase) delivery pattern because agent ex
 
 ```
 Phase 1: Submit Request
-  User tx → Precompile → Executor picks up job → Returns jobId (tx hash) to caller
+  EOA → Consumer → Precompile → async commitment → Executor Phase-1 result
+  Job ID = origin transaction hash; settled receipt contains task/prelaunch output
 
 Phase 2: Deliver Result
-  Executor completes agent execution → Calls deliveryTarget.deliverySelector(result)
+  Executor completes agent execution → Calls callbackTarget.callbackSelector(result)
   Your contract receives the callback with the agent's response
 ```
 
-Phase 1 settles synchronously within the submitting transaction — the caller receives the job ID (transaction hash) as the precompile output. Phase 2 arrives asynchronously via callback once the executor finishes.
+The origin transaction is first committed as an async job. Its hash is the job ID. After executor Phase-1 execution, inspect the settled receipt: sovereign `spcCalls.output` decodes as a task-id string, while persistent output contains the six strings described above. Phase 2 arrives later through the configured callback; it is distinct from both the origin job hash and Phase-1 output.
 
 ### Delivery Configuration
 
-To receive the result on-chain, configure delivery fields in your precompile input:
+To receive the result on-chain, configure the callback fields of the `AgentProtocolConfig` envelope:
 
 ```typescript
-// When encoding with encodeAbiParameters, set the delivery fields:
+// AgentProtocolConfig callback fields (note the types: gas is uint64, fee caps are uint128):
 //
-//   deliveryTarget:               '0x...YourConsumerContract',
-//   deliverySelector:             '0xaabbccdd',  // function selector for your callback
-//   deliveryGasLimit:             3_000_000n,
-//   deliveryMaxFeePerGas:         1_000_000_000n,
-//   deliveryMaxPriorityFeePerGas: 100_000_000n,
-//   deliveryValue:                0n,
+//   callbackEnabled:              true,
+//   callbackTarget:               '0x...YourConsumerContract',
+//   callbackSelector:             '0xaabbccdd',  // function selector for your callback
+//   callbackGasLimit:             3_000_000n,    // uint64
+//   callbackMaxFeePerGas:         1_000_000_000n, // uint128
+//   callbackMaxPriorityFeePerGas: 100_000_000n,  // uint128
+//   callbackValue:                0n,            // uint256; must be 0 for sovereign agents
 ```
 
-Setting `deliveryTarget` to `0x0000000000000000000000000000000000000000` means no on-chain delivery — the result is only available off-chain via event logs.
+Validation is strict and **all-or-nothing**: `callbackMaxPriorityFeePerGas <= callbackMaxFeePerGas`; if `callbackEnabled` is true, `callbackTarget`/`callbackSelector`/`callbackGasLimit` must all be non-zero; if false, **every** callback field must be zero (`InvalidCallbackConfig` otherwise).
+
+**Callback-free (fire-and-forget) is first-class.** An agent envelope with ALL callback fields zero is a legal job end-to-end: `AsyncDelivery.deliver()` detects the disabled callback, settles only the executor fee via `RITUAL_WALLET.settle`, and emits `Delivered(..., address(0), true, 0, 0, 0)` with NO external call. Node-side, the base-fee-vs-`maxFeePerGas` check is skipped, `effective_fee_per_gas = 0`, and prefit gas uses `CALLBACK_DISABLED_DELIVERY_PREFIT_GAS = 1_000_000` when `callbackGasLimit == 0`. The protocol supports callback-free persistent jobs and revival. The direct example consumer enables callbacks to record the final result; liveness still rides AgentHeartbeat.
 
 ### Long-Running Commitment Behavior
 
@@ -1191,7 +194,7 @@ Agent precompiles (and other long-running async precompiles) are committed to th
 - RitualWallet funds remain locked until TTL block is reached
 - No error is returned — the transaction appears successful (Phase 1 mined)
 
-**Mitigation:** Query `TEEServiceRegistry.getServicesByCapability(0, true)` before submitting to verify at least one valid executor exists. This doesn't guarantee the executor is healthy, but catches deregistered or expired-attestation scenarios.
+**Mitigation:** Select and pin an executor before sealing secrets, because signatures bind to it. Persistent application launches use valid HTTP_CALL registration, a nonempty encryption key and deployment allowlist/exclusions; an empty registry endpoint is valid. Admission capacity remains finite and is enforced by the executor. Authorized operator health probes can diagnose capacity but public endpoint reachability is not a required product eligibility gate. See Persistent Agent Preflight #6. Sovereign-job health checks are described separately above.
 
 ---
 
@@ -1213,11 +216,12 @@ A Persistent Agent is the right primitive when you want to deploy an agent that:
 
 This is the main mental model:
 
-1. You submit a Persistent Agent request on-chain.
-2. The system provisions a long-lived agent instance in a TEE-backed runtime.
-3. The agent maintains state through its workspace, memory, and encrypted DA checkpoints.
-4. A heartbeat contract monitors whether the agent is still alive.
-5. If the agent stops heartbeating, the system can attempt revival from the latest checkpoint.
+1. You first allocate a chain-issued `agentId` in a **standalone committed transaction** — `AgentIdentityRegistry.allocateAgentId(owner)` for the owner EOA — and parse the new id from `AgentIdAllocated`. Same-tx allocate+launch is unsupported.
+2. You submit a Persistent Agent request on-chain: the committed `agentId` (plus a `uint64 revision`) is passed as explicit arguments and also sits near the end of the 21-field V1 executor payload (field 19, with `revision` after it), bound into the envelope via `applicationContext = keccak256(abi.encode(agentId, revision))`.
+3. The system provisions a long-lived agent instance in a TEE-backed runtime.
+4. The agent maintains state through its workspace, memory, and encrypted DA checkpoints.
+5. A heartbeat contract monitors whether the agent is still alive (keyed by `agentId`).
+6. If the agent stops heartbeating, the system can attempt revival from the latest checkpoint.
 
 If you want "my agent keeps existing and working for me," this is the primitive.
 
@@ -1227,39 +231,50 @@ If you want "my agent keeps existing and working for me," this is the primitive.
 
 | # | Check | How to verify | What happens if skipped |
 |---|-------|---------------|------------------------|
+| 0 | **Chain-issued identity committed before launch** | EOA calls `AgentIdentityRegistry.allocateAgentId(owner)`, parses `AgentIdAllocated`, then approves the consumer with `setAgentOperator`. Encode the same `agentId`/`revision` in the payload and envelope context. | Admission rejects an unknown identity, unauthorized caller, or mismatched context. |
 | 1 | **Real DA credentials** (not mocked, not empty) | Verify GCS bucket exists and SA has `storage.objectAdmin`, or HF token can access repo, or Pinata JWT is valid | Agent cannot checkpoint. Container may start but cannot persist state or be revived. |
-| 2 | **DKMS address funded** with native RITUAL (>= 1000 for development) | `cast balance <dkms_address>` after funding | Agent cannot register on heartbeat contract. Nonce stays 0. Agent is operationally dead even though container runs. |
+| 2 | **Prelaunch/runtime wallet fundable** — the wallet that must hold funds is the PRELAUNCH wallet returned by Phase 1 (it becomes the runtime EOA): >= 0.1 RITUAL for `claim` (MIN_BALANCE) + heartbeat drip. | `cast balance <prelaunch_wallet>` after Phase-1 funding | Runtime EOA below 0.1 at claim time -> claim reverts; below 0.1 later -> agent REMOVED by liveness check, no revival. |
 | 3 | **`rpcUrls` is a publicly reachable RPC** (e.g., `https://rpc.ritualfoundation.org`) | Verify the URL is reachable from outside your local machine | Agent cannot post heartbeats, cannot send any on-chain transactions. **Do NOT use `http://172.17.0.1:8545`** — this is a Docker bridge address that only works when the chain runs on the same Docker host as the executor. |
-| 4 | **RitualWallet deposit** covers the spawn lifecycle | `cast call RITUAL_WALLET "balanceOf(address)(uint256)" <sender>` | Precompile call reverts with `insufficient wallet balance`. |
-| 5 | **No pending async job** on sender | `cast call ASYNC_JOB_TRACKER "hasPendingJobForSender(address)(bool)" <sender>` | Transaction silently dropped by the block builder. |
-| 6 | **At least one valid executor** for HTTP_CALL capability | `TEEServiceRegistry.getServicesByCapability(0, true)` returns non-empty | Commitment mined but executor never processes the job. TTL expires, funds locked. |
+| 4 | **RitualWallet deposit** covers the spawn lifecycle | `cast call RITUAL_WALLET "availableBalance(address)(uint256)" <sender>` | Precompile call reverts with `insufficient wallet balance`. |
+| 5 | **Origin lock released** | Prior jobs from this origin have Phase-1 settled or expired; a pending final callback alone is not a lock. | Transaction is skipped while the origin remains locked. |
+| 6 | **Registry-eligible executor selected and pinned before secrets** | Query valid `HTTP_CALL` services, require nonempty encryption key and apply deployment allowlist/exclusions. Empty endpoints are valid; do not require public `/health` or bypass policy for a pin. Executors still enforce finite identity/memory capacity. Operators may inspect authorized health/capacity diagnostics. `CAPACITY_EXCEEDED` is not solved by blind retry: inspect the existing launch, then choose an eligible executor and re-seal secrets for an explicit new launch. | Invalid selection, missing credentials or admission rejection prevents a usable runtime. |
 | 7 | **LLM API key is valid** for the chosen provider | Test the key against the provider's API before encrypting | Agent container fails at LLM initialization. |
-| 8 | **`deliveryTarget` matches the predicted launcher** | For compressed: use `predictCompressedLauncher`. For two-step: use `predictLauncher`. | `InvalidDeliveryTarget()` revert, or Phase 2 delivered to wrong contract. |
-| 9 | **Gas limit is sufficient** | Use >= 10,000,000 for `launchPersistentCompressed`, >= 8,000,000 for `configureFundAndArm` | Transaction reverts with out-of-gas. All state changes lost. |
+| 8 | **Consumer and sponsor bindings** | Callback target is the deployed consumer; the EOA sponsor has sufficient RitualWallet balance and allowance to that consumer. | Callback delivery or fee reservation fails. |
+| 9 | **Gas limit is sufficient** | Use the explicit submission gas limit in the direct consumer example. | Submission runs out of gas. |
 
-> **Use `launchPersistentCompressed` to satisfy checks 2 and 8 atomically.** The compressed flow derives the DKMS address, funds it, deploys the launcher, and arms the scheduler in a single transaction. The two-step flow requires you to handle DKMS derivation and funding manually.
 
 **DA is non-negotiable.** Persistent agents cannot function without real, working DA credentials. Unlike Sovereign Agents (which can execute with empty DA refs), Persistent Agents use DA for state continuity, checkpoint/recovery, and workspace persistence. If your DA credentials are fake or expired, the agent will write its initial state and then die.
 
 Supported DA providers:
-- `gcs` — requires GCS service account JSON + bucket name
+- `gcs` — requires GCS service account JSON + bucket name **+ a non-empty object prefix** (the `daConfig` StorageRef path): the sidecar's schema-v1 recovery config fails closed with "gcs recovery config requires service_account_json, bucket, and prefix" if any of the three is empty, so an empty `daConfig` path kills the agent at recovery-config build time. "Non-empty" is not enough: the prefix must be exactly the canonical agent-id-keyed value `persistent-agents/agent-{agentId}` (chain-issued numeric `agentId` substituted) — the claw-spawner rejects any other value, and revival reads/writes the SAME prefix as launch (there is no separate `revival-takeover/` prefix). the example's `examples/persistent-agent/helpers.py` derives it for you
 - `hf` — requires HuggingFace access token + repo ID
 - `pinata` — requires Pinata JWT
 
 For credential formats, see `ritual-dapp-da`.
 
-**`rpcUrls` must be reachable from inside the TEE container.** The agent container uses this URL to interact with the chain (heartbeat registration, heartbeat posting, on-chain transactions). The default `http://172.17.0.1:8545` in example scripts is for local development only — it is the Docker bridge network address and is unreachable from remote TEE executors. In production, use `https://rpc.ritualfoundation.org` or your deployment's public RPC.
+**`rpcUrls` must be reachable from inside the TEE container.** The agent container uses this URL to interact with the chain (heartbeat registration, heartbeat posting, on-chain transactions). The default `http://172.17.0.1:8545` in example scripts is for local development only — it is the Docker bridge network address and is unreachable from remote TEE executors. In production, use `https://rpc.ritualfoundation.org`.
+
+### Executor Churn: Eviction & Recovery
+
+Pinning makes the chosen executor a standing dependency, not just a launch parameter. If the pinned executor is evicted from the registry or leaves the network:
+
+- **Scheduled calls are cancelled** (`CallCancelled`) — the schedule does not re-route to another executor.
+- **`restart()` cannot reuse the old secrets** — they are ECIES-sealed to the evicted executor's key; no other executor can decrypt them.
+- **Recovery:** reconcile the submitted job, heartbeat assignment and protocol revival before retrying. An observation timeout does not prove the launch failed. An explicit new launch needs an eligible executor, correctly sealed secrets and grants. See [launch diagnostics](references/launch-diagnostics.md).
 
 ### Persistent Agent Lifecycle
 
-At a high level, a persistent agent moves through this lifecycle:
+The heartbeat contract tracks each agent as a slot keyed by `agentId`, with state `SlotState {VACANT, ACTIVE} × RevivalStatus {NONE, FAILED, REVIVING}`. A persistent agent moves through this lifecycle:
 
 1. **Spawned** — your request creates the agent instance and returns a pending id in Phase 1, then a real instance result in Phase 2.
-2. **Monitored** — once registered with the heartbeat contract, the agent is treated as alive and expected to keep heartbeating.
-3. **Failed** — if it misses its heartbeat deadline, it is marked failed.
-4. **Reviving** — the system can attempt to recover the agent from its latest encrypted checkpoint.
-5. **Monitored again** — if revival succeeds and the agent heartbeats again, it returns to healthy monitored state.
-6. **Removed** — if the agent drops below the contract's minimum balance threshold, it is removed from monitoring rather than endlessly revived.
+2. **Claimed (ACTIVE, NONE)** — registration is **claim-based self-registration**: the runtime calls `claim(agentId, ...)` from inside the container (there is no `registerAgent`; the consumer does not register the agent). This is the moment the agent exists operationally — and the launch success gate.
+3. **Monitored** — the agent keeps heartbeating at the cadence the sidecar **reads from the contract** (`heartbeatIntervalBlocks()`), not from local config.
+4. **Failed (VACANT, FAILED)** — if it misses its heartbeat deadline, the slot is vacated and queued for revival.
+5. **Reviving (VACANT, REVIVING)** — the system can attempt to recover the agent from its latest encrypted checkpoint, but only up to `MAX_REVIVAL_ATTEMPTS` times (3 at current genesis; read the live cap via `AgentHeartbeat.MAX_REVIVAL_ATTEMPTS()` and the per-agent counter via `revivalAttempts(agentId)`). The slot stays VACANT until the revived runtime **re-claims**.
+6. **Active again** — if revival succeeds and the revived runtime claims and heartbeats, the slot returns to `(ACTIVE, NONE)`.
+7. **Removed** — if the agent drops below the contract's minimum balance threshold, **or exhausts its revival budget** (`revivalAttempts >= MAX_REVIVAL_ATTEMPTS`, emitting `SlotRemoved(agentId, agent, "revival attempts exceeded")`), the assignment is deleted rather than endlessly revived. Removal is deletion from tracking, not a state — the `agentId` itself lives forever in the registry, and a fresh claim is the only path back (it resets the counter).
+
+> **One shared `slotNonce` per agentId.** Claim, heartbeat, and vacate all consume a single per-agentId `slotNonce` — **any vacate invalidates in-flight claim/heartbeat signatures**. Signature-signing flows must re-read the nonce after any slot transition. Note also that `claim()` is now 7 args, ending in `(encryptedDAConfig, revivalExecutorPayload, revivalApplicationContext)`, and the executor claim-signature digest inserts `keccak256(revivalExecutorPayload)` and `revivalApplicationContext` immediately before the nonce — signatures minted over the old 8-field digest are invalid, and DKMS `/sign_claim` carries both new fields.
 
 ### Heartbeat, Monitoring, and Revival
 
@@ -1270,7 +285,7 @@ What the heartbeat system does:
 - records the agent's latest successful heartbeat,
 - stores the latest manifest / checkpoint reference used for recovery,
 - marks agents failed when they miss the timeout window,
-- initiates revival attempts,
+- initiates revival attempts (bounded by `MAX_REVIVAL_ATTEMPTS`; once the budget is exhausted the slot is removed with `"revival attempts exceeded"` rather than retried forever),
 - returns the agent to healthy state after a successful post-revival heartbeat.
 
 There are **two different heartbeat concepts** you should not confuse:
@@ -1282,13 +297,18 @@ The first is about lifecycle and recovery. The second is about behavior.
 
 ### How to Monitor a Persistent Agent
 
-Your users and backend systems should monitor persistent agents through the heartbeat contract on the deployment they are using.
+Your users and backend systems should monitor persistent agents through the AgentHeartbeat system contract at `0xDeeA4Df0C958966ED75570a05430BB0D4844a8cc` (a fixed canonical genesis proxy — same value across chain/executor/DKMS).
+
+> **Slots are keyed by the IdentityRegistry `agentId` (uint256), not the agent's address.** A "slot" is the `agentId -> active holder assignment`. All views are agentId-keyed (`getAssignment(agentId)`, `slotExists(agentId)`, …); there are no address-keyed views.
 
 Useful view methods include:
 
-- `isAlive(agentAddress)` — whether the contract currently considers the agent monitored/alive
-- `getAgentInfo(agentAddress)` — detailed heartbeat metadata for that agent
-- `getAgentsNeedingRevival()` — list of currently failed agents awaiting or eligible for revival
+- `getAssignmentState(uint256 agentId) -> SlotState` — liveness check; returns `VACANT` or `ACTIVE` (ACTIVE means the slot has a live monitored holder). Replaces the old `isAlive(address)`.
+- `getAssignment(uint256 agentId) -> SlotAssignment` — detailed slot metadata. `SlotAssignment` is `{SlotState state; RevivalStatus revivalStatus; address agentAddress; bytes32 boundHolderKey; address boundExecutor; uint64 lastHeartbeat; uint64 heartbeatTimeout; uint64 cooldownEnd; string latestManifestCID; bytes encryptedDAConfig; bytes revivalExecutorPayload; bytes32 revivalApplicationContext}`. The two trailing fields (tuple indices 10 and 11) are the claim-time revival binding — the sanitized opaque executor payload (capped at `MAX_REVIVAL_EXECUTOR_PAYLOAD_LENGTH` = 10*1024 bytes, else `RevivalExecutorPayloadTooLarge`) and its application context — set at `claim()`, wiped on unclaim/removal, and replayed byte-exactly by `reviveAgent`; slot-ownership validation requires exact payload+context equality, so a mismatch means ownership loss. Read `revivalStatus` (`RevivalStatus{NONE,FAILED,REVIVING}`) for failure/revival state. Replaces the old `getAgentInfo(address)`.
+- `getAgentIdsNeedingRevival() -> uint256[]` — list of agentIds awaiting or eligible for revival (returns agentIds, not addresses). Replaces the old `getAgentsNeedingRevival()`.
+- `trackedAgentCount()`, `trackedAgentIdAt(uint256 index)`, `slotNonce(uint256 agentId)` — enumerate and monitor tracked slots.
+
+Lifecycle is now observed via the agentId-keyed `Slot*` events (`SlotClaimed`, `SlotHeartbeat`, `SlotRecalled`, `SlotVacated`, `SlotReplaced`, `SlotRevivalQueued`, `SlotRevivalInitiated`, `SlotRevivalFailed`, `SlotRemoved`), each carrying an indexed `uint256 agentId` topic — replacing the old address-keyed events (`AgentRegistered`/`Heartbeat`/`AgentFailed`/`AgentRevived`/etc.). Indexers must switch topic names and decode the `agentId` topic.
 
 At a product level, you should monitor:
 
@@ -1303,23 +323,28 @@ If a persistent agent misses its heartbeat deadline:
 
 - it is marked as **failed**,
 - the system can attempt to **revive** it,
-- revival uses the agent's latest encrypted checkpoint / manifest reference,
-- if the revived agent begins heartbeating again, it returns to healthy state.
+- revival uses the agent's latest encrypted checkpoint / manifest reference — **an agent that never posted a successful heartbeat has no manifest CID and is REMOVED at its first revival attempt**. Heartbeats aren't just liveness; they are the recovery lifeline,
+- the revival attempt is **sponsored by the agent's own wallet**: it is paid by pulling the agent's RitualWallet funds through the AgentHeartbeat contract's allowance (`sponsor` = agent, `caller` = AgentHeartbeat), which the heartbeat sidecar pre-approves on startup — the agent must keep both `availableBalance` and that allowance, or it silently never revives,
+- the revival tx is **protocol-authored** — `reviveAgent(agentId, executor, precompileInput)` is called with `msg.sender = SYSTEM_SENDER` (`0x…fa7e`), never the identity owner. The named executor must be a **registered HTTP executor** and must match the node's deterministic lottery pick (a new executor is chosen deterministically; do not assume the revived agent runs on the executor you launched with). The precompile input is NOT rebuilt from `latestManifestCID` — it is the opaque `revivalExecutorPayload` + `revivalApplicationContext` stored at claim time, and the contract requires envelope equality: `envelope.executor == executor`, `envelope.sponsor == slot.agentAddress` (the agent funds its own revival), callbacks disabled, context match, and `keccak256(executorPayload)` equality — with `ttl = 500` (`AGENT_REVIVAL_TTL`) and `phase2_ttl = 6000`. The persisted revival payload itself carries `restore_from_cid = ""` (all launch-only material stripped); the executor reads the authoritative restore CID (`latestManifestCID`) and encrypted DA config on-chain from the heartbeat assignment at spawn time — the behavioral outcome (restore from the latest manifest CID on a fresh executor) is unchanged,
+- if the revived agent claims and begins heartbeating again, it returns to healthy state.
 
-If a revival attempt fails, the agent remains failed and can be retried later depending on the deployment's orchestration policy.
+If a revival attempt fails, retry is **protocol behavior, not deployment orchestration policy**: when the revival's AgentHeartbeat system tx reverts, the node drops the entry from the async pool and skips settlement (no fee is drawn from the agent's RitualWallet for the failed attempt), and the normal liveness scan automatically retries — each attempt still counted against `MAX_REVIVAL_ATTEMPTS`. The sidecar deliberately exits on terminal failures (crash-to-revive) and the chain launches replacements; after the attempt budget is exhausted the contract removes the slot ("revival attempts exceeded"), as described in the lifecycle above.
 
 ### What Happens If the Agent Runs Out of Money?
 
 This is important and easy to miss:
 
 - a persistent agent must maintain the minimum native balance required by the heartbeat contract,
+- **each heartbeat is payable**: the agent pays `HEARTBEAT_FEE_WEI` (`24_500_000_000_000_000` wei = 0.0245 RITUAL) as `msg.value` on every `heartbeat(agentId, manifestCID, executorSignature)` call, credited to the bound executor's payment address via `RitualWallet.depositFor` — so native balance drains continuously — and the bound executor must be a registered `HTTP_CALL` TEE service or the heartbeat reverts (`executor not registered`),
 - if it falls below that threshold, it is **removed from monitoring**,
 - removal is different from failure: a removed agent is not simply auto-revived forever.
+
+Beyond holding a minimum native balance, **revival is funded from the agent's RitualWallet** via the sponsor->caller allowance mechanism. The agent must have deposited into RitualWallet and approved the AgentHeartbeat contract to pull those funds: the agent (acting as `sponsor` = `msg.sender`) calls `RitualWallet.approve(caller, amount)` with `caller = AgentHeartbeat` and `amount = type(uint256).max`, so the heartbeat contract can draw revival fees through `allowance[sponsor][caller]`. The persistent-agent heartbeat sidecar establishes this approval automatically on startup (`ensureHeartbeatRevivalApproval`): it reads `allowance(agentAddr /*sponsor*/, AgentHeartbeat /*caller*/)` and, if below max, sends `approve(AgentHeartbeat, type(uint256).max)` from the agent. If this allowance is missing or insufficient, revival cannot be funded. **The default launch leaves `availableBalance = 0`** (verified live: the sidecar sets the allowance but nothing deposits) — so out of the box, a FAILED agent never auto-revives. To enable revival, deposit for the agent: `cast send $RITUAL_WALLET "depositFor(address)" <agent_runtime_wallet> --value 0.5ether` — any owner can do this at any time while the agent is ACTIVE.
 
 So the practical builder takeaway is:
 
 - if your persistent agent runs out of native funds, you should treat that as an operational incident,
-- topping up and resuming may require a fresh registration or fresh spawn path depending on how your deployment manages monitored agents,
+- topping up and resuming may require a fresh registration or fresh spawn path,
 - do not assume the heartbeat system will keep reviving an underfunded agent forever.
 
 ### What Persists vs What Does Not
@@ -1339,6 +364,13 @@ What does **not** exist as a first-class persistent-agent field:
 This is one of the biggest conceptual differences from Sovereign Agent.
 
 ### Key Concepts
+
+**On-chain agent identity (`agentId`)**: Persistent agents now have a canonical on-chain identity — a chain-issued `uint256 agentId` allocated via the `AgentIdentityRegistry` system contract at `0x2cbF50F833a3AEfb5c5B27068052cB5585F5c087`. This is distinct from the `IDENTITY.md` workspace ref (a DA-backed personality/config document); the `agentId` is the on-chain ownership/identity handle the heartbeat slot and DKMS derivation are keyed by.
+
+- **Allocate**: `allocateAgentId(address identityOwner) -> uint256 agentId` — the caller must equal `identityOwner` (else `IdentityOwnerMismatch`); allocates `++nextAgentId`.
+- **Query**: `getIdentity(uint256) -> AgentIdentity{uint256 agentId; address owner}`, `ownerOf(uint256) -> address`, `agentIdsOf(address)` / `getOwnerAgentIds(address) -> uint256[]`, `exists(uint256) -> bool`, `nextAgentId`.
+- **Operator delegation**: `setAgentOperator(uint256 agentId, address operator, bool approved)` is owner-authorized. Approve the consumer before launch; operator authorization permits request initiation without transferring identity ownership. Persistent DKMS roots are agent-scoped and bootstrap from the admitted job, not from the operator address.
+- **Events**: `AgentIdAllocated(agentId, owner, allocator)`, `AgentOperatorSet(agentId, operator, approved)`.
 
 **StorageRef**: A `(platform, path, keyRef)` tuple pointing to external storage. Supported platforms in this skill are `hf`, `gcs`, and `pinata`. The `keyRef` references a key in `encryptedSecrets` holding the credential. See `ritual-dapp-da` for the full StorageRef definition, platform table, path formats, and credential encryption patterns.
 
@@ -1363,9 +395,9 @@ const gcsRef = ['gcs', 'agents/soul.md', 'GCS_CREDENTIALS'];
 
 **Runtime Config Reference** (`openclaw_config_ref`): Legacy-named runtime configuration patch (JSON). This field now carries runtime-level settings across ZeroClaw/Hermes integrations (for example Telegram and heartbeat wiring). Supports `__KEY__` placeholder substitution — values matching `__KEY_NAME__` are auto-replaced with the corresponding decrypted secret. Example: `"token": "__TELEGRAM_BOT_TOKEN__"` is replaced with the decrypted value of `TELEGRAM_BOT_TOKEN`.
 
-**DA (Data Availability) Config**: Where the agent stores and retrieves persistent data. The executor derives a DA encryption key from DKMS using the sender's Ethereum address. This key is user-bound (not executor-bound), making agent state portable across executors. All agent DA writes are encrypted — there is currently no public DA option. For DA formats, providers, and credential payloads, see `ritual-dapp-da`.
+**DA (Data Availability) Config**: Where the agent stores and retrieves persistent data. The executor derives a DA encryption key from DKMS using the sender's Ethereum address. This key is user-bound (not executor-bound), making agent state portable across executors. All agent DA writes are encrypted — every DA platform requires credentials; there is no anonymous write target. For DA formats, providers, and credential payloads, see `ritual-dapp-da`.
 
-**Revival Mode**: When `encrypted_secrets` is empty and `restore_from_cid` is non-empty, the executor starts the agent container in bootstrap mode. The container recovers its API keys from the DKMS escrow stored in the DA manifest. This enables automatic agent revival without re-submitting secrets.
+**Revival Mode**: Revival is not inferred from payload shape. The persisted revival payload (`PersistentAgentRequest.revival_payload()`, mirrored by the executor's per-spawn sanitizer) blanks ALL one-shot launch material — `secret_owners`, `encrypted_secrets`, `secret_signature`, `user_public_key` AND `restore_from_cid` — keeping `agent_id`/`revision`, LLM config, workspace refs, `rpc_urls`, and `agent_runtime`; it must stay ≤ 10 KiB and requires `agent_id > 0`. The executor detects revival by the spawn **sender being the AgentHeartbeat contract** (`IsAgentHeartbeatSender`; callbacks must be disabled), then fetches the authoritative restore CID (`latestManifestCID`) and encrypted DA config from AgentHeartbeat on-chain (`GetAssignmentAtBlock`) and starts the container in bootstrap mode. On revival, DA and LLM credentials come from the DKMS-encrypted recovery config (the `encryptedDAConfig` blob), a strict schema-v1 tagged union decoded with `DisallowUnknownFields`: `{schema_version: 1, provider ∈ {gcs, pinata, hf} lowercase, exactly ONE provider variant (gcs{service_account_json,bucket,prefix} | pinata{jwt,read_url} | hugging_face{token,repo_id}, all non-empty), required agent_runtime (0-2), optional llm_provider/llm_model/llm_api_key}` — legacy flat keys (top-level `gcs_service_account_json`, `AGENT_PROVIDER`, …) fail decoding. The sidecar builds it via `recoveryconfig.FromEnv()/Validate()` and exits on encryption failure. Remaining env secrets still come from the escrow, but escrow bootstrap is strict: an empty or undecryptable bundle is an error, not a silent skip. This enables automatic agent revival without re-submitting secrets.
 
 **No Persistent-Agent `skills_ref`**: Persistent Agent does **not** accept a `skills[]` array like Sovereign Agent. Persistent-agent behavior is shaped through:
 
@@ -1385,11 +417,61 @@ This distinction is critical:
 
 Do not conflate these three.
 
+### Hermes tool approval policy
+
+For persistent Hermes (`agent_runtime = 2`), set `hermes.approvals.mode` in the
+JSON carried by `openclaw_config_ref` (`openclawConfigRef` in ABI examples):
+
+```json
+{
+  "hermes": {
+    "approvals": { "mode": "off" }
+  }
+}
+```
+
+Merge this fragment with your existing UAHI, heartbeat, and channel settings.
+For an inline StorageRef, use `['inline', JSON.stringify(runtimeConfig), '']`.
+It is a runtime setting, not a secret, environment variable, prompt instruction,
+connector-manifest field, or new chain ABI parameter.
+
+| Mode | Tool approval behavior |
+|---|---|
+| `off` | Bypass Hermes tool approval prompts (including plugin approval gates). |
+| `smart` | Use Hermes' smart approval assessment; uncertain actions may ask a human. |
+| `manual` | Ask a human for actions that require approval. Ordinary allowed actions still run. |
+
+Agent House defaults **new launches to `off`**. General Hermes launches that omit
+the policy retain the native default, **`smart`**; omission does not mean `off`.
+Use an explicit mode when your application depends on it. Invalid modes fail
+launch. Only `approvals.mode` is accepted inside the `hermes` configuration block.
+
+This setting governs approval gates. It does not disable tool hard blocks,
+application actor authorization, chain permissions, or model clarification
+questions. Agent Link applications must still handle `interaction.requested`
+and reply with `interaction.respond`; a clarification can occur in `off` mode.
+Unattended/manual single-query or cron work may be denied instead of waiting for
+a human, according to Hermes' separate noninteractive policies.
+
+Claw seeds the selected mode once and includes its credential-free policy file
+in encrypted DA recovery state. On revival the verified snapshot wins over the
+original launch configuration. Changing a launch form does not change an
+already-running agent; legacy snapshots without a policy retain restored Hermes
+configuration, falling back to native defaults when no mode is configured.
+
+**Deployment prerequisite:** the executor deployment must support this launch
+configuration mapping and preserve the selected approval policy through recovery.
+Ask the deployment operator to confirm support before relying on the setting;
+a runtime name or published software change alone is not deployment proof. Executor Go
+already forwards the generic config, so no executor or contract ABI change is
+needed. Validate a fresh launch and a DA revival with a bounded approval-triggering
+operation before treating the deployment as supporting the selected mode.
+
 ### Telegram Plugin
 
-Telegram is the supported user-facing plugin/channel you should document for persistent agents today.
+Telegram is a supported user-facing channel. Application-owned bidirectional interfaces use [Agent Link](../ritual-dapp-agent-link/SKILL.md) with Hermes runtime 2; the example below describes the legacy autonomous UAHI configuration, not event-only cognition.
 
-Configure runtime behavior through `openclaw_config_ref`:
+Configure runtime behavior through `openclaw_config_ref`. For a Hermes (`agent_runtime = 2`) agent, configure the work-cycle driver (`uahi`) and the on-chain liveness loop (`heartbeat_chain`) explicitly alongside `channels.telegram` — both default **ON** when omitted (see below), but explicit config keeps you independent of server-side defaults:
 
 ```json
 {
@@ -1405,9 +487,23 @@ Configure runtime behavior through `openclaw_config_ref`:
         }
       }
     }
+  },
+  "uahi": {
+    "enabled": true,
+    "tick_sec": 3,
+    "app_heartbeat_sec": 10,
+    "onboard_mode": "off"
+  },
+  "heartbeat_chain": {
+    "enabled": true,
+    "contract_address": "0xDeeA4Df0C958966ED75570a05430BB0D4844a8cc"
   }
 }
 ```
+
+- **`channels.telegram`** — the operator-facing channel (see secret substitution below).
+- **`uahi`** — the UAHI runtime tick loop: `tick_sec` (how often the runtime wakes), `app_heartbeat_sec`, `onboard_mode`. **For Hermes (`agent_runtime = 2`), a MISSING `uahi` block defaults the work loop ON** (heartbeat_only mode, ~30 s cadence, `onboard_mode: off`). Only an explicit `"enabled": false` disables it — omission does not. Still configure it explicitly so the cadence and mode are what you intend, not the fallback.
+- **`heartbeat_chain`** — the on-chain liveness loop the heartbeat FSM watches: `contract_address` is the `AgentHeartbeat` address (`0xDeeA4Df0C958966ED75570a05430BB0D4844a8cc`). The block carries only `enabled`, `contract_address`, and optional RPC endpoint overrides; `interval_blocks` and `heartbeat_timeout_blocks` are ignored by the spawner and the sidecar. **A MISSING `heartbeat_chain` block defaults on-chain heartbeating ON**; only an explicit `"enabled": false` disables it. Cadence is **contract-only**: the sidecar eth_calls `heartbeatIntervalBlocks()` (uint64, must be > 0; = `defaultTimeout / heartbeatIntervalDivisor` — mainnet uses 10000/5 = 2,000 blocks (dev bootstrap configs use 4000/2 — same 2,000-block interval); local networks typically pin 200/2 = 100 blocks), caches it, and re-reads every 100 blocks. There is NO env/config fallback — a failed or zero read logs an error and the sidecar exits (`os.Exit(1)`) so the revival path takes over.
 
 Use secret substitution for the token:
 
@@ -1416,48 +512,50 @@ Use secret substitution for the token:
 
 This lets a persistent agent expose an operator-facing communication surface without the dApp having to design a custom messaging channel from day one.
 
-### Raw ABI Usage
+### Request ABI — Direct Consumer Input
+
+Encode the following canonical flat 13-field `AgentAsyncEnvelope` and 21-field payload as the `input` argument to `PersistentAgentConsumer.callPersistentAgent(agentId, revision, input)`. Canonical byte-exact encoding is enforced; tuple-wrapped or noncanonical encodings are rejected.
 
 ```typescript
-import { encodeAbiParameters, parseAbiParameters } from 'viem';
+import { encodeAbiParameters, parseAbiParameters, keccak256, encodeAbiParameters as enc, toFunctionSelector } from 'viem';
 
 // LLM provider enum: 0=Anthropic, 1=OpenAI, 2=Gemini, 3=xAI, 4=OpenRouter
 const LLMProvider = { ANTHROPIC: 0, OPENAI: 1, GEMINI: 2, XAI: 3, OPENROUTER: 4 } as const;
 
-const PERSISTENT_AGENT_ABI = parseAbiParameters([
-  'address, bytes[], uint256, bytes[], bytes,',                  // executor, encryptedSecrets, ttl, secretSignatures, userPublicKey
-  'uint64, address, bytes4, uint256, uint256, uint256, uint256,', // maxSpawnBlock, delivery config (target, selector, gasLimit, maxFee, maxPriorityFee, value)
+// 21-field persistent V1 executor payload (version first, agentId + revision last)
+const PERSISTENT_PAYLOAD_V1_ABI = parseAbiParameters([
+  'uint8, address[], bytes[], bytes[], bytes,',                  // version=1, secretOwners, encryptedSecrets, secretSignatures, userPublicKey
   'uint8, string, string,',                                      // provider, model, llmApiKeyRef
   '(string,string,string), (string,string,string),',             // daConfig, soulRef
   '(string,string,string), (string,string,string),',             // agentsRef, userRef
   '(string,string,string), (string,string,string),',             // memoryRef, identityRef
   '(string,string,string), (string,string,string),',             // toolsRef, openclawConfigRef
-  'string, string, uint16',                                      // restoreFromCid, rpcUrls, agentRuntime
+  'string, string, uint16, uint256, uint64',                     // restoreFromCid, rpcUrls, agentRuntime, agentId, revision
 ].join(''));
 
-// Do not hardcode executor addresses. Select a live executor from
-// TEEServiceRegistry.getServicesByCapability(0, true) at request build time.
-const executorAddress = '0x...selectedFromRegistry';
+// 13-field flat AgentAsyncEnvelope shared by 0x080C and 0x0820 (NOT a tuple)
+const AGENT_ENVELOPE_ABI = parseAbiParameters(
+  'address, address, uint64, uint64, bool, address, bytes4, uint64, uint128, uint128, uint256, bytes32, bytes'
+);
 
-const encoded = encodeAbiParameters(PERSISTENT_AGENT_ABI, [
-  executorAddress, [], 300n, [], '0x',               // base fields
+// Pin a registry-eligible executor under deployment policy (Persistent Agent Preflight #6).
+// Require valid HTTP_CALL registration, encryption key, allowlist/exclusions; endpoints may be empty.
+const executorAddress = '0x...eligiblePinnedExecutor';
+// sponsor: RitualWallet account whose balance backs this async job (must be non-zero).
+// The deployed consumer is the immediate precompile caller.
+const sponsorAddress = '0x...sponsorEOA';
+const consumerAddress = '0x...deployedConsumer';
 
-  // Delivery
-  600n,                                               // maxSpawnBlock (~3.5 min at ~350ms blocks)
-  '0x...consumerContract',                            // deliveryTarget
-  toFunctionSelector('onPersistentAgentResult(bytes32,bytes)'), // deliverySelector
-  500_000n,                                           // deliveryGasLimit
-  1_000_000_000n,                                     // deliveryMaxFeePerGas
-  100_000_000n,                                       // deliveryMaxPriorityFeePerGas
-  0n,                                                 // deliveryValue
+const executorPayload = encodeAbiParameters(PERSISTENT_PAYLOAD_V1_ABI, [
+  1, [], [], [], '0x',                                // version=1, base secret fields (parallel arrays)
 
   // LLM configuration
   LLMProvider.ANTHROPIC,                              // provider
   'claude-sonnet-4-5-20250929',                       // model
-  'ANTHROPIC_API_KEY',                                // llmApiKeyRef — placeholder name in encrypted_secrets
+  'ANTHROPIC_API_KEY',                                // llmApiKeyRef — an ARBITRARY name that must match a key in your encrypted secrets map (the examples use 'LLM_API_KEY' for every provider; both are valid as long as ref == secrets key)
 
   // Storage references (platform, path, keyRef)
-  ['hf', 'my-org/agent-data/manifest.json', 'HF_TOKEN'],  // daConfig
+  ['hf', 'my-org/agent-data', 'HF_TOKEN'],                 // daConfig — the DA workspace ROOT (HF repo ID / GCS prefix — for gcs it MUST be the canonical `persistent-agents/agent-{agentId}`), NOT a fixed manifest.json: the sidecar writes each manifest to a unique immutable path (HF: manifests/<instanceID>/<64-hex-sha>.json); a mutable manifest.json is coordination metadata only and is never accepted as an on-chain / revival reference
   ['hf', 'my-org/agent-configs/SOUL.md', 'HF_TOKEN'],     // soulRef
   ['', '', ''],                                             // agentsRef (empty)
   ['', '', ''],                                             // userRef (empty)
@@ -1466,10 +564,35 @@ const encoded = encodeAbiParameters(PERSISTENT_AGENT_ABI, [
   ['hf', 'my-org/agent-configs/TOOLS.md', 'HF_TOKEN'],    // toolsRef
   ['', '', ''],                                             // openclawConfigRef (empty)
 
-  '',                                                       // restoreFromCid
+  '',                                                       // restoreFromCid (launch-only; stripped in the canonical revival payload)
   `{"ritual":"${process.env.RITUAL_RPC_URL}"}`,             // rpcUrls — JSON-encoded; the agent container uses this to reach the chain
-  0,                                                        // agentRuntime (0=ZeroClaw, 2=Hermes; 1 is legacy-reserved)
+  2,                                                        // agentRuntime — HERMES (2), the default and most-supported runtime (0 = ZeroClaw alternative; 1 legacy-reserved)
+  agentId,                                                  // agentId (uint256) — chain-issued, MUST be non-zero; pre-allocated in a prior committed tx
+  0n,                                                       // revision (uint64) — application-owned payload revision
 ]);
+
+// Identity binding: the envelope's applicationContext MUST equal keccak256(abi.encode(agentId, revision))
+const applicationContext = keccak256(
+  enc(parseAbiParameters('uint256, uint64'), [agentId, 0n]),
+);
+
+const encoded = encodeAbiParameters(AGENT_ENVELOPE_ABI, [
+  executorAddress,      // executor
+  sponsorAddress,       // EOA sponsor with RitualWallet allowance to the consumer
+  300n,                 // ttl
+  6000n,                // phase2Ttl (~35 min; matches the chain's revival constant)
+  true,                 // direct example consumer requires authenticated callbacks
+  consumerAddress,      // callbackTarget
+  toFunctionSelector('onPersistentAgentResult(bytes32,bytes)'),
+  3_000_000n,           // callbackGasLimit (uint64)
+  1_000_000_000n,       // callbackMaxFeePerGas (uint128)
+  100_000_000n,         // callbackMaxPriorityFeePerGas (uint128)
+  0n,                   // callbackValue
+  applicationContext,   // applicationContext = keccak256(abi.encode(agentId, revision))
+  executorPayload,      // opaque 21-field V1 payload
+]);
+// `agentId` must come from a prior committed AgentIdentityRegistry.allocateAgentId tx.
+// Pass this input to your deployed consumer after the identity allocation has committed.
 ```
 
 ### LLM Provider Enum
@@ -1485,7 +608,7 @@ const LLMProvider = {
 } as const;
 ```
 
-> **Note:** Sovereign Agent determines provider via `LLM_PROVIDER` in encrypted secrets (see "Provider Secret Payloads" in Section 1) and additionally supports `"ritual"` (no API key needed). Persistent Agent does **not** support `"ritual"` and only accepts enum values `0..4` above.
+> **Note:** Sovereign Agent determines provider via `LLM_PROVIDER` in encrypted secrets (see "Provider Secret Payloads" in Section 3) and additionally supports `"ritual"` (no API key needed). Persistent Agent does **not** support `"ritual"` and only accepts enum values `0..4` above.
 
 ### Agent Runtime Enum
 
@@ -1499,55 +622,76 @@ const AgentRuntime = {
 // New integrations should use ZEROCLAW (0) or HERMES (2).
 ```
 
-### Persistent Agent ABI Fields (26 fields)
+### Persistent Agent Wire Format — Envelope (13 fields) + V1 Payload (21 fields)
+
+The chain-visible request is the shared flat 13-field `AgentAsyncEnvelope` (`AGENT_ASYNC_ENVELOPE_FIELD_COUNT = 13`, NOT a tuple), identical for `0x080C` and `0x0820`:
+
+```
+Index  Field                           Type      Description
+-----  ------------------------------  --------  -----------
+0      executor                        address   TEE executor address (MUST not be zero)
+1      sponsor                         address   Address sponsoring payment (RitualWallet account, non-zero; approved to the consumer)
+2      ttl                             uint64    Time-to-live in blocks (chain-enforced max: 500 blocks)
+3      phase2Ttl                       uint64    Phase 2 deadline offset from Phase 1 settlement block (was maxSpawnBlock)
+4      callbackEnabled                 bool      All-or-nothing: false => fields 5-10 must ALL be zero
+5      callbackTarget                  address   Callback contract address
+6      callbackSelector                bytes4    Callback function selector
+7      callbackGasLimit                uint64    Gas limit for callback execution
+8      callbackMaxFeePerGas            uint128   EIP-1559 max fee per gas
+9      callbackMaxPriorityFeePerGas    uint128   EIP-1559 max priority fee (must be <= max fee)
+10     callbackValue                   uint256   RITUAL value to send with callback (usually 0)
+11     applicationContext              bytes32   Persistent: MUST equal keccak256(abi.encode(agentId, revision))
+12     executorPayload                 bytes     Opaque executor-owned request (V1 payload below)
+```
+
+The executor decodes `executorPayload` as the strictly-versioned 21-field persistent V1 payload (`expected 21 persistent agent V1 payload fields`; `version != 1` rejected; canonical byte-exact re-encode required):
 
 ```
 Index  Field                           Type                    Description
 -----  ------------------------------  ----------------------  -----------
-0      executor                        address                 TEE executor address (MUST not be zero)
-1      encryptedSecrets                bytes[]                 ECIES-encrypted secret blobs
-2      ttl                             uint256                 Time-to-live in blocks (chain-enforced max: 500 blocks, ~175s at ~350ms block time)
-3      secretSignatures                bytes[]                 Signatures over encrypted secrets
+0      version                         uint8                   MUST be 1
+1      secretOwners                    address[]               Explicit owner per encrypted secret blob (parallel to encryptedSecrets/secretSignatures; all empty together when no secrets)
+2      encryptedSecrets                bytes[]                 ECIES-encrypted secret blobs
+3      secretSignatures                bytes[]                 Owner signatures over the domain-separated secret-authorization payload; signer == secretOwners[i]
 4      userPublicKey                   bytes                   User ECIES public key for output encryption (empty = plaintext)
-5      maxSpawnBlock                   uint64                  Phase 2 deadline offset from Phase 1 settlement block
-6      deliveryTarget                  address                 Callback contract address
-7      deliverySelector                bytes4                  Callback function selector
-8      deliveryGasLimit                uint256                 Gas limit for callback execution
-9      deliveryMaxFeePerGas            uint256                 EIP-1559 max fee per gas
-10     deliveryMaxPriorityFeePerGas    uint256                 EIP-1559 max priority fee
-11     deliveryValue                   uint256                 RITUAL value to send with callback (usually 0)
-12     provider                        uint8                   LLM provider enum (0=Anthropic, 1=OpenAI, 2=Gemini, 3=xAI, 4=OpenRouter)
-13     model                           string                  Model identifier (MUST NOT be empty)
-14     llmApiKeyRef                    string                  Placeholder name in encrypted_secrets for LLM API key
-15     daConfig                        (string,string,string)  DA layer StorageRef for agent output writes
-16     soulRef                         (string,string,string)  SOUL.md — agent personality definition
-17     agentsRef                       (string,string,string)  AGENTS.md — operating instructions
-18     userRef                         (string,string,string)  USER.md — user profile
-19     memoryRef                       (string,string,string)  MEMORY.md — long-term memory
-20     identityRef                     (string,string,string)  IDENTITY.md — agent identity
-21     toolsRef                        (string,string,string)  TOOLS.md — tool conventions
-22     openclawConfigRef               (string,string,string)  Legacy-named runtime config patch (supports __KEY__ substitution)
-23     restoreFromCid                  string                  DA manifest CID to restore from (empty = fresh spawn)
-24     rpcUrls                         string                  JSON-encoded RPC URLs, e.g. '{"ritual":"http://localhost:8545"}'
-25     agentRuntime                    uint16                  Runtime selector (0=ZeroClaw, 2=Hermes; 1 reserved for legacy OpenClaw deployments)
+5      provider                        uint8                   LLM provider enum (0=Anthropic, 1=OpenAI, 2=Gemini, 3=xAI, 4=OpenRouter)
+6      model                           string                  Model identifier (MUST NOT be empty)
+7      llmApiKeyRef                    string                  Placeholder name in encrypted_secrets for LLM API key
+8      daConfig                        (string,string,string)  DA layer StorageRef for agent output writes
+9      soulRef                         (string,string,string)  SOUL.md — agent personality definition
+10     agentsRef                       (string,string,string)  AGENTS.md — operating instructions
+11     userRef                         (string,string,string)  USER.md — user profile
+12     memoryRef                       (string,string,string)  MEMORY.md — long-term memory
+13     identityRef                     (string,string,string)  IDENTITY.md — agent identity
+14     toolsRef                        (string,string,string)  TOOLS.md — tool conventions
+15     openclawConfigRef               (string,string,string)  Legacy-named runtime config patch (supports __KEY__ substitution)
+16     restoreFromCid                  string                  DA manifest CID to restore from. Launch-only: empty = fresh spawn for user-initiated launches; it is stripped (set to "") in the canonical revival payload, and on protocol revivals (AgentHeartbeat-sent spawns) the executor ignores it and uses the on-chain latestManifestCID instead.
+17     rpcUrls                         string                  JSON-encoded RPC URLs, e.g. '{"ritual":"http://localhost:8545"}'. An EMPTY string silently strips the container's chain access — always set it, and it must be reachable FROM the executor.
+18     agentRuntime                    uint16                  Runtime selector (0=ZeroClaw, 2=Hermes; 1 reserved for legacy OpenClaw deployments)
+19     agentId                         uint256                 Chain-issued agent identifier (MUST be non-zero; zero is rejected with InvalidFieldValue / "spawn_agent requires a preallocated chain-issued agentId"). Must be pre-allocated in a prior committed transaction via AgentIdentityRegistry.allocateAgentId — it cannot be caller-invented.
+20     revision                        uint64                  Application-owned payload revision; bound with agentId into applicationContext
 ```
+
+> **`agentId` is committed-state, not request-local.** Allocate it before submitting `callPersistentAgent(uint256 agentId, uint64 revision, bytes input)`. The consumer checks the matching id/revision context; the executor resolves ownership and verifies that the immediate consumer is the owner or approved operator against committed chain state. DKMS bootstrap independently binds the admitted job to that identity.
 
 > **Only one Persistent Agent call per transaction.** The precompile enforces this — a second call in the same tx will fail.
 
+> **Secret signatures are owner-bound and precompile-scoped.** Each `secretSignatures[i]` signs a domain-separated authorization preimage (`RITUAL_SECRET_AUTHORIZATION_V1` || `uint16(len)` || `use_context` || `chainId` || `executor` || `secretOwners[i]` || `keccak256(encryptedSecrets[i])`), **not** the raw ciphertext. For the Persistent Agent the `use_context` is `precompile:0x0000000000000000000000000000000000000820`, so a signature minted for another precompile cannot be replayed here. The recovered signer must equal `secretOwners[i]`.
+
 ### Delivery Callback & Events
 
-Your contract must implement the callback function and the PrecompileConsumer emits the event:
+Your consumer authenticates the callback and emits its result event:
 
 ```solidity
 // Implement this in your contract:
-address constant ASYNC_DELIVERY = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+address constant ASYNC_DELIVERY = 0x508f57AE70967Da28AE0Ab6b95532878c4D0F440;
 
 function onPersistentAgentResult(bytes32 jobId, bytes calldata result) external {
     require(msg.sender == ASYNC_DELIVERY, "unauthorized callback sender");
     // Decode the response fields from `result`
 }
 
-// Event emitted by PrecompileConsumer:
+// Event emitted by your consumer:
 // event PersistentAgentResultDelivered(bytes32 indexed jobId, bytes result);
 ```
 
@@ -1559,14 +703,14 @@ const deliverySelector = toFunctionSelector('onPersistentAgentResult(bytes32,byt
 
 ### Phase 1 Response
 
-Phase 1 returns a pending instance ID: `"pending-{txHash[:16]}"` (other fields empty).
+Phase 1 returns a pending instance ID: `"pending-{txHash[:16]}"` at index 0 — and, critically, the **prelaunch primary wallet address** at index 5 (`gatewayToken`). This is the address you must fund with **≥ 0.01 RITUAL within 120 s** of Phase-1 settlement (Launch Gate row 11). Other fields are empty.
 
 ### Phase 2 Response
 
 ```typescript
 import { decodeAbiParameters, parseAbiParameters } from 'viem';
 
-const [instanceId, , containerId, checkpointCid, errorMessage] =
+const [instanceId, gatewayUrl, containerId, checkpointCid, errorMessage, gatewayToken] =
   decodeAbiParameters(
     parseAbiParameters('string, string, string, string, string, string'),
     responseData,
@@ -1577,12 +721,14 @@ const [instanceId, , containerId, checkpointCid, errorMessage] =
 Index  Field           Type    Description
 -----  --------------  ------  -----------
 0      instanceId      string  Unique agent instance identifier
+1      gatewayUrl      string  Agent gateway URL (the gateway listens on port 18789, injected by the spawner; the 8642 fallback is dead)
 2      containerId     string  Docker container ID in the TEE
 3      checkpointCid   string  DA manifest CID for state checkpoint
 4      errorMessage    string  Error details if spawn failed (empty on success)
+5      gatewayToken    string  Phase 1: prelaunch primary wallet address to fund; Phase 2: gateway auth token
 ```
 
-> The response ABI contains 6 string fields. Fields at index 1 and 5 are reserved and should be ignored.
+> All 6 string fields are load-bearing — indices 1 and 5 are `gateway_url`/`gateway_token`, not reserved. Note that Phase-2 delivery is **event-only**: the real success gate is `AgentHeartbeat.getAssignment(agentId).state == ACTIVE && agentAddress != 0` (Launch Gate row 13).
 
 ---
 
@@ -1599,80 +745,61 @@ The Sovereign Agent precompile runs AI coding agents (Claude Code, Crush, ZeroCl
 | ZeroClaw | `6` | Rust AI agent with tool calling | Anthropic, OpenAI, Gemini, OpenRouter, Ritual gateway |
 
 > Harness types 1-4 exist in some older enums/docs but are unavailable in the supported executor path:
-> - 1 (Codex), 2 (Aider), 3 (MCP) are **rejected at chain validation** (only `cliType ∈ {0, 4, 5, 6}` is allowed).
+> - 1 (Codex), 2 (Aider), 3 (MCP) are **rejected at chain validation** (chain validation only allows `cliType ∈ {0, 4, 5, 6}`).
 > - 4 (OpenClaw) **passes chain validation but is explicitly disabled at the executor** — submitting it returns the error "OpenClaw (type 4) is temporarily disabled; use ZeroClaw (type 6) instead".
 >
 > Build against **0 (Claude Code), 5 (Crush), 6 (ZeroClaw)** only. **`Hermes` is NOT a sovereign agent harness** — it's a *Persistent Agent* runtime (`agentRuntime = 2` in the Persistent Agent section above). The two enums use different numbering and apply to different precompiles. Do not try to set `cliType = 2` for sovereign — it will be rejected at the chain layer.
 
-> **Recommended default for new sovereign agents:** `cliType = 6` (ZeroClaw) with `LLM_PROVIDER = "ritual"` and `model = "zai-org/GLM-4.7-FP8"`. This combination requires no external API keys (the Ritual gateway handles auth via mTLS inside the TEE) and is the lowest-friction path to first-call success. Switch to Claude Code + Anthropic only if you specifically need Claude's tooling, or if you've hit the model's 128K context window and need a larger one. (See `ritual-dapp-llm` for context-window vs `max_completion_tokens` semantics.)
+> **Recommended default for new sovereign agents:** `cliType = 6` (ZeroClaw) with `LLM_PROVIDER = "ritual"` and `model = "deepseek-ai/DeepSeek-V4-Flash-0731"`. This combination requires no external API keys (the Ritual gateway handles auth via mTLS inside the TEE) and is the lowest-friction path to first-call success — though ritual-provider usage is token-metered per agent, and executors configured with a daily token budget will 429 (`llm_token_budget_exceeded`, `Retry-After: 3600`) once an agent exhausts it, so long-running/chatty agents should account for this when choosing the ritual provider. Switch to Claude Code + Anthropic only if you specifically need Claude's tooling. (See `ritual-dapp-llm` for context-window vs `max_completion_tokens` semantics.)
 
-The provider is determined by the `LLM_PROVIDER` key in `encryptedSecrets`. **`LLM_PROVIDER` is mandatory** — the executor rejects the call with `LLM_PROVIDER not found in secrets` if the key is missing or empty. Always include it explicitly, even when using Anthropic. Valid values: `anthropic`, `openai`, `gemini`, `openrouter`, `ritual`. (Legacy: `google` is normalized to `gemini`.) The `"ritual"` provider does not require an API key and is available for **Sovereign Agent only**.
+The provider is determined by the `LLM_PROVIDER` key in `encryptedSecrets`. **`LLM_PROVIDER` is mandatory** — the executor rejects the call with `LLM_PROVIDER not found in secrets` if the key is missing or empty. Always include it explicitly, even when using Anthropic. Valid values: `anthropic`, `openai`, `gemini`, `openrouter`, `ritual`. (Legacy: `google` is normalized to `gemini`.) The `"ritual"` provider does not require an API key and is available for **Sovereign Agent only**. Note: the executor's internal LLM gateway (port 8083) now meters prompt+completion tokens per caller over a rolling 24h window, attributing callers via the `X-Ritual-Agent-Id` header (`"agent:<id>"`, falling back to remote IP). If the executor sets `INTERNAL_LLM_GATEWAY_DAILY_TOKEN_BUDGET` (default 0 = meter-only), over-budget `/v1/chat/completions` calls get HTTP 429 with `Retry-After: 3600` and error code `"llm_token_budget_exceeded"` — agents on the ritual provider must be prepared for this. Per-caller counters are readable at `GET /v1/usage`.
 
 ### Switching Harness or Provider Mid-Project
 
 This is a frequent stumbling block — disentangle the two axes before changing anything:
 
-- **`cliType` (harness)**: which CLI runs inside the TEE container — Claude Code, Crush, or ZeroClaw. Goes in `SovereignAgentParams.agentType`.
+- **`cliType` (harness)**: which CLI runs inside the TEE container — Claude Code, Crush, or ZeroClaw. Goes in the V1 `executorPayload` (`cli_type`, payload field 5) — inside the opaque executor payload. The `payload.*` rows below refer to fields of that 16-field V1 payload.
 - **`LLM_PROVIDER` + matching API key (provider)**: which LLM backend that CLI talks to — Anthropic, OpenAI, Gemini, OpenRouter, or the Ritual gateway. Goes in the encrypted secrets JSON.
 
 These are independent. ZeroClaw can talk to Anthropic, Crush can talk to Gemini, etc. (Claude Code is the exception — it only talks to Anthropic.)
 
-**Walkthrough: ZeroClaw + GLM (default) → Claude Code + Anthropic Claude.**
+**Walkthrough: ZeroClaw + Ritual-hosted model (default) → Claude Code + Anthropic Claude.**
 
 The agent + LLM are both changing; you must change all three of `cliType`, secrets, and `model`:
 
 | Field | Before | After |
 |-------|--------|-------|
-| `params.agentType` (`cliType`) | `6` (ZeroClaw) | `0` (Claude Code) |
+| `payload.cliType` (V1 payload field 5) | `6` (ZeroClaw) | `0` (Claude Code) |
 | `encryptedSecrets` (decrypted JSON) | `{"LLM_PROVIDER":"ritual"}` | `{"LLM_PROVIDER":"anthropic","ANTHROPIC_API_KEY":"sk-ant-..."}` |
-| `params.model` | `"zai-org/GLM-4.7-FP8"` | A Claude model ID, e.g. `"claude-sonnet-4-5-20250929"` or `"claude-haiku-4-5-20251001"` |
+| `payload.model` (V1 payload field 11) | `"deepseek-ai/DeepSeek-V4-Flash-0731"` | A Claude model ID, e.g. `"claude-sonnet-4-5-20250929"` or `"claude-haiku-4-5-20251001"` |
 
-**Walkthrough: keep ZeroClaw, switch from Ritual GLM to Anthropic Claude.**
+**Walkthrough: keep ZeroClaw, switch from the Ritual-hosted model to Anthropic Claude.**
 
 Only secrets + model change; `cliType` stays at `6`:
 
 | Field | Before | After |
 |-------|--------|-------|
-| `params.agentType` | `6` (ZeroClaw) | `6` (ZeroClaw) — unchanged |
+| `payload.cliType` | `6` (ZeroClaw) | `6` (ZeroClaw) — unchanged |
 | `encryptedSecrets` | `{"LLM_PROVIDER":"ritual"}` | `{"LLM_PROVIDER":"anthropic","ANTHROPIC_API_KEY":"sk-ant-..."}` |
-| `params.model` | `"zai-org/GLM-4.7-FP8"` | `"claude-sonnet-4-5-20250929"` |
-
-#### Important harness lifecycle gotcha (probable cause of "I tried to set cliType=0 and it didn't change")
-
-`SovereignAgentHarness._configure` reverts with `AlreadyRunning` if the harness is currently scheduled (`wakeMode != NONE`). If you've already called `configureFundAndStart` once and the schedule is active, **you must call `stop()` first** before calling `configure(...)` again with the new `agentType`. Sequence:
-
-```solidity
-// 1. Cancel the active schedule so wakeMode drops back to NONE
-sovereignAgentHarness.stop();
-
-// 2. Re-configure with the new params (new agentType, new model, new schedule, etc.)
-sovereignAgentHarness.configure(newParams, newSchedule, newRolling);
-
-// 3. Re-arm the schedule (and re-fund RitualWallet if needed)
-//    Either fund + arm in one call:
-sovereignAgentHarness.configureFundAndStart{value: lockAmount}(newParams, newSchedule, newRolling, lockDuration);
-//    or just arm the existing schedule if RitualWallet is already funded:
-//    (call into the harness's start path directly per its interface)
-```
-
-If you skip the `stop()` call, the new `configure` reverts and your `agentType` change appears to "do nothing" — even though the chain accepts `cliType = 0` perfectly. The executor dispatches `cliType = 0` to Claude Code correctly; there is no executor-side bug.
+| `payload.model` | `"deepseek-ai/DeepSeek-V4-Flash-0731"` | `"claude-sonnet-4-5-20250929"` |
 
 A second source of confusion: the public block explorer (`ritual-scan`) historically only labeled `cliType ∈ {0..4}` and rendered higher values as `UNKNOWN(5)` / `UNKNOWN(6)` — `cliType = 0` always rendered as `claude_code`, so this UI bug bites Crush / ZeroClaw users specifically, not Claude Code switchers. If the scanner UI shows your `cliType` correctly, the chain has accepted the change.
 
-### Preflight Checklist (Run Before Every Submit)
+### Preflight Checklist (Run Before Every Launch)
 
-1. Sender has native RITUAL for gas (Phase 1 submission tx).
-2. `AsyncJobTracker.hasPendingJobForSender(sender)` returns `false`. If `true`, the tx is silently dropped.
-3. Sender has sufficient locked `RitualWallet` balance. Lock duration must extend past `currentBlock + ttl`. Recommended minimum: 5000 blocks (~29 minutes at ~350ms block time). For development, 100_000 blocks (~9.7 hours) avoids lock-expiry during iteration. See `ritual-dapp-block-time` for conversion formulas and measurement preflight.
-4. At least one valid executor exists: `TEEServiceRegistry.getServicesByCapability(0, true)`.
-5. Do not hardcode executor addresses as your default pattern. Select from `TEEServiceRegistry` at submit time so calls survive executor churn/restarts.
-6. Encrypt secrets per `ritual-dapp-secrets` (ECIES to executor's `node.publicKey`, nonce length 12).
-7. `max_poll_block` (Phase 2 offset) must be > `ttl` (Phase 1 TTL) and <= 70,000.
-8. `model` must be non-empty and must be an exact provider-routable model identifier (do not rely on shorthand aliases). Before submit, run a provider-side model preflight check and pass the exact model string.
+1. Sender has native RITUAL for gas (consumer deployment and submission).
+2. Previous async jobs from the EOA have Phase-1 settled or expired; do not submit while the origin is locked.
+3. The sponsor's `RitualWallet.availableBalance` covers the reserve, and `allowance(sponsor, consumer)` covers it when sponsor differs from the immediate caller.
+4. Select and pin an eligible executor before sealing secrets, using the registry and deployment selection policy.
+5. Configure the deployed consumer as callback target, with callbacks enabled and callback value zero.
+6. Grant secret access to the consumer for each ciphertext hash before submission.
+7. Encrypt secrets per `ritual-dapp-secrets` (ECIES to the pinned executor's `node.executorSecretsAuthPublicKey`, nonce length 12), with exactly **one** secret owner across all blobs.
+8. `phase2Ttl` (Phase 2 deadline offset, envelope field 3) must be non-zero and <= 70,000. It may be less than `ttl`. Submitting offset 0 is rejected at RPC with `Phase 2 deadline offset must be non-zero`.
+9. `model` must be non-empty and must be an exact provider-routable model identifier (do not rely on shorthand aliases). Before submit, run a provider-side model preflight check and pass the exact model string.
    - Anthropic example: `claude-sonnet-4-5-20250929`
    - OpenAI example: `gpt-4o-mini`
    - Gemini example: `gemini-2.5-flash`
-9. `cliType` must be one of: 0 (ClaudeCode), 5 (Crush), or 6 (ZeroClaw). Values 1-4 are unavailable in the supported executor path.
+10. `cliType` must be one of: 0 (ClaudeCode), 5 (Crush), or 6 (ZeroClaw). Values 1-4 are unavailable in the supported executor path.
 
 ### Provider Secret Payloads
 
@@ -1704,9 +831,9 @@ The `"ritual"` provider does not require an API key and is unavailable for Persi
 
 **One pending job per sender.** The chain enforces a single pending async job per sender address via `AsyncJobTracker`. If your previous sovereign agent call hasn't been settled by the executor (or expired via TTL), subsequent calls from the same address are **silently dropped** by the block builder — no error, no revert, the tx just never gets included. Use a fresh sender address or wait for the previous job to complete.
 
-**RitualWallet deposit required.** The sender must have RITUAL deposited in the `RitualWallet` contract (`0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948`) with a lock duration that extends past the TTL. Deposit with native RITUAL (not wrapped tokens):
+**RitualWallet deposit required.** The sender must have sufficient `availableBalance` deposited in the `RitualWallet` contract (`0xF04076756d8129Baec46Dc0F1c526Baec490C393`). Deposit with native RITUAL (not wrapped tokens):
 ```solidity
-RitualWallet(0x532F...3948).deposit{value: 5 ether}(100_000); // lockDuration in blocks (~9.7 hours for dev)
+RitualWallet(0xF040...C393).deposit{value: 5 ether}();
 ```
 
 **EIP-1559 gas parameters.** Transactions must use type 2 (EIP-1559). Set `maxFeePerGas` to at least 20 gwei and `maxPriorityFeePerGas` to at least 1 gwei.
@@ -1735,7 +862,7 @@ success, error, text, _, _, artifacts = decode(
 The most painful failure mode for sovereign agents is **not** "Phase 2 never lands" (that has good signals — see `ritual-dapp-longrunning`). It's **"Phase 2 lands and `success == true` but the `text` field isn't the JSON object your contract was relying on"**. This happens because the harness (Claude Code / Crush / ZeroClaw) wraps an LLM call inside its own ReAct loop, and when that inner LLM call fails — most commonly from **upstream context-window overflow** — the harness can fall back to writing its own freeform reasoning trace, an upstream error string, or a partially-formed JSON-ish blob into `text` instead of the structured object your prompt asked for. From your contract's point of view: `success=true`, `error=""`, `text="<long apology / reasoning / error string>"`. Strict JSON parsing then reverts (or worse, parses garbage).
 
 Drivers of this failure (in rough order of frequency):
-1. **Operational context-window cap on the upstream LLM.** The on-chain `max_seq_length` for a model is the *registered* capability; the actually deployed inference endpoint can be configured smaller. The live Ritual gateway currently caps `zai-org/GLM-4.7-FP8` at **64K = 65,536 tokens** even though it is registered at 128K. Inside an agent loop, accumulated tool-call replay context fills 64K much faster than you'd expect — well before you hit 128K. Treat the smaller of the two as your real budget.
+1. **Context-window budget on the upstream LLM.** Read the model's `max_seq_length` from `ModelPricingRegistry.getModel(name)`. Inside an agent loop, accumulated tool-call replay context fills the window much faster than raw prompt size suggests — budget for replay growth.
 2. **`maxTokens` is not a context-window cap.** It limits the *output* the model is allowed to generate. Setting `maxTokens=8192` does not stop a 70K-token prompt from being sent.
 3. **Harness reasoning that bleeds into `text`.** When the inner LLM errors mid-iteration, harnesses sometimes return their last reasoning step as the agent's "answer" rather than failing cleanly. The chain layer can't tell the difference; only your decoder can.
 
@@ -1776,39 +903,9 @@ function onSovereignAgentResult(bytes32 jobId, bytes calldata result) external {
 
 Off-chain decoders (Python / TypeScript) follow the same pattern: `success` first, `error` empty, `text` non-empty, then try JSON parse with a try/catch, and treat parse failure as "agent failed" rather than "schema needs adjusting". If you see frequent text-parse failures, the answer is almost never "tweak the parser" — it's "shrink the prompt", "lower `maxTurns`", or "switch to a model with a larger operational context window".
 
-### Minimal Consumer Contract
+### Consumer Contracts
 
-Any contract can call the 0x080C precompile. You do NOT need the canonical PrecompileConsumer — write your own:
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
-
-contract SovereignAgentConsumer {
-    address constant SOVEREIGN_AGENT = address(0x080C);
-    address constant ASYNC_DELIVERY = 0x5A16214fF555848411544b005f7Ac063742f39F6;
-
-    bytes32 public lastJobId;
-    bytes public lastResult;
-
-    event SovereignAgentResultDelivered(bytes32 indexed jobId, bytes result);
-
-    function callSovereignAgent(bytes calldata input) external returns (bytes memory) {
-        (bool ok, bytes memory output) = SOVEREIGN_AGENT.call(input);
-        require(ok, "precompile call failed");
-        return output;
-    }
-
-    function onSovereignAgentResult(bytes32 jobId, bytes calldata result) external {
-        require(msg.sender == ASYNC_DELIVERY, "unauthorized callback sender");
-        lastJobId = jobId;
-        lastResult = result;
-        emit SovereignAgentResultDelivered(jobId, result);
-    }
-}
-```
-
-Deploy with Foundry: `forge create --rpc-url $RPC --private-key $KEY SovereignAgentConsumer.sol:SovereignAgentConsumer`
+Use the complete owner-controlled `SovereignAgentConsumer` in the [example](../../examples/sovereign-agent/README.md). It forwards the canonical input to `0x080C`, tracks the origin job hash, and authenticates `onSovereignAgentResult` against `AsyncDelivery` and the pending job. Configure the consumer as callback target and grant it access to the owner's ciphertext.
 
 ### StorageRef Type
 
@@ -1825,7 +922,9 @@ const emptyRef: StorageRef = ['', '', ''];
 const hfRef: StorageRef = ['hf', 'my-org/workspace:session.jsonl', 'HF_TOKEN'];
 ```
 
-### Raw ABI Usage
+### Request ABI — Direct Consumer Input
+
+Encode the following canonical flat 13-field `AgentAsyncEnvelope` and 16-field payload as the `input` argument to `SovereignAgentConsumer.callSovereignAgent(input)`. Canonical byte-exact encoding is enforced.
 
 ```typescript
 import { encodeAbiParameters, parseAbiParameters, toFunctionSelector } from 'viem';
@@ -1839,46 +938,48 @@ const CLIType = {
   ZEROCLAW: 6,
 } as const;
 
-const SOVEREIGN_AGENT_ABI = parseAbiParameters([
-  'address, uint256, bytes,',                                // executor, ttl, userPublicKey
-  'uint64, uint64, string,',                                 // pollIntervalBlocks, maxPollBlock, taskIdMarker
-  'address, bytes4, uint256, uint256, uint256,',             // delivery config
-  'uint16, string, bytes,',                                  // cliType, prompt, encryptedSecrets
+// 16-field sovereign V1 executor payload (version first)
+const SOVEREIGN_PAYLOAD_V1_ABI = parseAbiParameters([
+  'uint8, address[], bytes[], bytes[], bytes,',              // version=1, secretOwners, encryptedSecrets, secretSignature, userPublicKey
+  'uint16, string,',                                         // cliType, prompt
   '(string,string,string), (string,string,string),',        // convoHistory, output
   '(string,string,string)[],',                               // skills
   '(string,string,string),',                                 // systemPrompt
   'string, string[], uint16, uint32, string',                // model, tools, maxTurns, maxTokens, rpcUrls
 ].join(''));
 
+// 13-field flat AgentAsyncEnvelope shared by 0x080C and 0x0820 (NOT a tuple)
+const AGENT_ENVELOPE_ABI = parseAbiParameters(
+  'address, address, uint64, uint64, bool, address, bytes4, uint64, uint128, uint128, uint256, bytes32, bytes'
+);
+
 // Encrypt API keys with executor's public key.
 // LLM_PROVIDER is mandatory — the executor rejects the call with
 // "LLM_PROVIDER not found in secrets" if the key is missing or empty.
-const secretsJson = JSON.stringify({
-  LLM_PROVIDER: 'anthropic',
-  ANTHROPIC_API_KEY: process.env.ANTHROPIC_KEY,
+// Each blob is wrapped in an owner-bound envelope before ECIES encryption; the
+// envelope owner must equal the matching secretOwners[i].
+const secretOwner = secretOwnerAddress; // checksummed; signs the secret-authorization payload
+const secretEnvelope = JSON.stringify({
+  version: 1,
+  secret_owner: secretOwner,
+  secrets: {
+    LLM_PROVIDER: 'anthropic',
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_KEY,
+  },
 });
-const encryptedSecrets = encrypt(executorPublicKey, Buffer.from(secretsJson));
+const encryptedSecret = encrypt(executorPublicKey.slice(2), Buffer.from(secretEnvelope));
 
-const deliverySelector = toFunctionSelector('onSovereignAgentResult(bytes32,bytes)');
+const callbackSelector = toFunctionSelector('onSovereignAgentResult(bytes32,bytes)');
 
-const encoded = encodeAbiParameters(SOVEREIGN_AGENT_ABI, [
-  executorAddress,                     // executor (from TEEServiceRegistry)
-  500n,                                // ttl (blocks until expiry)
+const executorPayload = encodeAbiParameters(SOVEREIGN_PAYLOAD_V1_ABI, [
+  1,                                   // version — MUST be 1
+  [secretOwner],                       // secretOwners (one owner per blob; parallel to encryptedSecrets/secretSignature)
+  [`0x${Buffer.from(encryptedSecret).toString('hex')}`], // encryptedSecrets (bytes[] — owner-bound envelope per blob)
+  [secretSignature],                   // secretSignature (owner sig over the precompile:0x...080c authorization payload)
   '0x',                                // userPublicKey (empty = plaintext delivery)
-
-  5n,                                  // pollIntervalBlocks
-  6000n,                               // maxPollBlock
-  'SOVEREIGN_AGENT_TASK',              // taskIdMarker
-
-  consumerContractAddress,             // deliveryTarget (your contract)
-  deliverySelector,                    // deliverySelector
-  3_000_000n,                          // deliveryGasLimit
-  1_000_000_000n,                      // deliveryMaxFeePerGas (1 gwei)
-  100_000_000n,                        // deliveryMaxPriorityFeePerGas
 
   CLIType.CRUSH,                       // cliType
   'Say hello world',                   // prompt
-  `0x${encryptedSecrets.toString('hex')}`,  // encryptedSecrets (single blob)
 
   ['hf', 'my-org/workspace/sessions/session.jsonl', 'HF_TOKEN'],  // convoHistory (HF-backed memory)
   ['hf', 'my-org/workspace/artifacts/', 'HF_TOKEN'],              // output (HF-backed artifacts)
@@ -1891,37 +992,50 @@ const encoded = encodeAbiParameters(SOVEREIGN_AGENT_ABI, [
   8192,                                // maxTokens
   '',                                  // rpcUrls (empty = default)
 ]);
+
+const encoded = encodeAbiParameters(AGENT_ENVELOPE_ABI, [
+  executorAddress,                     // executor (from TEEServiceRegistry)
+  sponsorAddress,                      // EOA sponsor with RitualWallet allowance to the consumer
+  500n,                                // ttl (blocks until expiry)
+  6000n,                               // phase2Ttl (Phase-2/polling deadline; replaces maxPollBlock)
+  true,                                // callbackEnabled — required by this consumer
+  consumerContractAddress,             // callbackTarget (the deployed consumer)
+  callbackSelector,                    // callbackSelector
+  3_000_000n,                          // callbackGasLimit (uint64)
+  1_000_000_000n,                      // callbackMaxFeePerGas (uint128, 1 gwei)
+  100_000_000n,                        // callbackMaxPriorityFeePerGas (uint128)
+  0n,                                  // callbackValue — MUST be 0 ("sovereign agent callback value is not supported")
+  '0x0000000000000000000000000000000000000000000000000000000000000000', // applicationContext (zero for this consumer)
+  executorPayload,                     // opaque 16-field V1 payload
+]);
 ```
 
-### ABI Fields (23 fields)
+### Wire Format — Envelope (13 fields) + Sovereign V1 Payload (16 fields)
+
+The envelope fields (indices 0-12: executor, sponsor, ttl, phase2Ttl, callbackEnabled, callbackTarget, callbackSelector, callbackGasLimit uint64, callbackMaxFeePerGas/MaxPriorityFeePerGas uint128, callbackValue, applicationContext, executorPayload) are shared with the Persistent Agent — see the envelope table in Section 2. The executor decodes `executorPayload` as the 16-field sovereign V1 payload (`expected 16 sovereign agent V1 payload fields`; `version != 1` rejected):
 
 ```
 Index  Field                           Type                     Description
 ─────  ─────────────────────────────── ──────────────────────── ────────────────────────────────
-0      executor                        address                  TEE executor address
-1      ttl                             uint256                  Time-to-live in blocks
-2      userPublicKey                   bytes                    User ECIES key (empty = plaintext)
-3      pollIntervalBlocks              uint64                   Polling frequency
-4      maxPollBlock                    uint64                   Polling timeout block
-5      taskIdMarker                    string                   Task ID placeholder
-6      deliveryTarget                  address                  Callback contract
-7      deliverySelector                bytes4                   Callback function selector
-8      deliveryGasLimit                uint256                  Callback gas limit
-9      deliveryMaxFeePerGas            uint256                  EIP-1559 max fee for callback
-10     deliveryMaxPriorityFeePerGas    uint256                  EIP-1559 priority fee for callback
-11     cliType                         uint16                   0=claude_code, 5=crush, 6=zeroclaw
-12     prompt                          string                   Agent prompt
-13     encryptedSecrets                bytes                    ECIES-encrypted secrets (single blob)
-14     convoHistory                    (string,string,string)   Conversation history StorageRef
-15     output                          (string,string,string)   Output artifacts StorageRef
-16     skills                          (string,string,string)[] Skills array
-17     systemPrompt                    (string,string,string)   System prompt StorageRef
-18     model                           string                   Model identifier
-19     tools                           string[]                 Allowed tools (empty = all)
-20     maxTurns                        uint16                   Max conversation turns
-21     maxTokens                       uint32                   Max output tokens
-22     rpcUrls                         string                   JSON-encoded RPC URLs
+0      version                         uint8                    MUST be 1
+1      secretOwners                    address[]                Explicit owner per encrypted secret blob (parallel to encryptedSecrets/secretSignature; all three arrays must be EQUAL LENGTH, all empty together when no secrets)
+2      encryptedSecrets                bytes[]                  ECIES-encrypted owner-bound secret blobs
+3      secretSignature                 bytes[]                  Owner signatures over the domain-separated secret-authorization payload; signer == secretOwners[i]
+4      userPublicKey                   bytes                    User ECIES key (empty = plaintext)
+5      cliType                         uint16                   0=claude_code, 5=crush, 6=zeroclaw
+6      prompt                          string                   Agent prompt
+7      convoHistory                    (string,string,string)   Conversation history StorageRef
+8      output                          (string,string,string)   Output artifacts StorageRef
+9      skills                          (string,string,string)[] Skills array
+10     systemPrompt                    (string,string,string)   System prompt StorageRef
+11     model                           string                   Model identifier
+12     tools                           string[]                 Allowed tools (empty = all)
+13     maxTurns                        uint16                   Max conversation turns
+14     maxTokens                       uint32                   Max output tokens
+15     rpcUrls                         string                   JSON-encoded RPC URLs. An EMPTY string silently strips the container's chain access — always set it, and it must be reachable FROM the executor.
 ```
+
+The old top-level `pollIntervalBlocks`/`taskIdMarker` fields are deleted; the polling deadline rides `phase2Ttl` on the envelope.
 
 ### Data Availability (DA) — Conversation Memory & Artifacts
 
@@ -1931,12 +1045,12 @@ Sovereign agents are **stateless by default** — each call gets a fresh contain
 
 **Four StorageRef fields control DA:**
 
-| Field | Index | What It Does |
+| Field | Payload Index | What It Does |
 |-------|:---:|---|
-| `convoHistory` | 14 | Conversation memory. Executor downloads previous JSONL, injects as conversation context in the prompt, appends a new turn after execution, re-uploads. |
-| `output` | 15 | Artifact storage. Executor downloads previous files into `/workspace/artifacts/`, extracts new files after execution, uploads them. |
-| `skills` | 16 | Skill definitions. Downloaded and injected as `/workspace/skill_0.md`, `skill_1.md`, etc. Read-only — not re-uploaded. |
-| `systemPrompt` | 17 | System prompt. Downloaded and passed to the agent via `--system-prompt`. Read-only — not re-uploaded. |
+| `convoHistory` | 7 | Conversation memory. Executor downloads previous JSONL, injects as conversation context in the prompt, appends a new turn after execution, re-uploads. |
+| `output` | 8 | Artifact storage. Executor downloads previous files into `/workspace/artifacts/`, extracts new files after execution, uploads them. |
+| `skills` | 9 | Skill definitions. Downloaded and injected as `/workspace/skill_0.md`, `skill_1.md`, etc. Read-only — not re-uploaded. |
+| `systemPrompt` | 10 | System prompt. Downloaded and passed to the agent via `--system-prompt`. Read-only — not re-uploaded. |
 
 **Supported DA platforms:**
 
@@ -1966,15 +1080,16 @@ Sovereign agents are **stateless by default** — each call gets a fresh contain
 {"ANTHROPIC_API_KEY":"sk-ant-...", "DA_PINATA_JWT":"eyJ...", "DA_PINATA_GATEWAY":"https://my-gateway.mypinata.cloud"}
 ```
 
+The `encodeAbiParameters` examples below build the input passed through your deployed sovereign consumer.
+
 **Example: HuggingFace-backed conversation memory + artifacts**
 
 ```typescript
-const encoded = encodeAbiParameters(SOVEREIGN_AGENT_ABI, [
-  executorAddress, 500n, '0x',
-  5n, 10000n, 'SOVEREIGN_AGENT_TASK',
-  consumerContract, deliverySelector, 3_000_000n, 1_000_000_000n, 100_000_000n,
+// Envelope fields (executor, sponsor, ttl 500n, phase2Ttl, mandatory callback config)
+// are set on AGENT_ENVELOPE_ABI / AgentProtocolConfig as shown in the Raw Request ABI section.
+const executorPayload = encodeAbiParameters(SOVEREIGN_PAYLOAD_V1_ABI, [
+  1, [secretOwner], [`0x${Buffer.from(encryptedSecret).toString('hex')}`], [secretSignature], '0x',
   CLIType.CRUSH, 'What did we talk about last time?',
-  `0x${encryptedSecrets.toString('hex')}`,
 
   ['hf', 'my-org/agent-workspace/sessions/session.jsonl', 'HF_TOKEN'],  // convoHistory
   ['hf', 'my-org/agent-workspace/artifacts/', 'HF_TOKEN'],              // output
@@ -1988,17 +1103,21 @@ const encoded = encodeAbiParameters(SOVEREIGN_AGENT_ABI, [
 **Example: GCS-backed conversation memory + artifacts**
 
 ```typescript
-// GCS credentials go in encryptedSecrets as a JSON blob
-const secretsJson = JSON.stringify({
-  ANTHROPIC_API_KEY: 'sk-ant-...',
-  GCS_CREDENTIALS: JSON.stringify({
-    service_account_json: '{"type":"service_account","project_id":"my-project",...}',
-    bucket: 'my-ritual-da-bucket',
-  }),
+// GCS credentials go in encryptedSecrets, wrapped in the owner-bound envelope
+const secretEnvelope = JSON.stringify({
+  version: 1,
+  secret_owner: secretOwner, // must equal the matching secretOwners[i]
+  secrets: {
+    ANTHROPIC_API_KEY: 'sk-ant-...',
+    GCS_CREDENTIALS: JSON.stringify({
+      service_account_json: '{"type":"service_account","project_id":"my-project",...}',
+      bucket: 'my-ritual-da-bucket',
+    }),
+  },
 });
 
-const encoded = encodeAbiParameters(SOVEREIGN_AGENT_ABI, [
-  // ... executor, ttl, delivery config ...
+const executorPayload = encodeAbiParameters(SOVEREIGN_PAYLOAD_V1_ABI, [
+  // ... version=1, secret fields, cliType, prompt ...
 
   ['gcs', 'sovereign-agent/convo_history.jsonl', 'GCS_CREDENTIALS'],  // convoHistory
   ['gcs', 'sovereign-agent/artifacts/', 'GCS_CREDENTIALS'],           // output
@@ -2013,8 +1132,8 @@ const encoded = encodeAbiParameters(SOVEREIGN_AGENT_ABI, [
 
 ```typescript
 // First call — empty paths, CIDs returned in Phase 2 response
-const firstCall = encodeAbiParameters(SOVEREIGN_AGENT_ABI, [
-  // ... executor, ttl, delivery config ...
+const firstCallPayload = encodeAbiParameters(SOVEREIGN_PAYLOAD_V1_ABI, [
+  // ... version=1, secret fields, cliType, prompt ...
 
   ['pinata', '', 'DA_PINATA_JWT'],          // convoHistory — empty for first call
   ['pinata', '', 'DA_PINATA_JWT'],          // output — empty for first call
@@ -2029,8 +1148,8 @@ const firstCall = encodeAbiParameters(SOVEREIGN_AGENT_ABI, [
 //   updatedOutput       = { platform: 'pinata', path: 'QmDef...123' }
 
 // Second call — pass the CIDs from the first response
-const secondCall = encodeAbiParameters(SOVEREIGN_AGENT_ABI, [
-  // ... executor, ttl, delivery config ...
+const secondCallPayload = encodeAbiParameters(SOVEREIGN_PAYLOAD_V1_ABI, [
+  // ... version=1, secret fields, cliType, prompt ...
 
   ['pinata', 'QmXyz...abc', 'DA_PINATA_JWT'],   // convoHistory — CID from first call
   ['pinata', 'QmDef...123', 'DA_PINATA_JWT'],   // output — manifest CID from first call
@@ -2061,31 +1180,16 @@ With these configurations, the agent remembers prior conversations and accumulat
 
 > **DKMS DA encryption is agent-only.** Only Sovereign Agent and Persistent Agent precompiles use DKMS-derived encryption. LLM conversation history, multimodal outputs, and FHE ciphertexts are stored as plaintext on the DA provider. See `ritual-dapp-da` for the full DA architecture and DKMS details.
 
-Every sovereign agent invocation derives a **secp256k1 keypair** from DKMS (Decentralized Key Management) inside the TEE. This keypair is bound to the **sender's Ethereum address**, not the executor — making agent state portable across executors.
+The executor derives agent DA encryption keys inside the TEE. Sovereign DA derivation is bound to the immediate consumer address, with owner-root index zero and the DA purpose lane. Persistent derivation uses the chain-issued `agentId` and revision, with admitted-job bootstrap and distinct runtime/DA purpose lanes. Identity ownership authorizes launch; it is not a substitute for the persistent agent-scoped DKMS namespace.
 
-**What the DKMS keypair provides:**
-- **Private key** — stays inside the TEE, used to ECIES-decrypt DA content on download and ECIES-encrypt on upload
-- **Public key** — exposed via the DKMS precompile (0x081B), used by external parties to encrypt data TO the agent
-- **Ethereum address** — derived from the public key, used for the agent's on-chain transactions
-
-**All agent DA content is ECIES-encrypted.** The executor encrypts uploads with the agent's public key and decrypts downloads with the agent's private key. No plaintext agent DA — content at rest on HF/GCS/Pinata is always ciphertext. Only the TEE can read it.
-
-**Getting the agent's DA public key** — call the DKMS precompile (0x081B):
-
-```typescript
-// The DKMS precompile returns (address, publicKey) for a given owner
-// Use the owner's address (sender) to derive the agent's keypair
-const dkmsResult = await callDkmsPrecompile(executorAddress, senderAddress, 0, 1);
-const [agentAddress, agentDAPublicKey] = decodeDkmsResponse(dkmsResult);
-// agentDAPublicKey is 65 bytes (uncompressed secp256k1, 0x04 prefix)
-```
+Agent DA uploads are ECIES-encrypted and decrypted inside the TEE. These DA keys differ from the registry executor key used to seal request credentials. The direct launch examples use the executor key for `encryptedSecrets`; no preliminary DKMS precompile transaction is required.
 
 ### Encrypted Inputs — Encrypting Skills & System Prompt to the Agent
 
 Skills and system prompt content can be ECIES-encrypted to the agent's DA public key. This keeps agent instructions private — only the TEE can read them.
 
 **How it works:**
-1. Get the agent's DA public key from the DKMS precompile (0x081B)
+1. Obtain the correct agent-scoped DA public key through a supported key-discovery flow; do not substitute the executor key or an owner-root key for a persistent DA key. The minimal launch examples do not require encrypted input files.
 2. ECIES-encrypt the skill/system prompt content with that public key
 3. Upload the ciphertext to HF/GCS/Pinata
 4. Set `keyRef` to `dkms_encrypted:<credential>` on the StorageRef
@@ -2100,23 +1204,27 @@ const encrypted = encrypt(agentDAPublicKey.slice(2), systemPromptContent);
 const systemPrompt: StorageRef = ['hf', 'my-org/workspace/system.encrypted.md', 'dkms_encrypted:HF_TOKEN'];
 ```
 
-> **Two different encryption targets.** `encryptedSecrets` (field 13) is encrypted to the **executor's** public key (from `TEEServiceRegistry.node.publicKey`). `dkms_encrypted:` content is encrypted to the **agent's** DA public key (from DKMS precompile 0x081B). These are different keys for different purposes: the executor key protects API keys in transit, the agent key protects agent state at rest.
+> **Two different encryption targets.** `encryptedSecrets` (payload field 2, `bytes[]`) is encrypted to the **executor's** public key (from `TEEServiceRegistry.node.executorSecretsAuthPublicKey`). `dkms_encrypted:` content is encrypted to the **agent's** purpose-specific DA public key. These are different keys for different purposes: the executor key protects API keys in transit, the agent key protects agent state at rest.
 
 ### Private Prompt — Encrypting the Prompt On-Chain
 
-The `prompt` field (index 12) is a plaintext string in the on-chain calldata — anyone can read it. To keep the prompt private, use the **template replacement pattern**:
+The `prompt` field (payload index 6) is a plaintext string in the on-chain calldata — anyone can read it. To keep the prompt private, use the **template replacement pattern**:
 
 1. Put the real prompt in `encryptedSecrets` under a placeholder key (e.g., `PRIVATE_PROMPT`)
 2. Set the on-chain `prompt` field to the placeholder string
 3. The executor decrypts the secrets, finds the placeholder in the prompt, and replaces it with the decrypted value
 
 ```typescript
-// The real prompt goes into encrypted secrets
-const secretsJson = JSON.stringify({
-  ANTHROPIC_API_KEY: 'sk-ant-...',
-  PRIVATE_PROMPT: 'Analyze my DeFi positions and suggest optimizations for maximum yield',
+// The real prompt goes into encrypted secrets, wrapped in the owner-bound envelope
+const secretEnvelope = JSON.stringify({
+  version: 1,
+  secret_owner: secretOwner, // must equal the matching secretOwners[i]
+  secrets: {
+    ANTHROPIC_API_KEY: 'sk-ant-...',
+    PRIVATE_PROMPT: 'Analyze my DeFi positions and suggest optimizations for maximum yield',
+  },
 });
-const encryptedSecrets = encrypt(executorPublicKey.slice(2), Buffer.from(secretsJson));
+const encryptedSecret = encrypt(executorPublicKey.slice(2), Buffer.from(secretEnvelope));
 
 // The on-chain prompt is just the placeholder — visible to everyone but meaningless
 const prompt = 'PRIVATE_PROMPT';
@@ -2124,7 +1232,7 @@ const prompt = 'PRIVATE_PROMPT';
 
 The executor does `prompt.replaceAll("PRIVATE_PROMPT", decryptedSecrets["PRIVATE_PROMPT"])` before running the agent. Any key in `encryptedSecrets` that appears as a substring in the prompt is replaced. Multiple placeholders are supported.
 
-> **Encrypted to the executor, not the agent.** The private prompt is in `encryptedSecrets`, which is ECIES-encrypted to the **executor's** public key (from `TEEServiceRegistry.node.publicKey`). This is different from `dkms_encrypted:` content which is encrypted to the agent's DA key.
+> **Encrypted to the executor, not the agent.** The private prompt is in `encryptedSecrets`, which is ECIES-encrypted to the **executor's** public key (from `TEEServiceRegistry.node.executorSecretsAuthPublicKey`). This is different from `dkms_encrypted:` content which is encrypted to the agent's DA key.
 
 ### Phase 2 Response
 
@@ -2153,7 +1261,7 @@ Index  Field               Type                      Description
 
 ```solidity
 // Implement in your contract:
-address constant ASYNC_DELIVERY = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+address constant ASYNC_DELIVERY = 0x508f57AE70967Da28AE0Ab6b95532878c4D0F440;
 
 function onSovereignAgentResult(bytes32 jobId, bytes calldata result) external {
     require(msg.sender == ASYNC_DELIVERY, "unauthorized callback sender");
@@ -2184,39 +1292,33 @@ event SovereignAgentResultDelivered(bytes32 indexed jobId, bytes result);
 
 An agent that remembers previous interactions and builds context over time.
 
+Encode the following canonical flat 13-field `AgentAsyncEnvelope` and 21-field payload as the `input` argument to `PersistentAgentConsumer.callPersistentAgent(agentId, revision, input)`. Canonical byte-exact encoding is enforced; tuple-wrapped or noncanonical encodings are rejected.
+
 ```typescript
-import { encodeAbiParameters, parseAbiParameters, toFunctionSelector } from 'viem';
+import { encodeAbiParameters, parseAbiParameters, keccak256, toFunctionSelector } from 'viem';
 
 const LLMProvider = { ANTHROPIC: 0, OPENAI: 1, GEMINI: 2, XAI: 3, OPENROUTER: 4 } as const;
 
-const PERSISTENT_AGENT_ABI = parseAbiParameters([
-  'address, bytes[], uint256, bytes[], bytes,',
-  'uint64, address, bytes4, uint256, uint256, uint256, uint256,',
-  'uint8, string, string,',
-  '(string,string,string), (string,string,string),',
-  '(string,string,string), (string,string,string),',
-  '(string,string,string), (string,string,string),',
-  '(string,string,string), (string,string,string),',
-  'string, string, uint16',
-].join(''));
+// See the Raw Request ABI section for PERSISTENT_PAYLOAD_V1_ABI (21 fields) and
+// AGENT_ENVELOPE_ABI (13 fields).
 
-// Select from TEEServiceRegistry at runtime (do not hardcode).
-const executorAddress = '0x...selectedFromRegistry';
+// Pin a registry-eligible executor under deployment policy (Persistent Agent Preflight #6).
+// signature binds to the executor, so selection must precede sealing secrets.
+const executorAddress = '0x...eligiblePinnedExecutor';
+// sponsor: the funded EOA, with RitualWallet allowance to the consumer.
+const sponsorAddress = '0x...sponsorEOA';
+const consumerAddress = '0x...deployedConsumer';
 
-const encoded = encodeAbiParameters(PERSISTENT_AGENT_ABI, [
-  executorAddress, [], 300n, [], '0x',
-  600n,                                                     // maxSpawnBlock (~3.5 min at ~350ms blocks)
-  '0x...YourContract',
-  toFunctionSelector('onPersistentAgentResult(bytes32,bytes)'),
-  500_000n,
-  1_000_000_000n, 100_000_000n, 0n,
+const revision = 0n;
+const executorPayload = encodeAbiParameters(PERSISTENT_PAYLOAD_V1_ABI, [
+  1, [], [], [], '0x',                                      // version=1, secret fields
 
   LLMProvider.ANTHROPIC,
   'claude-sonnet-4-5-20250929',
   'ANTHROPIC_API_KEY',                                      // llmApiKeyRef in encrypted_secrets
 
   // Storage references (platform, path, keyRef)
-  ['hf', 'my-org/portfolio-agent/manifest.json', 'HF_TOKEN'], // daConfig
+  ['hf', 'my-org/portfolio-agent', 'HF_TOKEN'],               // daConfig — DA workspace ROOT (bare HF repo ID); never a fixed manifest.json — manifests get unique immutable per-snapshot paths and a mutable manifest.json is never a chain/revival reference
   ['hf', 'my-org/portfolio-agent/SOUL.md', 'HF_TOKEN'],       // soulRef
   ['', '', ''],                                                 // agentsRef
   ['', '', ''],                                                 // userRef
@@ -2225,9 +1327,26 @@ const encoded = encodeAbiParameters(PERSISTENT_AGENT_ABI, [
   ['hf', 'my-org/portfolio-agent/TOOLS.md', 'HF_TOKEN'],      // toolsRef
   ['', '', ''],                                                 // openclawConfigRef
 
-  '',                                                           // restoreFromCid
+  '',                                                           // restoreFromCid (launch-only)
   `{"ritual":"${process.env.RITUAL_RPC_URL}"}`,                 // rpcUrls — JSON-encoded; the agent container uses this to reach the chain
-  0,                                                            // agentRuntime (0=ZeroClaw)
+  2,                                                            // agentRuntime — HERMES (2), the default and most-supported runtime (0 = ZeroClaw alternative)
+  agentId,                                                      // agentId (uint256) — chain-issued, MUST be non-zero; pre-allocated in a prior committed tx
+  revision,                                                     // revision (uint64)
+]);
+
+const applicationContext = keccak256(
+  encodeAbiParameters(parseAbiParameters('uint256, uint64'), [agentId, revision]),
+);
+
+const persistentInput = encodeAbiParameters(AGENT_ENVELOPE_ABI, [
+  executorAddress, sponsorAddress,
+  300n,                 // ttl
+  6000n,                // phase2Ttl (~35 min; matches the chain's revival constant)
+  true,                 // callbacks required by this consumer
+  consumerAddress, toFunctionSelector('onPersistentAgentResult(bytes32,bytes)'),
+  3_000_000n, 1_000_000_000n, 100_000_000n, 0n,
+  applicationContext,   // = keccak256(abi.encode(agentId, revision))
+  executorPayload,
 ]);
 ```
 
@@ -2237,28 +1356,21 @@ const encoded = encodeAbiParameters(PERSISTENT_AGENT_ABI, [
 
 The async transaction pool enforces **one pending async job per sender address**. You cannot submit a second agent call from the same wallet while the first is in flight.
 
-**For sequential operations (same wallet):** Wait for Phase 1 completion before submitting the next call. Once Phase 1 settles (the job ID is returned), the sender slot is freed and a new async transaction can be submitted.
+**For sequential operations (same wallet):** Wait for Phase 1 completion before submitting the next call. Once Phase 1 settles, the sender slot is freed and a new async transaction can be submitted.
 
 **For concurrent agents:** Use separate wallet addresses for each concurrent agent call. Each wallet can independently have one pending job.
 
-This is a protocol-level constraint enforced by `AsyncJobTracker.hasPendingJobForSender()`.
+This is a protocol-level constraint enforced by `AsyncJobTracker.hasPendingJobForTxOrigin()`.
 
 ---
 
 ## 6. Combining Agents with Other Precompiles
 
+An agent can call an HTTP tool whose dApp-side request uses RITHTTP1, but do not conflate the formats. Agent `StorageRef`/DKMS fields remain agent protocol state; RITHTTP1 refs exist only inside the `body` of HTTP `0x0801` or long HTTP `0x0805`. Use RITHTTP1 for large JSON tool arguments, post-hydration API secrets, response artifact fan-out, held tool responses, or selected SSE, and keep agent lifecycle/memory in the agent protocol. See [`../ritual-dapp-http/references/rithttp1.md`](../ritual-dapp-http/references/rithttp1.md).
+
 ### Agent + Scheduler: Recurring Sovereign-Agent Tasks
 
-Use the Scheduler to trigger sovereign agent jobs on a schedule:
-
-```solidity
-function scheduledSovereignTask() external {
-    require(msg.sender == SCHEDULER, "Only scheduler");
-    bytes memory request = buildSovereignAgentRequest();
-    (bool ok, ) = SOVEREIGN_AGENT_PRECOMPILE.call(request);
-    require(ok, "Sovereign agent call failed");
-}
-```
+For recurring work, schedule calls to your own consumer and explicitly implement authorization, secret delegation, fee sponsorship, callback correlation, and retry policy. The single-invocation examples do not create or manage recurring schedules.
 
 ### Agent + Secrets: Authenticated Tool Access
 
@@ -2271,14 +1383,14 @@ import { encrypt, ECIES_CONFIG } from 'eciesjs';
 ECIES_CONFIG.symmetricNonceLength = 12; // see ritual-dapp-secrets
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
 });
 const publicClient = createPublicClient({ chain: ritualChain, transport: http() });
 
-const TEE_SERVICE_REGISTRY = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F' as const;
+const TEE_SERVICE_REGISTRY = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839' as const;
 const CAPABILITY_HTTP_CALL = 0;
 
 // Get executor's public key from on-chain registry
@@ -2297,9 +1409,9 @@ const services = await publicClient.readContract({
           { name: 'paymentAddress', type: 'address' },
           { name: 'teeAddress', type: 'address' },
           { name: 'teeType', type: 'uint8' },
-          { name: 'publicKey', type: 'bytes' },
+          { name: 'executorSecretsAuthPublicKey', type: 'bytes' },
           { name: 'endpoint', type: 'string' },
-          { name: 'certPubKeyHash', type: 'bytes32' },
+          { name: 'mTlsSpkiHash', type: 'bytes32' },
           { name: 'capability', type: 'uint8' },
         ]},
         { name: 'isValid', type: 'bool' },
@@ -2311,17 +1423,27 @@ const services = await publicClient.readContract({
   args: [CAPABILITY_HTTP_CALL, true],
 });
 
-const executor = services[0];
-const executorPubKey = executor.node.publicKey as `0x${string}`;
+// Apply mode-specific eligibility and PIN before sealing secrets. For persistent
+// apps require valid HTTP_CALL, a secrets key and deployment allowlist/exclusions.
+const executor = pickEligibleExecutor(services); // implement policy; never take services[0] blindly
+const executorPubKey = executor.node.executorSecretsAuthPublicKey as `0x${string}`;
 
-// Encrypt secrets with executor's public key using ECIES
-const secretsJson = JSON.stringify({
-  ANTHROPIC_API_KEY: process.env.ANTHROPIC_KEY!,
-  HF_TOKEN: process.env.HF_TOKEN!,
+// Encrypt secrets with executor's public key using ECIES.
+// Each blob is an owner-bound envelope; the three base arrays stay parallel.
+const secretOwner = secretOwnerAddress; // checksummed owner that signs the authorization payload
+const secretEnvelope = JSON.stringify({
+  version: 1,
+  secret_owner: secretOwner,
+  secrets: {
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_KEY!,
+    HF_TOKEN: process.env.HF_TOKEN!,
+  },
 });
+const secretOwners = [secretOwner];
 const encryptedSecrets = [
-  `0x${encrypt(executorPubKey.slice(2), Buffer.from(secretsJson)).toString('hex')}` as `0x${string}`,
+  `0x${Buffer.from(encrypt(executorPubKey.slice(2), Buffer.from(secretEnvelope))).toString('hex')}` as `0x${string}`,
 ];
+const secretSignatures = [secretSignature]; // owner sig over the precompile use_context authorization payload
 
 // Use encryptedSecrets in your Persistent Agent or Sovereign Agent encoding
 ```
@@ -2336,14 +1458,14 @@ Both agent precompiles use HTTP_CALL capability (0) for executor selection:
 import { createPublicClient, http, defineChain } from 'viem';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
 });
 const publicClient = createPublicClient({ chain: ritualChain, transport: http() });
 
-const TEE_SERVICE_REGISTRY = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F' as const;
+const TEE_SERVICE_REGISTRY = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839' as const;
 const CAPABILITY_HTTP_CALL = 0;
 
 const services = await publicClient.readContract({
@@ -2361,9 +1483,9 @@ const services = await publicClient.readContract({
           { name: 'paymentAddress', type: 'address' },
           { name: 'teeAddress', type: 'address' },
           { name: 'teeType', type: 'uint8' },
-          { name: 'publicKey', type: 'bytes' },
+          { name: 'executorSecretsAuthPublicKey', type: 'bytes' },
           { name: 'endpoint', type: 'string' },
-          { name: 'certPubKeyHash', type: 'bytes32' },
+          { name: 'mTlsSpkiHash', type: 'bytes32' },
           { name: 'capability', type: 'uint8' },
         ]},
         { name: 'isValid', type: 'bool' },
@@ -2375,19 +1497,21 @@ const services = await publicClient.readContract({
   args: [CAPABILITY_HTTP_CALL, true],
 });
 
-const executor = services[0];
+// Apply mode-specific eligibility and PIN before sealing secrets. For persistent
+// apps require valid HTTP_CALL, a secrets key and deployment allowlist/exclusions.
+const executor = pickEligibleExecutor(services); // implement policy; never take services[0] blindly
 // Use executor.node.teeAddress as the executor field
-// Use executor.node.publicKey to encrypt secrets with ECIES
+// Use executor.node.executorSecretsAuthPublicKey to encrypt secrets with ECIES
 ```
 
 ### Checking Executor Health
 
-Before submitting an agent job, verify the executor is available:
+Pin an eligible executor before sealing secrets. The following is a registry query sketch, not a production selector. Persistent application selection must additionally check encryption keys and deployment allowlist/exclusions (Preflight #6). Operator health probes are separate diagnostics and do not require making private executor endpoints public:
 
 ```typescript
 import type { PublicClient } from 'viem';
 
-const TEE_SERVICE_REGISTRY = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F' as const;
+const TEE_SERVICE_REGISTRY = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839' as const;
 
 const teeServiceRegistryAbi = [{
   name: 'getServicesByCapability',
@@ -2402,9 +1526,9 @@ const teeServiceRegistryAbi = [{
         { name: 'paymentAddress', type: 'address' },
         { name: 'teeAddress', type: 'address' },
         { name: 'teeType', type: 'uint8' },
-        { name: 'publicKey', type: 'bytes' },
+        { name: 'executorSecretsAuthPublicKey', type: 'bytes' },
         { name: 'endpoint', type: 'string' },
-        { name: 'certPubKeyHash', type: 'bytes32' },
+        { name: 'mTlsSpkiHash', type: 'bytes32' },
         { name: 'capability', type: 'uint8' },
       ]},
       { name: 'isValid', type: 'bool' },
@@ -2413,7 +1537,7 @@ const teeServiceRegistryAbi = [{
   }],
 }] as const;
 
-async function findHealthyExecutor(
+async function findRegisteredExecutor(
   publicClient: PublicClient,
   capability: number,
 ) {
@@ -2425,7 +1549,7 @@ async function findHealthyExecutor(
   });
 
   for (const service of services) {
-    if (service.isValid) {
+    if (service.isValid) { // registry validity only (attestation not expired) — NOT a health check
       return service;
     }
   }
@@ -2433,11 +1557,18 @@ async function findHealthyExecutor(
 }
 
 const CAPABILITY_HTTP_CALL = 0;
-const executor = await findHealthyExecutor(publicClient, CAPABILITY_HTTP_CALL);
+const executor = await findRegisteredExecutor(publicClient, CAPABILITY_HTTP_CALL);
 if (!executor) {
-  throw new Error('No healthy executor available for agent calls');
+  throw new Error('No registered executor available for agent calls');
 }
 ```
+
+`isValid` is not a capacity guarantee. Sovereign examples use the health gate below. For persistent applications, public reachability is not an eligibility requirement; an operator with authorized endpoint access can use these diagnostics:
+
+- **Sovereign (`0x080C`)**: `handlers["0x…080C"]` is present and its payload status is `ok`/`healthy`.
+- **Persistent (`0x0820`)**: `handlers["0x…0820"]` is present, with `claw_spawner.payload.status == "healthy"` (there is **no** `PERSISTENT_AGENT` registry capability — executors register `HTTP_CALL`; consult deployment admission policy and runtime results); identity slots satisfy `10 − max(capacity.live_agent_ids, capacity.distinct_reserved_slots) ≥ 1`; memory slots satisfy `(capacity.limit_budget_bytes − capacity.effective_limit_bytes) // capacity.startup_limit_bytes ≥ 1`; and `capacity.accounting_available == true`.
+
+If a spawn later fails with `CAPACITY_EXCEEDED` (HTTP 409, `retryable=false`), **switch executors — never retry the same one**; the rejection means that executor's admission budget is full for your request.
 
 ---
 
@@ -2447,23 +1578,20 @@ if (!executor) {
 
 | Field | Default |
 |-------|---------|
-| `maxSpawnBlock` | `600` (~3.5 min at ~350ms blocks) |
-| `deliveryGasLimit` | `100,000` |
-| `deliveryMaxFeePerGas` | `1,000,000,000` (1 gwei) |
-| `deliveryMaxPriorityFeePerGas` | `100,000,000` (0.1 gwei) |
+| `phase2Ttl` | `6000` (~35 min at ~350ms blocks; matches the chain's revival constant; was `maxSpawnBlock`) |
+| `callbackEnabled` + callback fields | **callbacks enabled in the example consumer**; callback-free protocol revival uses all-zero callback fields. Liveness rides AgentHeartbeat. All-or-nothing rule: if you set a non-zero `callbackTarget` you must set selector/gas/fee fields yourself; non-zero gas/fee fields with a zero target are invalid. |
 | `provider` | `ANTHROPIC` (0) in example scripts |
 | `model` | Set explicitly to exact provider model id (no protocol default) |
-| `agentRuntime` | `ZEROCLAW` (0) |
+| `agentRuntime` | `HERMES` (2) — the most-supported runtime; ZeroClaw (0) as the alternative |
 
 ### Sovereign Agent (0x080C) Suggested Starting Values
 
 | Field | Default |
 |-------|---------|
-| `pollIntervalBlocks` | `5` |
-| `maxPollBlock` | `6000` |
-| `deliveryGasLimit` | `3,000,000` |
-| `deliveryMaxFeePerGas` | `1,000,000,000` (1 gwei) |
-| `deliveryMaxPriorityFeePerGas` | `100,000,000` (0.1 gwei) |
+| `phase2Ttl` | `6000` — Phase 2 deadline offset in blocks |
+| `callbackGasLimit` | `3,000,000` (callbacks are MANDATORY for sovereign — `callbackEnabled: true`, `callbackTarget` = consumer) |
+| `callbackMaxFeePerGas` | `1,000,000,000` (1 gwei) |
+| `callbackMaxPriorityFeePerGas` | `100,000,000` (0.1 gwei) |
 | `cliType` | `CRUSH` (5) — recommended for multi-provider |
 | `model` | Set explicitly to exact provider model id (no protocol default) |
 | `maxTurns` | `50` |
@@ -2513,11 +1641,14 @@ For canonical system-contract addresses, ABI surfaces, and callback security pat
 
 | Contract | Address |
 |----------|---------|
-| TEEServiceRegistry | `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` |
-| RitualWallet | `0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948` |
-| AsyncJobTracker | `0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5` |
-| AsyncDelivery | `0x5A16214fF555848411544b005f7Ac063742f39F6` |
-| Scheduler | `0x56e776BAE2DD60664b69Bd5F865F1180ffB7D58B` |
+| TEEServiceRegistry | `0xf4495DC72143D44A93AB0ecE4d6D63a216b27839` |
+| RitualWallet | `0xF04076756d8129Baec46Dc0F1c526Baec490C393` |
+| AsyncJobTracker | `0xf00385449fD961925A0B125F5f30b29B682D4bFb` |
+| AsyncDelivery | `0x508f57AE70967Da28AE0Ab6b95532878c4D0F440` |
+| Scheduler | `0x4E0abeE2233D73E66382b45244F7459B34E1490E` |
+| AgentHeartbeat | `0xDeeA4Df0C958966ED75570a05430BB0D4844a8cc` |
+| AgentIdentityRegistry | `0x2cbF50F833a3AEfb5c5B27068052cB5585F5c087` |
+| SecretsAccessControl | `0x0cEae62e2082829226eF5821Bb662483Db17A71F` |
 | Sovereign Agent Precompile | `0x000000000000000000000000000000000000080C` |
 
 ### Troubleshooting
@@ -2525,27 +1656,34 @@ For canonical system-contract addresses, ABI surfaces, and callback security pat
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `cipher: message authentication failed` | ECIES nonce length mismatch | See `ritual-dapp-secrets` — nonce must be 12, not the library default of 16. |
-| Commitment mined, `hasPendingJobForSender` = true, but Phase 1 never settles. No errors anywhere. | ECIES encryption config wrong (nonce length or cipher). Executor cannot decrypt and silently drops the job. | Fix encryption per `ritual-dapp-secrets`. Use a fresh sender address to unblock. See "Debugging Silent Failures" below. |
-| Tx accepted but never mined (silent drop) | Sender has a pending async job | Wait for previous job to complete or use a different sender address. Check: `AsyncJobTracker.hasPendingJobForSender(sender)` |
-| `insufficient wallet balance` | RitualWallet not funded | Deposit RITUAL: `RitualWallet.deposit{value: X}(lockDuration)`. Lock must extend past `currentBlock + ttl`. |
-| `invalid async payload: SovereignAgentRequest: Field extraction failed` | ABI encoding mismatch | Verify StorageRef uses `(string,string,string)` not `(string,string,bytes)`. Verify all 23 fields are present. |
-| Phase 2 never arrives | Executor unreachable or TTL expired | Check `TEEServiceRegistry.getServicesByCapability(0, true)` returns valid executors. Increase `ttl`. |
+| Commitment mined, `hasPendingJobForTxOrigin` = true, but Phase 1 never settles. No errors anywhere. | ECIES encryption config wrong (nonce length or cipher). Executor cannot decrypt and silently drops the job. | Fix encryption per `ritual-dapp-secrets`. Use a fresh sender address to unblock. See "Debugging Silent Failures" below. |
+| Tx accepted but never mined (silent drop) | Sender has a pending async job | Wait for previous job to complete or use a different sender address. Check: `AsyncJobTracker.hasPendingJobForTxOrigin(txOrigin)` |
+| `insufficient wallet balance` | RitualWallet not funded (sponsor `availableBalance` < required reserve) | Deposit RITUAL: `RitualWallet.deposit{value: X}()`. For a sponsored child payer, the sponsor must also `approve(caller, amount)` so `allowance(sponsor, caller) >= reserve` (otherwise `Insufficient wallet allowance`). |
+| `invalid async payload` / `agent envelope is not canonical ABI encoding` / `sovereign agent payload is not canonical ABI encoding` | ABI encoding mismatch | Verify StorageRef uses `(string,string,string)` not `(string,string,bytes)`. The decoders enforce the flat **13-field AgentAsyncEnvelope** with **byte-exact canonical re-encoding** (re-encode must equal input — trailing or short bytes rejected), strict callback all-or-nothing validation, and an exact **16-field sovereign V1 payload** count (`expected 16 sovereign agent V1 payload fields`, `version` must be 1). `encryptedSecrets` must be `bytes[]` with parallel `secretOwners`/`secretSignature` arrays of **equal length** (all three empty together when no secrets). The old shaped 26-field sovereign / 29-field persistent layouts are rejected. |
+| Phase 2 never arrives (persistent agent armed, but no container / no heartbeat) | **Most common: the spawn was committed to an executor that doesn't run the `0x0820` handler** (a random HTTP-capable executor is not necessarily persistent-capable). Also: executor unreachable, TTL expired, or the spawn actually **failed and the failure delivery was shed** — saturated executors shed failure deliveries, so a failed spawn can present as a pure TTL timeout with nothing on-chain. | **First**, confirm you pinned a persistent executor whose `/health` shows `handlers["0x…0820"]` with `claw_spawner.payload.status=="healthy"` (preflight #6) — registry presence alone is a trap. Then check executor reachability/logs and increase `ttl`. Do not assume "chain/executor down" until you've verified the executor and ruled out a shed failure delivery. |
+| Commitment mined, but the job **never settles** at all (no `JobAdded` settlement, no errorMessage, origin stays locked) | Phase-1 failure family A: **authz/decode failure → job dropped** (`Success:false`). The executor rejected authorization (agentId operator, secrets delegation) or could not decode the request; nothing settles on-chain. | Fix authorization (`setAgentOperator`, `grantAccess` to the child contract) and payload encoding. Contrast with the settled-with-error family below — "no Phase 2" alone doesn't identify which happened. |
+| Job **settled WITH an error string** (`Success:true` + `errorMessage`, Phase-1 fee charged, no container) | Phase-1 failure family B: **secrets/DKMS/DA errors settle with an error** rather than dropping. Includes multiple distinct secret owners — all `encrypted_secrets` blobs must share exactly **ONE** owner. | Read the `errorMessage`; fix the secrets bundle (single owner, correct ECIES target), DKMS derivation, or DA credentials. The Phase-1 fee is spent either way — preflight before retrying. A sovereign runtime crash settles with the fixed `errorMessage` `diagnostic output withheld (stdout=N bytes, stderr=M bytes)` — the executor never forwards the agent process output; pull the executor/container logs to see it. |
+| Phase 1 settled, then the launch dies ~2 minutes later with `PRELAUNCH_FUNDING_FAILED` | Prelaunch primary wallet (Phase-1 response index 5, `gatewayToken`) was not funded **≥ 0.01 RIT within the 120 s window** (executor polls every 1 s). | Non-retryable — the launch is dead. On the next attempt, watch for Phase-1 settlement and fund the decoded prelaunch wallet immediately. |
+| Spawn rejected with `CAPACITY_EXCEEDED` (HTTP 409, `retryable=false`) | The pinned executor admission budget is full. | Reconcile the failed launch. Wait for confirmed capacity or explicitly select another eligible executor and re-seal secrets; do not repeatedly submit the same failed launch. |
+| `cast send` fails with `already known` | The load-balanced RPC double-forwarded the submission — the tx IS in the pool and will mine. | Recover the hash by (sender, nonce) — see `send_tx` in `examples/persistent-agent/run.sh` — and wait for it to mine. **Never blind-resubmit**: you would race your own tx. |
+| Job settles with error `signature signer does not match` | `use_context` casing mismatch in the secret-authorization preimage. | The context string must be lowercase-exact: `precompile:0x0000000000000000000000000000000000000820` (persistent) / `…081b` (DKMS). Re-sign with the exact lowercase string. |
 | `NonEmptyPaddingBytes: Boolean must be either 0x0 or 0x1` | Decoding event data directly instead of unwrapping outer `bytes` | Event data is ABI-encoded `bytes`. Decode outer `bytes` first, then decode inner response tuple. |
 | Empty text response from Claude Code | Claude Code version outdated in executor image | Not a client issue — executor needs updated sovereign-agent container image. |
 | `sovereign_agent_type N is not currently supported` | Invalid or unsupported `cliType` value | Use 0 (ClaudeCode), 5 (Crush), or 6 (ZeroClaw). Values 1-4 are unavailable in the supported executor path. |
 | `waitForTransactionReceipt` hangs after submitting an agent call | Phase 1 hasn't settled (usually because executor can't decrypt). Receipt won't appear until settlement. | Don't block on receipt for long-running async precompile txs. Use `cast send --async` or `sendTransaction` and poll for the Phase 2 event by `jobId` topic instead. |
+| Agent was **ACTIVE**, then `getAssignment(agentId).revivalStatus` shows **FAILED** | The agent's own runtime crashed after starting — commonly a channel/config force-enabled that the container can't handle, or **unescaped LLM output** breaking a JSON body the agent POSTs. | Pull the executor/container logs; JSON-encode & validate all model output before using it in a request; fix the config. Heartbeat revives up to `MAX_REVIVAL_ATTEMPTS` (3) then removes the slot. This is an agent-code bug, not a chain issue. |
 
 ### Debugging Silent Failures
 
-When a sovereign agent call produces a commitment (`hasPendingJobForSender` = true) but Phase 1 never settles and no error is emitted anywhere, work through this checklist in order:
+When a sovereign agent call produces a commitment (`hasPendingJobForTxOrigin` = true) but Phase 1 never settles and no error is emitted anywhere, work through this checklist in order:
 
 1. **Check ECIES encryption config.** This is the #1 cause. See `ritual-dapp-secrets` for the mandatory nonce length and setup. A wrong nonce produces `MAC check failed` inside the TEE — but this error is never surfaced on-chain.
 
-2. **Check you encrypted to the correct public key.** The key must be `node.publicKey` from `TEEServiceRegistry.getServicesByCapability()`. Not `paymentAddress`, not `teeAddress` — those are Ethereum addresses, not ECIES public keys.
+2. **Check you encrypted to the correct public key.** The key must be `node.executorSecretsAuthPublicKey` from `TEEServiceRegistry.getServicesByCapability()`. Not `paymentAddress`, not `teeAddress` — those are Ethereum addresses, not ECIES public keys.
 
 3. **Check the secrets JSON format.** Must be valid JSON with the exact key names the provider expects: `{"ANTHROPIC_API_KEY":"sk-..."}`, not `{"api_key":"sk-..."}` and not a bare string.
 
-4. **Executor routing is handled entirely by the protocol.** You only need `teeAddress` and `publicKey` from `TEEServiceRegistry`. The `endpoint` field in the registry is internal executor infrastructure — it is not relevant for dApp submission and should not be used for routing or health checks.
+4. **Check the pinned executor and deployment policy.** Routing uses field 0; there is no automatic fallback. Re-read registry validity, encryption key, allowlist/exclusions and the existing job result. Authorized operator diagnostics can inspect spawner/capacity; an empty registry endpoint is not a failure. Switching executor requires newly sealed secrets and an explicit new launch.
 
 5. **Test encryption locally before submitting on-chain.** Encrypt a payload, then decrypt it with the same keypair using the other language's library (both configured per `ritual-dapp-secrets`). If local decryption fails, on-chain will fail too — and it will fail silently.
 

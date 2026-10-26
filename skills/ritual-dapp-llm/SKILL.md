@@ -7,14 +7,14 @@ description: LLM inference patterns for Ritual dApps. Use when building dApps wi
 
 ## Overview
 
-The LLM precompile (`0x0802`) enables on-chain AI inference via TEE-verified executors. For current production usage, pin model selection to `zai-org/GLM-4.7-FP8`. Conversation history is stored as plaintext JSONL on the DA provider (GCS, HuggingFace, or Pinata) — see `ritual-dapp-da` for StorageRef format and credential encoding.
+The LLM precompile (`0x0802`) enables on-chain AI inference via TEE-verified executors. For current production usage, pin model selection to `deepseek-ai/DeepSeek-V4-Flash-0731`. Conversation history is stored as plaintext JSONL on the DA provider (GCS, HuggingFace, or Pinata) — see `ritual-dapp-da` for StorageRef format and credential encoding.
 
 > **Execution Model: Short-running async.** LLM Call (0x0802) is async. The builder simulates your tx (fresh simulation) and creates a commitment, the executor performs inference off-chain, and the builder re-executes your deferred tx with the settled output injected in `spcCalls` (fulfilled replay). You do not register a callback function; you read settled output from the transaction receipt. See `ritual-dapp-overview` for the full transaction lifecycle.
 >
-> **At most one short-running async call per transaction.** You cannot make two async precompile calls in one transaction. You can still combine one async call with synchronous precompiles (JQ, ONNX, etc.).
+> **At most one short-running async call per transaction.** You cannot make two async precompile calls in one transaction. You can still combine one async call with synchronous precompiles (JQ, etc.).
 
 **Precompile address**: `0x0000000000000000000000000000000000000802`
-**Chain ID**: 1979 (Ritual Chain)
+**Chain ID**: 784 (Ritual Chain)
 **Transaction type**: Short-running async (commitment → executor processes → your tx + settlement in same block)
 
 ### How It Works
@@ -34,13 +34,17 @@ The LLM precompile (`0x0802`) enables on-chain AI inference via TEE-verified exe
 
 For streaming, a separate SSE service delivers tokens in real-time while the on-chain settlement happens asynchronously.
 
+### Native LLM vs OpenAI-compatible HTTP
+
+Use the native LLM precompile for registered Ritual models, its typed chat ABI, conversation JSONL lifecycle, tool calls, and standardized stream events. Use HTTP/Long HTTP with RITHTTP1 when the target is an arbitrary OpenAI-compatible endpoint and you need a large DA-backed `messages` value, private chat history or tools, post-hydration API secrets, selected output fan-out, a held response, or provider-native SSE. That route remains an HTTP call and does not inherit the LLM precompile's registry, pricing, response ABI, or token schema. Read [`../ritual-dapp-http/references/rithttp1.md`](../ritual-dapp-http/references/rithttp1.md) and, for private chat, [`../ritual-dapp-http/references/rithttp1-private-io.md`](../ritual-dapp-http/references/rithttp1-private-io.md).
+
 ### Execution Prerequisites (Early)
 
 - **Registry + capability:** select executors from `TEEServiceRegistry` using LLM capability (`Capability.LLM = 1`).
-- **What to use from registry:** use executor address (`teeAddress`) and `publicKey`.
+- **What to use from registry:** use executor address (`teeAddress`) and `executorSecretsAuthPublicKey`.
 - **What not to use:** do **not** read/use the registry `endpoint` field in this dapp flow.
-- **Wallet funding:** deposit in `RitualWallet` before inference so async settlement can complete.
-- **Model policy:** for current production, pin to `zai-org/GLM-4.7-FP8`.
+- **Wallet funding:** deposit in `RitualWallet` before inference. If the account sponsoring fees (the ABI `sponsor` field) is DIFFERENT from the caller that invokes the precompile (e.g. a user EOA sponsoring a separate consumer contract), the sponsor must first call `RitualWallet.approve(caller, amount)` (e.g. `MAX_ALLOWANCE = 2**256-1`); otherwise the reservation reverts on the allowance check. When you self-sponsor (`sponsor == caller`, e.g. a direct EOA precompile call or a consumer contract that sets `sponsor = address(this)`), the allowance check is skipped and a deposit alone is sufficient.
+- **Model policy:** for current production, pin to `deepseek-ai/DeepSeek-V4-Flash-0731`.
 
 ---
 
@@ -48,8 +52,8 @@ For streaming, a separate SSE service delivers tokens in real-time while the on-
 
 Before any example, lock these in:
 
-- Always call precompile `0x0802` with the full **30-field** ABI tuple. Submitting any other field count returns RPC `-32602 invalid async payload` and the tx never lands. See "Error Reference" for the full surface.
-- For current production, use **`zai-org/GLM-4.7-FP8`** only. It is a reasoning model with a hardcoded `<think>...</think>` chain-of-thought, which has two practical consequences:
+- Always call precompile `0x0802` with the full **32-field** ABI tuple. Submitting any other field count returns RPC `-32602 invalid async payload` and the tx never lands. See "Error Reference" for the full surface.
+- For current production, use **`deepseek-ai/DeepSeek-V4-Flash-0731`** only. In reasoning mode it emits a `<think>...</think>` chain-of-thought, which has two practical consequences:
   - Set `maxCompletionTokens` to **at least 4096**. The `<think>` block typically consumes 500–1500 tokens before the final answer is emitted; smaller caps risk returning empty `content` with `finish_reason: "length"`. 4096 is the recommended baseline for any substantive reply on this model.
   - Set `ttl` to **at least 60 blocks** (300 is a safe default). Reasoning inference can take 10–40 seconds wall-clock; the default `30` blocks risks expiration.
 - `convoHistory` is a **StorageRef tuple**. See **`ritual-dapp-da`** for the full StorageRef contract — supported platforms (`gcs`, `hf`, `pinata`), path conventions per platform, credential JSON formats, the meaning of an empty `('', '', '')` tuple, and end-to-end DA debugging. Do not improvise from this skill alone — DA has its own surface area and `ritual-dapp-da` is the source of truth.
@@ -65,11 +69,12 @@ This is the single most common source of mysterious LLM call failures on Ritual.
 
 | Cap | Where it lives | What it controls | What happens when you hit it |
 |-----|---------------|------------------|--------------------|
-| `max_completion_tokens` (ABI field 10, `int256`) | Your precompile input | **Output** generation budget only — caps the number of tokens the model is allowed to *produce*, not the input prompt size. Sent through to the upstream model as OpenAI-style `max_completion_tokens`. | The model stops generating early; you get a successful response with `finish_reason: "length"`. Not an error. |
-| `ttl` (ABI field 2, `uint256`) | Your precompile input | **On-chain** wait budget — the executor must produce a result within `ttl` blocks of the commitment, otherwise the tx expires. | `Request expired` error in the response envelope. |
-| Upstream **context window** (a.k.a. `max_seq_len`) | The **model**, registered on chain in `ModelPricingRegistry` and *separately* configured on whatever inference endpoint the executor actually talks to | Total prompt + completion tokens the upstream model will accept. Examples: `zai-org/GLM-4.7-FP8` is registered with `max_seq_length: 128000`. | The upstream call returns a **non-200 HTTP error**; the precompile envelope comes back with `has_error=true` and a freeform `error_message` string like `HTTP request failed with status 400: ... context length exceeded ...`. The precompile execution itself is still considered "successful" at the chain layer (still pays the `LLM_ERROR_EXECUTOR_FEE_WEI = 5×10¹¹ wei` error fee). |
+| `max_completion_tokens` (ABI field 12, `int256`) | Your precompile input | **Output** generation budget only — caps the number of tokens the model is allowed to *produce*, not the input prompt size. Sent through to the upstream model as OpenAI-style `max_completion_tokens`. | The model stops generating early; you get a successful response with `finish_reason: "length"`. Not an error. |
+| `ttl` (ABI field 4, `uint256`) | Your precompile input | **On-chain** wait budget — the executor must produce a result within `ttl` blocks of the commitment, otherwise the tx expires. | `Request expired` error in the response envelope. |
+| Upstream **context window** (a.k.a. `max_seq_len`) | The **model**, registered on chain in `ModelPricingRegistry` and *separately* configured on whatever inference endpoint the executor actually talks to | Total prompt + completion tokens the upstream model will accept. Example: `deepseek-ai/DeepSeek-V4-Flash-0731` is registered with `max_seq_length: 1048576`. | The upstream call returns a **non-200 HTTP error**; the precompile envelope comes back with `has_error=true` and a freeform `error_message` string like `HTTP request failed with status 400: ... context length exceeded ...`. The precompile execution itself is still considered "successful" at the chain layer (still pays the `LLM_ERROR_EXECUTOR_FEE_WEI = 1×10¹⁶ wei` (0.01 RIT) error fee). |
 
-> **The on-chain `max_seq_length` is the model's nominal capability, not the operational deployed cap.** The actual inference endpoint behind a model can be configured with a smaller `--max-model-len` (or equivalent) than the registered max. As of writing, the live Ritual gateway caps `zai-org/GLM-4.7-FP8` at **64K = 65,536 tokens** despite its 128K registration. Always treat the **smaller of the two** as your real budget — registered max gets you past chain-level validation, but the upstream endpoint can still reject at runtime. If you don't know the operational cap for a deployment, assume 64K for hosted GLM until you've measured it.
+
+> **Output size cap:** the ABI-encoded LLM output the executor settles on-chain is capped at 50 KiB (`LLM_CALL_PHASE1_MAX_OUTPUT_BYTES`); a larger settlement is a `SettlementConstraintViolation` and the block is rejected, so bound `max_completion_tokens` for very long completions.
 
 **The executor does NOT preflight token counts.** Oversized prompts only fail when the upstream model rejects them — the executor doesn't count tokens before sending the call. You cannot rely on `max_completion_tokens` to protect you from context-window overflow; it is a separate cap.
 
@@ -87,7 +92,7 @@ When the upstream model rejects your prompt, returns invalid JSON, errors out fo
 - `completion_data` is empty
 - `error_message` is a **freeform string** describing the failure (e.g. `HTTP request failed with status 400: ...`, `Failed to parse response JSON: ...`, `Model 'X' is not available. Available models: [...]`, `Streaming is requested but not enabled in executor configuration`, etc.). There is **no structured error code enum** — only the string. Pattern-match defensively, do not assume a fixed taxonomy.
 
-**Consumer-contract requirement: always decode `has_error` first, never call into `completion_data` until you have verified `has_error == false`.** The Solidity consumer pattern in Section 7 shows this. If your contract assumes `completion_data` is always JSON conforming to your `response_format` schema and decodes it without checking `has_error`, you will revert (or worse, parse garbage) on the first upstream failure. This is exactly the failure path one early adopter ran into: the upstream model errored on a context-window overflow, the executor returned `has_error=true` with a freeform error string, and the contract assumed it would always get a clean JSON object back, so on-chain JSON parsing blew up.
+**Consumer-contract requirement: always decode `has_error` first, never call into `completion_data` until you have verified `has_error == false`.** The Solidity consumer pattern in Section 7 shows this. If your contract assumes `completion_data` is always JSON conforming to your `response_format` schema and decodes it without checking `has_error`, you will revert (or worse, parse garbage) on the first upstream failure. Typical failure path: the upstream model errors on a context-window overflow, the executor returns `has_error=true` with a freeform error string, and a contract that assumes a clean JSON object blows up parsing it on-chain.
 
 The Section 5 "Response Format — Structured Output" path (`response_format` with `json_schema`) is **best-effort**. The executor passes your schema through to the upstream model, but does not locally re-validate the model's output against the schema. If the model returns invalid JSON despite being asked for JSON mode, you will see that invalid JSON in `completion_data`, not as `has_error=true`. So even with structured-output mode, your decoder must handle:
 1. `has_error == true` (upstream rejected the request entirely).
@@ -109,7 +114,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import type { Address } from 'viem';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
@@ -125,11 +130,12 @@ const walletClient = createWalletClient({
 const LLM_PRECOMPILE = '0x0000000000000000000000000000000000000802' as const;
 
 const executorAddress: Address = '0x...'; // TEE executor address
+const sponsorAddress: Address = account.address; // RitualWallet account backing async fees (sponsor); here the sponsor is also the caller, so only a deposit is required — no approve needed
 
 // Simple inference with minimal parameters
 const encoded = encodeAbiParameters(
   parseAbiParameters([
-    'address, bytes[], uint256, bytes[], bytes,',
+    'address, address, address[], bytes[], uint256, bytes[], bytes,',
     'string, string, int256, string, bool, int256, string, string,',
     'uint256, bool, int256, string, bytes, int256, string, string, bool,',
     'int256, bytes, bytes, int256, int256, string, bool,',
@@ -137,6 +143,8 @@ const encoded = encodeAbiParameters(
   ].join('')),
   [
     executorAddress,
+    sponsorAddress,         // sponsor: RitualWallet account backing this job (often your own address)
+    [],                     // secretOwners: address[] — one owner per encryptedSecrets blob (parallel arrays)
     [],                     // encryptedSecrets
     300n,                   // ttl: blocks until expiry (max 500; increase if requests time out)
     [],                     // secretSignatures
@@ -145,7 +153,7 @@ const encoded = encodeAbiParameters(
       { role: 'system', content: 'You are a helpful DeFi assistant.' },
       { role: 'user', content: 'Explain impermanent loss in one paragraph.' },
     ]),
-    'zai-org/GLM-4.7-FP8',
+    'deepseek-ai/DeepSeek-V4-Flash-0731',
     0n, '', false, -1n, '', '',
     1n, true, 0n, 'medium', '0x', -1n, 'auto', '',
     false,                   // stream
@@ -171,6 +179,7 @@ import { encodeAbiParameters, parseAbiParameters } from 'viem';
 import type { Address } from 'viem';
 
 const executorAddress: Address = '0x...';
+const sponsorAddress: Address = '0x...'; // RitualWallet account backing async fees (sponsor)
 
 // Encode request with full control using raw ABI encoding
 const messagesJson = JSON.stringify([
@@ -180,7 +189,7 @@ const messagesJson = JSON.stringify([
 
 const encoded = encodeAbiParameters(
   parseAbiParameters([
-    'address, bytes[], uint256, bytes[], bytes,',
+    'address, address, address[], bytes[], uint256, bytes[], bytes,',
     'string, string, int256, string, bool, int256, string, string,',
     'uint256, bool, int256, string, bytes, int256, string, string, bool,',
     'int256, bytes, bytes, int256, int256, string, bool,',
@@ -188,16 +197,18 @@ const encoded = encodeAbiParameters(
   ].join('')),
   [
     executorAddress,        // executor
+    sponsorAddress,         // sponsor: RitualWallet account backing async fees
+    [],                     // secretOwners: address[] — one owner per encryptedSecrets blob (parallel arrays)
     [],                     // encryptedSecrets
     300n,                   // ttl: blocks until expiry (max 500; increase if requests time out)
     [],                     // secretSignatures
     '0x',                   // userPublicKey
     messagesJson,           // messagesJson
-    'zai-org/GLM-4.7-FP8', // model
+    'deepseek-ai/DeepSeek-V4-Flash-0731', // model
     100n,                   // frequencyPenalty (0.1 × 1000)
     '',                     // logitBiasJson
     false,                  // logprobs
-    4096n,                  // maxCompletionTokens (>=4096 — GLM-4.7-FP8 is a reasoning model, see ABI Context)
+    4096n,                  // maxCompletionTokens (>=4096 — reasoning headroom, see ABI Context)
     '',                     // metadataJson
     '',                     // modalitiesJson
     1n,                     // n
@@ -235,28 +246,30 @@ const hash = await walletClient.sendTransaction({
 ```typescript
 import { parseEther } from 'viem';
 
-const RITUAL_WALLET = '0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948' as const;
+const RITUAL_WALLET = '0xF04076756d8129Baec46Dc0F1c526Baec490C393' as const;
 const LLM_PRECOMPILE = '0x0000000000000000000000000000000000000802' as const;
 
-// Step 1: Deposit RITUAL to cover fees
+// Step 1: Deposit RITUAL to cover fees (credited to availableBalance immediately — no lock)
 const depositHash = await walletClient.writeContract({
   address: RITUAL_WALLET,
   abi: [{
     name: 'deposit',
     type: 'function',
     stateMutability: 'payable',
-    inputs: [{ name: 'lockDuration', type: 'uint256' }],
+    inputs: [],
     outputs: [],
   }] as const,
   functionName: 'deposit',
-  args: [5000n],
-  value: parseEther('0.02'),
+  args: [],
+  // Must cover the worst-case escrow for the model (see "Worst-case escrow vs. actual fee"):
+  // DeepSeek-V4-Flash-0731 reserves ~2.26 RIT per in-flight call, so 0.02 RIT would revert at submission.
+  value: parseEther('0.5'),
 });
 
 // Step 2: Submit the LLM inference directly to the precompile
 const encoded = encodeAbiParameters(
   parseAbiParameters([
-    'address, bytes[], uint256, bytes[], bytes,',
+    'address, address, address[], bytes[], uint256, bytes[], bytes,',
     'string, string, int256, string, bool, int256, string, string,',
     'uint256, bool, int256, string, bytes, int256, string, string, bool,',
     'int256, bytes, bytes, int256, int256, string, bool,',
@@ -264,11 +277,12 @@ const encoded = encodeAbiParameters(
   ].join('')),
   [
     executorAddress,
-    [], 300n, [], '0x',
+    sponsorAddress,         // sponsor: RitualWallet account backing async fees
+    [], [], 300n, [], '0x',  // secretOwners, encryptedSecrets, ttl, secretSignatures, userPublicKey
     JSON.stringify([
       { role: 'user', content: 'Summarize the latest crypto news' },
     ]),
-    'zai-org/GLM-4.7-FP8',
+    'deepseek-ai/DeepSeek-V4-Flash-0731',
     0n, '', false, 1024n, '', '',
     1n, true, 0n, 'medium', '0x', -1n, 'auto', '',
     false,                   // stream
@@ -296,6 +310,7 @@ import { encodeAbiParameters, parseAbiParameters } from 'viem';
 import type { Address, Hex } from 'viem';
 
 const executor: Address = '0x...';
+const sponsor: Address = '0x...'; // RitualWallet account backing async fees (sponsor)
 
 const messagesJson = JSON.stringify([
   { role: 'system', content: 'You are a helpful assistant.' },
@@ -305,7 +320,7 @@ const messagesJson = JSON.stringify([
 // Encode for on-chain submission using raw ABI encoding
 const encoded: Hex = encodeAbiParameters(
   parseAbiParameters([
-    'address, bytes[], uint256, bytes[], bytes,',
+    'address, address, address[], bytes[], uint256, bytes[], bytes,',
     'string, string, int256, string, bool, int256, string, string,',
     'uint256, bool, int256, string, bytes, int256, string, string, bool,',
     'int256, bytes, bytes, int256, int256, string, bool,',
@@ -313,16 +328,18 @@ const encoded: Hex = encodeAbiParameters(
   ].join('')),
   [
     executor,               // executor
+    sponsor,                // sponsor: RitualWallet account backing async fees
+    [],                     // secretOwners: address[] — one owner per encryptedSecrets blob (parallel arrays)
     [],                     // encryptedSecrets
     300n,                   // ttl: blocks until expiry (max 500; increase if requests time out)
     [],                     // secretSignatures
     '0x',                   // userPublicKey
     messagesJson,           // messagesJson
-    'zai-org/GLM-4.7-FP8', // model
+    'deepseek-ai/DeepSeek-V4-Flash-0731', // model
     0n,                     // frequencyPenalty
     '',                     // logitBiasJson
     false,                  // logprobs
-    4096n,                  // maxCompletionTokens (>=4096 — GLM-4.7-FP8 is a reasoning model, see ABI Context)
+    4096n,                  // maxCompletionTokens (>=4096 — reasoning headroom, see ABI Context)
     '',                     // metadataJson
     '',                     // modalitiesJson
     1n,                     // n
@@ -373,9 +390,16 @@ const [id, obj, created, model, , , choicesCount, choicesData, usageData] =
     completionData,
   );
 
-// usageData: (uint256 promptTokens, uint256 completionTokens, uint256 totalTokens)
-const [promptTokens, completionTokens, totalTokens] =
-  decodeAbiParameters(parseAbiParameters('uint256, uint256, uint256'), usageData);
+// usageData: (uint256 promptTokens, uint256 completionTokens, uint256 totalTokens, uint256 cachedTokens)
+// usageData is normally 4 words; a 3-word payload (cachedTokens omitted) is also valid — decode
+// length-aware. cachedTokens = prefix-cache hits, billed at the registry cached discount;
+// consensus clamps it to <= promptTokens.
+const usageBytes = (usageData.length - 2) / 2;
+const usageWords = (usageBytes >= 128
+  ? decodeAbiParameters(parseAbiParameters('uint256, uint256, uint256, uint256'), usageData)
+  : decodeAbiParameters(parseAbiParameters('uint256, uint256, uint256'), usageData)) as readonly bigint[];
+const [promptTokens, completionTokens, totalTokens] = usageWords;
+const cachedTokens = usageWords[3] ?? 0n;
 
 // Each choicesData element: (uint256 index, string finishReason, bytes messageData)
 // messageData: (string role, string content, string refusal, uint256 toolCallsCount, bytes[] toolCallsData)
@@ -387,7 +411,7 @@ if (choicesCount > 0n && choicesData.length > 0) {
   console.log('Model:', model);
   console.log('Content:', content);
   console.log('Finish reason:', finishReason);
-  console.log('Usage:', { prompt: promptTokens, completion: completionTokens, total: totalTokens });
+  console.log('Usage:', { prompt: promptTokens, completion: completionTokens, total: totalTokens, cached: cachedTokens });
 }
 
 // modelMetadataBytes: (string model, uint256 paramCount, string datatype, uint256 thetaScaled, uint256 maxSeqLen)
@@ -443,9 +467,11 @@ function extractLLMResult(receipt: TransactionReceipt): Hex | null {
 ```
 EXECUTOR_REQUEST_ABI (base fields):
   executor            address    — TEE executor address
+  sponsor             address    — RitualWallet account whose balance/escrow backs the job (may differ from msg.sender; must be non-zero)
+  secretOwners        address[]  — one non-zero owner address per encrypted secret blob (parallel to encryptedSecrets/secretSignatures; all three must have equal length, and all empty together when there are no secrets)
   encryptedSecrets    bytes[]    — ECIES-encrypted secret blobs
   ttl                 uint256    — blocks until expiry
-  secretSignatures    bytes[]    — sender signature over secrets
+  secretSignatures    bytes[]    — per-secret signature over the LLM-precompile secret-authorization preimage (use_context `precompile:0x0000000000000000000000000000000000000802`), binding domain/chainId/executor/owner/keccak256(encryptedSecrets) — NOT a plain signature over the ciphertext. A signature minted with the HTTP context (0x0801) will NOT validate for an LLM (0x0802) request.
   userPublicKey       bytes      — leave `0x` unless required by your chosen user-key encryption flow
 
 LLM_CALL_REQUEST_ABI (extends executor):
@@ -544,16 +570,16 @@ const messages: LLMMessage[] = [
 
 const encoded = encodeAbiParameters(
   parseAbiParameters([
-    'address, bytes[], uint256, bytes[], bytes,',
+    'address, address, address[], bytes[], uint256, bytes[], bytes,',
     'string, string, int256, string, bool, int256, string, string,',
     'uint256, bool, int256, string, bytes, int256, string, string, bool,',
     'int256, bytes, bytes, int256, int256, string, bool,',
     '(string,string,string)',
   ].join('')),
   [
-    executor, [], 300n, [], '0x',
+    executor, sponsor, [], [], 300n, [], '0x',  // secretOwners, encryptedSecrets, ttl, secretSignatures, userPublicKey
     JSON.stringify(messages),
-    'zai-org/GLM-4.7-FP8',
+    'deepseek-ai/DeepSeek-V4-Flash-0731',
     0n, '', false, -1n, '', '',
     1n, true, 0n, 'medium', '0x', -1n, 'auto', '',
     false,                   // stream
@@ -571,9 +597,9 @@ const encoded = encodeAbiParameters(
 Get this path working first:
 
 1. Select a valid executor from `TEEServiceRegistry` using `Capability.LLM (1)`.
-2. Pin model to `zai-org/GLM-4.7-FP8`.
+2. Pin model to `deepseek-ai/DeepSeek-V4-Flash-0731`.
 3. Deposit in `RitualWallet` before sending inference calls.
-4. Encode the 30-field request correctly.
+4. Encode the 32-field request correctly.
 5. Send transaction to `0x0802`.
 6. Wait for async settlement and read `spcCalls`.
 7. Decode response ABI and handle `hasError`.
@@ -642,18 +668,18 @@ const responseFormatData = encodeAbiParameters(
 
 const encoded = encodeAbiParameters(
   parseAbiParameters([
-    'address, bytes[], uint256, bytes[], bytes,',
+    'address, address, address[], bytes[], uint256, bytes[], bytes,',
     'string, string, int256, string, bool, int256, string, string,',
     'uint256, bool, int256, string, bytes, int256, string, string, bool,',
     'int256, bytes, bytes, int256, int256, string, bool,',
     '(string,string,string)',
   ].join('')),
   [
-    executor, [], 300n, [], '0x',
+    executor, sponsor, [], [], 300n, [], '0x',  // secretOwners, encryptedSecrets, ttl, secretSignatures, userPublicKey
     JSON.stringify([
       { role: 'user', content: 'Analyze ETH as an investment for Q1 2026.' },
     ]),
-    'zai-org/GLM-4.7-FP8',
+    'deepseek-ai/DeepSeek-V4-Flash-0731',
     0n, '', false, -1n, '', '',
     1n, true, 0n, 'medium',
     responseFormatData,     // responseFormatData
@@ -681,6 +707,8 @@ const encoded = encodeAbiParameters(
 
 For real-time token delivery, use the Ritual streaming service. The on-chain transaction initiates the request; an SSE connection delivers tokens as they're generated.
 
+This section documents the native LLM stream schema. RITHTTP1 uses the same authenticated streaming service endpoint but emits base64 RITPIPE1 records/ciphertexts for selected payloads. Decode and bind the record before consuming UTF8 text or selected provider JSON. The executor passes `[DONE]` to selectors; `fromjson?` omits it. Do not reuse the native LLM token parser or assume raw provider events are forwarded.
+
 ### EIP-712 Stream Request Signing
 
 Stream authentication uses EIP-712 typed data signatures to prove the requester authorized the stream.
@@ -690,7 +718,7 @@ import { defineChain, createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
@@ -707,7 +735,7 @@ const walletClient = createWalletClient({
 const domain = {
   name: 'Ritual Streaming Service',
   version: '1',
-  chainId: 1979,
+  chainId: 784,
 } as const;
 
 // Stream request type
@@ -820,7 +848,7 @@ class RitualStreamClient {
       }
     }
 
-    return fullText;
+    throw new Error('Stream ended before a completion event');
   }
 }
 ```
@@ -834,7 +862,7 @@ import { defineChain, createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
@@ -853,7 +881,7 @@ async function streamLLM(prompt: string) {
   // 1. Submit the on-chain LLM request directly to the precompile
   const encoded = encodeAbiParameters(
     parseAbiParameters([
-      'address, bytes[], uint256, bytes[], bytes,',
+      'address, address, address[], bytes[], uint256, bytes[], bytes,',
       'string, string, int256, string, bool, int256, string, string,',
       'uint256, bool, int256, string, bytes, int256, string, string, bool,',
       'int256, bytes, bytes, int256, int256, string, bool,',
@@ -861,9 +889,10 @@ async function streamLLM(prompt: string) {
     ].join('')),
     [
       executorAddress,
-      [], 60n, [], '0x',
+      sponsorAddress,        // sponsor: RitualWallet account backing async fees
+      [], [], 60n, [], '0x',  // secretOwners, encryptedSecrets, ttl, secretSignatures, userPublicKey
       JSON.stringify([{ role: 'user', content: prompt }]),
-      'zai-org/GLM-4.7-FP8',
+      'deepseek-ai/DeepSeek-V4-Flash-0731',
       0n, '', false, 2048n, '', '',
       1n, true, 0n, 'medium', '0x', -1n, 'auto', '',
       true,                    // stream — MUST be true for streaming
@@ -907,7 +936,7 @@ streamLLM('Write a short story about a decentralized AI.').catch(console.error);
 | TX not yet on-chain | 401 `"transaction not found"` | Wait for tx receipt before opening SSE |
 | Signature expired | 401 after 5 minutes from timestamp | Generate fresh signature on reconnect |
 | Timestamp clock skew | 401 if >60s in future | Keep timestamp within ±60s of server time |
-| Slow consumer | Tokens silently dropped (100-token channel buffer) | Process events immediately; detect gaps via `index` field |
+| Slow consumer | Tokens silently dropped (executor-configured channel buffer, typically 100 tokens) | Process events immediately; detect gaps via `index` field |
 | Stream TTL expired | Empty phantom stream (hangs forever) | Connect within 5 min of stream completion |
 | Reconnection | Replay buffer: last 100 tokens only | Long responses (500+ tokens) lose early tokens on reconnect |
 | HTTPS only | HTTP → TLS handshake error, no redirect | Use `https://`; in dev set `NODE_TLS_REJECT_UNAUTHORIZED=0` |
@@ -927,16 +956,26 @@ Result is injected by the builder into the SPC mechanism (fulfilled replay) — 
 pragma solidity ^0.8.20;
 
 contract LLMConsumer {
+    struct StorageRef {
+        string platform;
+        string path;
+        string keyRef;
+    }
+
     address constant LLM_PRECOMPILE = 0x0000000000000000000000000000000000000802;
-    address constant RITUAL_WALLET  = 0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948;
+    address constant RITUAL_WALLET  = 0xF04076756d8129Baec46Dc0F1c526Baec490C393;
 
     event InferenceCompleted(string model, bool hasError);
 
     function depositForFees() external payable {
         (bool ok,) = RITUAL_WALLET.call{value: msg.value}(
-            abi.encodeWithSignature("deposit(uint256)", 5000)
+            abi.encodeWithSignature("deposit()")
         );
         require(ok, "Deposit failed");
+        // Funds land in availableBalance immediately. Because this contract is both the
+        // caller and the sponsor (sponsor == caller), no allowance is required. Only when a
+        // DIFFERENT account sponsors a separate caller must that sponsor call
+        // approve(caller, amount) first.
     }
 
     function requestInference(
@@ -948,6 +987,8 @@ contract LLMConsumer {
     ) external returns (bool hasError, bytes memory completionData) {
         bytes memory input = abi.encode(
             executor,
+            address(this),    // sponsor: RitualWallet account backing async fees (this contract deposited)
+            new address[](0), // secretOwners: one non-zero owner per encryptedSecrets blob (parallel arrays; empty here)
             new bytes[](0),   // encryptedSecrets (encrypted secrets payload for your flow)
             uint256(300),     // ttl
             new bytes[](0),   // secretSignatures
@@ -976,7 +1017,7 @@ contract LLMConsumer {
             int256(1000),        // topP (1.0 × 1000)
             "",                  // user
             bool(false),         // piiEnabled
-            abi.encode("gcs", "convos/my-session.jsonl", "GCS_CREDS")
+            StorageRef("gcs", "convos/my-session.jsonl", "GCS_CREDS")
         );
 
         // Short-running async envelope: (bytes simmedInput, bytes actualOutput).
@@ -990,7 +1031,7 @@ contract LLMConsumer {
         bytes memory modelMeta;
         string memory errorMsg;
         (hasError, completionData, modelMeta, errorMsg, ) =
-            abi.decode(actualOutput, (bool, bytes, bytes, string, (string, string, string)));
+            abi.decode(actualOutput, (bool, bytes, bytes, string, StorageRef));
 
         emit InferenceCompleted(model, hasError);
     }
@@ -1016,14 +1057,16 @@ PII mode is a redaction workflow toggle — separate from `secretSignatures` or 
 Minimal parameter shape:
 
 ```typescript
-// ...same 30-field tuple...
+// ...same 32-field tuple...
 [
   executor,
+  sponsor,            // sponsor: RitualWallet account backing async fees
+  secretOwners,       // address[] — one non-zero owner per encryptedSecrets blob (parallel array, equal length)
   encryptedSecrets,   // includes pii prompt secret material
   300n,
   /* keep remaining base executor fields exactly as in your baseline request */,
   messagesJson,
-  'zai-org/GLM-4.7-FP8',
+  'deepseek-ai/DeepSeek-V4-Flash-0731',
   // ...
   false,              // stream
   // ...
@@ -1046,71 +1089,60 @@ LLM fees come from async settlement logic + RitualWallet charging.
 
 ### Fee Structure
 
-Current fee formula:
+Current fee formula — a linear, cache-aware per-model rate card (`llm_compute_fee_wei`):
 
 ```text
-seq_len = prompt_tokens + completion_tokens
-sqrt_b  = sqrt(params_b)
-delta_2k = max(seq_len - 2000, 0)
-delta_4k = max(seq_len - 4000, 0)
+cached = min(cached_prompt_tokens, prompt_tokens)
+fresh  = prompt_tokens - cached
 
-token_component     = LLM_ALPHA * params_b * (prompt_tokens + LLM_BETA * completion_tokens)
-memory_component    = LLM_GAMMA * seq_len * sqrt_b
-linear_penalty      = LLM_DELTA * delta_2k * sqrt_b
-quadratic_penalty   = LLM_EPSILON * (delta_4k^2) * sqrt_b
-
-total_gas = LLM_BASE_SETUP_GAS
-          + theta * (token_component + memory_component)
-          + linear_penalty
-          + quadratic_penalty
-
-executor_fee_wei = round(total_gas * LLM_EXECUTOR_GAS_PRICE_WEI)
+executor_fee_wei = llmBaseFeeWei
+                 + llmFeeWeiPerInputToken  * fresh
+                 + llmFeeWeiPerInputToken  * cached * llmCachedInputDiscountBps / 10_000
+                 + llmFeeWeiPerOutputToken * completion_tokens
 ```
 
-Current constants:
-- `LLM_ALPHA = 0.25`
-- `LLM_BETA = 2.5`
-- `LLM_GAMMA = 0.75`
-- `LLM_DELTA = 2.0`
-- `LLM_EPSILON = 0.001`
-- `LLM_BASE_SETUP_GAS = 500.0`
-- `LLM_EXECUTOR_GAS_PRICE_WEI = 1_000_000_000`
-- `LLM_ERROR_EXECUTOR_FEE_WEI = 500_000_000_000` when response has `hasError=true`
+All four rates (`llmBaseFeeWei`, `llmFeeWeiPerInputToken`, `llmFeeWeiPerOutputToken`, `llmCachedInputDiscountBps`) are per-model values read from `ModelPricingRegistry` (`getModel(name)` fields). The fee is linear in tokens; `paramsB` and `theta` do not enter it. `cached_prompt_tokens` is the 4th word of the executor's usage payload (see Section 2) and is clamped to `<= prompt_tokens` by consensus. A model whose `llmFeeWeiPerInputToken == 0` has no LLM pricing and the job is rejected.
+
+Current rate cards (genesis `models.json`; `llm_cached_input_discount_bps = 1000` = cached tokens pay 10%):
+- `deepseek-ai/DeepSeek-V4-Flash-0731`: base 5e11 wei, input 1.0792e12 wei/token, output 2.1584e12 wei/token. `maxSeqLen` 1,048,576 — read `getModel(name).maxSeqLen` from the registry before sizing escrow.
+- `LLM_ERROR_EXECUTOR_FEE_WEI = 10_000_000_000_000_000` (0.01 RIT) when response has `hasError=true`
+
+Rates change only via the owner-only `setLlmPricing(string modelName, uint256 baseFeeWei, uint256 feeWeiPerInputToken, uint256 feeWeiPerOutputToken, uint256 cachedInputDiscountBps)` (`cachedInputDiscountBps <= 10_000`, emits `LlmPricingSet`).
 
 Important sad path:
-- If model pricing cannot be resolved from `ModelPricingRegistry`, transaction handling can be skipped by builder logic (not a normal in-contract revert path).
+- If model pricing cannot be resolved from `ModelPricingRegistry` (model missing, or `llmFeeWeiPerInputToken == 0`), transaction handling can be skipped by builder logic (not a normal in-contract revert path).
 
 ### Worst-case escrow vs. actual fee
 
-The chain locks a **worst-case escrow** at submission time, computed against the model's `maxSeqLen` from `ModelPricingRegistry`, not against your `maxCompletionTokens`. Actual settlement charges only the realized usage, refunding the difference after the lock period.
+The chain reserves a **worst-case escrow** at submission time, computed against the model's `maxSeqLen` from `ModelPricingRegistry`, not against your `maxCompletionTokens`. The escrowed amount moves from `availableBalance` into `reservedBalance`. Actual settlement charges only the realized usage, refunding the difference back to `availableBalance`.
 
-For `zai-org/GLM-4.7-FP8` (params_b=355, theta=1.0, maxSeqLen=128000) with the formula above, the worst-case escrow is **~0.31 RIT per in-flight call**. A realistic 30-prompt / 220-completion call settles for ~5.5e13 wei (~0.000055 RIT); a 30/4096 call settles for ~1e15 wei (~0.001 RIT).
+Worst-case escrow = `max(llmBaseFeeWei + llmFeeWeiPerOutputToken × maxSeqLen, 1e16 wei)` — the whole `maxSeqLen` is charged as completion, since output is the highest per-token rate, and the estimate is floored at `HTTP_EXECUTOR_BASE_FEE_WEI` (1e16 wei = 0.01 RIT). For `deepseek-ai/DeepSeek-V4-Flash-0731` (maxSeqLen=1,048,576, output 2.1584e12 wei/token) the worst-case escrow is ~2.26e18 wei, i.e. **~2.26 RIT per in-flight call**. A realistic 30-prompt / 220-completion call settles for ~5.1e14 wei (~0.0005 RIT); a 30/4096 call settles for ~8.9e15 wei (~0.009 RIT).
 
 Practical implications:
-- A 0.1 RIT deposit covers ~0 in-flight GLM-4.7-FP8 calls — submission will revert with insufficient deposit. Deposit at least 0.4 RIT before your first call, and ~0.31 RIT per additional concurrent in-flight call.
-- For agents that submit many sequential (non-concurrent) calls, 0.5 RIT typically lasts hundreds of completed calls because the escrow unlocks after each settles.
-- Monitor `RitualWallet.balanceOf(yourAddress)` — settlement refunds usually appear in the same block as your tx; concurrent submissions need separate escrow ceilings.
+- A 0.1 RIT deposit covers ~0 in-flight DeepSeek-V4-Flash-0731 calls — submission will revert with insufficient deposit. Deposit at least 2.5 RIT before your first call, and ~2.3 RIT per additional concurrent in-flight call.
+- For agents that submit many sequential (non-concurrent) calls, 0.5 RIT typically lasts hundreds of completed calls because the escrow reservation is released back to `availableBalance` after each settles.
+- Monitor both `RitualWallet.availableBalance(yourAddress)` and `RitualWallet.reservedBalance(yourAddress)` — not available alone. At submission the worst-case escrow moves from `availableBalance` into `reservedBalance` (available drops, total unchanged); at settlement the realized cost is debited from the reservation and the remainder is refunded back to `availableBalance`. To observe actual spend/refunds, compare total (`availableBalance + reservedBalance`) before vs after; watching only `availableBalance` will mistake the in-flight escrow move for a payment. Settlement refunds usually appear in the same block as your tx; concurrent submissions need separate escrow ceilings.
 
 ### Depositing Fees
 
 ```typescript
 import { parseEther } from 'viem';
 
-const RITUAL_WALLET = '0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948' as const;
+const RITUAL_WALLET = '0xF04076756d8129Baec46Dc0F1c526Baec490C393' as const;
 
-// Deposit enough for several LLM calls
+// Deposit enough for several LLM calls (credited to availableBalance immediately — no lock)
 await walletClient.writeContract({
   address: RITUAL_WALLET,
   abi: [{
     name: 'deposit',
     type: 'function',
     stateMutability: 'payable',
-    inputs: [{ name: 'lockDuration', type: 'uint256' }],
+    inputs: [],
     outputs: [],
   }] as const,
   functionName: 'deposit',
-  args: [5000n],              // lock for 5000 blocks
-  value: parseEther('0.5'),  // 0.5 RIT covers ~1 in-flight GLM-4.7-FP8 call (escrow ~0.31 RIT) plus headroom; sequential calls reuse the deposit as escrow refunds
+  args: [],
+  value: parseEther('2.5'),  // 2.5 RIT covers ~1 in-flight DeepSeek-V4-Flash-0731 call (escrow ~2.26 RIT) plus headroom; sequential calls reuse the deposit as escrow refunds
 });
 ```
 
@@ -1144,6 +1176,8 @@ interface StreamingState {
 interface UseStreamingLLMOptions {
   executor: Hex;
   encryptedSecrets: Hex[]; // include encrypted blob that contains GCS_CREDS
+  secretOwners?: Hex[];    // one non-zero owner address per encryptedSecrets blob (parallel array, equal length)
+  secretSignatures?: Hex[]; // one secret-authorization signature per encryptedSecrets blob (parallel array, equal length)
   convoPath?: string;
   convoKeyRef?: string;
   model?: string;
@@ -1152,7 +1186,7 @@ interface UseStreamingLLMOptions {
   streamingServiceUrl?: string;
 }
 
-export function useStreamingLLM(options: UseStreamingLLMOptions = {}) {
+export function useStreamingLLM(options: UseStreamingLLMOptions) {
   const [state, setState] = useState<StreamingState>({
     status: 'idle',
     text: '',
@@ -1165,11 +1199,13 @@ export function useStreamingLLM(options: UseStreamingLLMOptions = {}) {
   const {
     executor,
     encryptedSecrets,
+    secretOwners = [],
+    secretSignatures = [],
     convoPath = 'convos/my-session.jsonl',
     convoKeyRef = 'GCS_CREDS',
-    model = 'zai-org/GLM-4.7-FP8',
+    model = 'deepseek-ai/DeepSeek-V4-Flash-0731',
     temperature = 0.7,
-    maxTokens = 4096, // >=4096 default for GLM-4.7-FP8 reasoning headroom; see ABI Context
+    maxTokens = 4096, // >=4096 default reasoning headroom; see ABI Context
     streamingServiceUrl = 'https://streaming.ritualfoundation.org',
   } = options;
 
@@ -1189,6 +1225,7 @@ export function useStreamingLLM(options: UseStreamingLLMOptions = {}) {
       }
 
       setState({ status: 'submitting', text: '', tokens: 0 });
+      let abortController: AbortController | null = null;
 
       try {
         const messages = [];
@@ -1201,7 +1238,7 @@ export function useStreamingLLM(options: UseStreamingLLMOptions = {}) {
 
         const encoded = encodeAbiParameters(
           parseAbiParameters([
-            'address, bytes[], uint256, bytes[], bytes,',
+            'address, address, address[], bytes[], uint256, bytes[], bytes,',
             'string, string, int256, string, bool, int256, string, string,',
             'uint256, bool, int256, string, bytes, int256, string, string, bool,',
             'int256, bytes, bytes, int256, int256, string, bool,',
@@ -1209,7 +1246,8 @@ export function useStreamingLLM(options: UseStreamingLLMOptions = {}) {
           ].join('')),
           [
             executor, // TEE executor address — must be a real registered executor (see Section 11)
-            encryptedSecrets, 300n, [], '0x',
+            address,  // sponsor: RitualWallet account backing async fees (connected wallet)
+            secretOwners, encryptedSecrets, 300n, secretSignatures, '0x', // secretOwners/secretSignatures must be parallel to encryptedSecrets (one non-zero owner + one sig per blob; equal length)
             JSON.stringify(messages),
             model,
             0n, '', false, BigInt(maxTokens), '', '',
@@ -1233,7 +1271,7 @@ export function useStreamingLLM(options: UseStreamingLLMOptions = {}) {
         // Sign EIP-712 stream request
         const timestamp = BigInt(Math.floor(Date.now() / 1000));
         const signature = await walletClient.signTypedData({
-          domain: { name: 'Ritual Streaming Service', version: '1', chainId: 1979 },
+          domain: { name: 'Ritual Streaming Service', version: '1', chainId: 784 },
           types: {
             StreamRequest: [
               { name: 'txHash', type: 'bytes32' },
@@ -1248,7 +1286,7 @@ export function useStreamingLLM(options: UseStreamingLLMOptions = {}) {
 
         // Connect SSE — uses path param + auth headers (NOT query params)
         // NOTE: Cannot use EventSource because it doesn't support custom headers.
-        const abortController = new AbortController();
+        abortController = new AbortController();
         abortControllerRef.current = abortController;
 
         const sseResponse = await fetch(
@@ -1306,10 +1344,12 @@ export function useStreamingLLM(options: UseStreamingLLMOptions = {}) {
               } catch { /* skip non-JSON lines */ }
             }
           }
+          throw new Error('Stream ended before a completion event');
         };
 
         await processStream();
       } catch (err) {
+        if (abortController?.signal.aborted) return;
         setState((s) => ({
           ...s,
           status: 'error',
@@ -1322,6 +1362,8 @@ export function useStreamingLLM(options: UseStreamingLLMOptions = {}) {
       address,
       executor,
       encryptedSecrets,
+      secretOwners,
+      secretSignatures,
       convoPath,
       convoKeyRef,
       model,
@@ -1362,10 +1404,10 @@ Use any UI wrapper you want, but keep frontend logic thin:
 
 ## 11. Model Selection
 
-For current production, use **`zai-org/GLM-4.7-FP8` only**. If your agent picks any other model name, treat it as a sad path and fail fast in app logic.
-From `TEEServiceRegistry` responses, use `teeAddress` and `publicKey` for this dapp flow. Do not use the registry `endpoint` field here.
+For current production, use **`deepseek-ai/DeepSeek-V4-Flash-0731` only**. If your agent picks any other model name, treat it as a sad path and fail fast in app logic.
+From `TEEServiceRegistry` responses, use `teeAddress` and `executorSecretsAuthPublicKey` for this dapp flow. Do not use the registry `endpoint` field here.
 
-`ModelPricingRegistry` (`0x7A85F48b971ceBb75491b61abe279728F4c4384f`) is for pricing metadata. It does not prove executor liveness. Confirm executors via `TEEServiceRegistry.getServicesByCapability(1, true)`.
+`ModelPricingRegistry` (`0xd190Aa03c401ef5CEcE00927b522974c0f330b97`) is for pricing metadata. It does not prove executor liveness. Confirm executors via `TEEServiceRegistry.getServicesByCapability(1, true)`.
 
 ### Checking Available Executors
 
@@ -1373,7 +1415,7 @@ From `TEEServiceRegistry` responses, use `teeAddress` and `publicKey` for this d
 import { createPublicClient, http, defineChain } from 'viem';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
@@ -1381,7 +1423,7 @@ const ritualChain = defineChain({
 
 const publicClient = createPublicClient({ chain: ritualChain, transport: http() });
 
-const TEE_SERVICE_REGISTRY = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F' as const;
+const TEE_SERVICE_REGISTRY = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839' as const;
 const CAPABILITY_LLM = 1; // LLM capability enum value
 
 const services = await publicClient.readContract({
@@ -1399,9 +1441,9 @@ const services = await publicClient.readContract({
           { name: 'paymentAddress', type: 'address' },
           { name: 'teeAddress', type: 'address' },
           { name: 'teeType', type: 'uint8' },
-          { name: 'publicKey', type: 'bytes' },
+          { name: 'executorSecretsAuthPublicKey', type: 'bytes' },
           { name: 'endpoint', type: 'string' },
-          { name: 'certPubKeyHash', type: 'bytes32' },
+          { name: 'mTlsSpkiHash', type: 'bytes32' },
           { name: 'capability', type: 'uint8' },
         ]},
         { name: 'isValid', type: 'bool' },
@@ -1416,12 +1458,12 @@ const services = await publicClient.readContract({
 for (const service of services) {
   console.log('Executor:', service.node.teeAddress);
   console.log('Valid:', service.isValid);
-  console.log('Public Key:', service.node.publicKey);
+  console.log('Public Key:', service.node.executorSecretsAuthPublicKey);
   // service.node.endpoint exists in the struct but is NOT used by dApp code.
 }
 ```
 
-> The `endpoint` field is present in the on-chain registry struct (required for ABI decoding) but is **not relevant to dApp developers**. It is an internal infrastructure value used by the node operator. Your dApp only needs `teeAddress` (pass as the executor in the precompile call) and `publicKey` (for ECIES secret encryption). Do not read, validate, or connect to the endpoint.
+> The `endpoint` field is present in the on-chain registry struct (required for ABI decoding) but is **not relevant to dApp developers**. It is an internal infrastructure value used by the node operator. Your dApp only needs `teeAddress` (pass as the executor in the precompile call) and `executorSecretsAuthPublicKey` (for ECIES secret encryption). Do not read, validate, or connect to the endpoint.
 
 ---
 
@@ -1429,14 +1471,14 @@ for (const service of services) {
 
 ### Model Registry
 
-Use registry lookups for pricing metadata and sanity checks, then still pin your call model to `zai-org/GLM-4.7-FP8`.
+Use registry lookups for pricing metadata and sanity checks, then still pin your call model to `deepseek-ai/DeepSeek-V4-Flash-0731`.
 
-**ModelPricingRegistry** (`0x7A85F48b971ceBb75491b61abe279728F4c4384f`):
+**ModelPricingRegistry** (`0xd190Aa03c401ef5CEcE00927b522974c0f330b97`):
 
 ```typescript
 // Discover available models
 const models = await publicClient.readContract({
-  address: '0x7A85F48b971ceBb75491b61abe279728F4c4384f',
+  address: '0xd190Aa03c401ef5CEcE00927b522974c0f330b97',
   abi: [{
     name: 'getAllModels',
     type: 'function',
@@ -1449,7 +1491,7 @@ const models = await publicClient.readContract({
 
 // Check if a specific model exists
 const exists = await publicClient.readContract({
-  address: '0x7A85F48b971ceBb75491b61abe279728F4c4384f',
+  address: '0xd190Aa03c401ef5CEcE00927b522974c0f330b97',
   abi: [{
     name: 'modelExists',
     type: 'function',
@@ -1458,13 +1500,13 @@ const exists = await publicClient.readContract({
     stateMutability: 'view'
   }],
   functionName: 'modelExists',
-  args: ['zai-org/GLM-4.7-FP8'], // the only confirmed live model
+  args: ['deepseek-ai/DeepSeek-V4-Flash-0731'], // enumerate hosted models with getAllModels()
 });
 ```
 
 #### ModelInfo Struct
 
-`getModel(string modelName)` returns a `ModelInfo` struct with 13 fields:
+`getModel(string modelName)` returns a `ModelInfo` struct with 17 fields (any ABI tuple you use to decode `getModel`/`getAllModelsWithInfo` must include the 4 trailing `uint256` LLM rate-card components):
 
 ```solidity
 struct ModelInfo {
@@ -1481,10 +1523,14 @@ struct ModelInfo {
     uint256 videoFeeWeiPerPixelSecond;// Per-pixel-second video fee (wei)
     uint256 videoStepsBaseline;       // Baseline diffusion steps for video
     uint256 videoFpsBaseline;         // Baseline FPS for video pricing
+    uint256 llmBaseFeeWei;            // Per-request LLM base fee (wei)
+    uint256 llmFeeWeiPerInputToken;   // Fresh prompt token rate (wei)
+    uint256 llmFeeWeiPerOutputToken;  // Completion token rate (wei)
+    uint256 llmCachedInputDiscountBps;// Cached prompt tokens pay this fraction (bps, 1000 = 10%)
 }
 ```
 
-For text LLM pricing, the relevant fields are `paramsB`, `theta`, and `maxSeqLen`. Image/audio/video fields apply to multimodal models.
+For text LLM pricing, the relevant fields are `llmBaseFeeWei`, `llmFeeWeiPerInputToken`, `llmFeeWeiPerOutputToken`, and `llmCachedInputDiscountBps` (plus `maxSeqLen`, which sets the worst-case escrow ceiling). `paramsB` and `theta` do not enter the LLM fee. A model with `llmFeeWeiPerInputToken == 0` has no LLM pricing and LLM jobs against it are rejected. Image/audio/video fields apply to multimodal models.
 
 ### Pricing
 
@@ -1506,20 +1552,20 @@ The error string returned in `error_message` is **freeform** — there is no str
 
 | Likely substring of `error_message` | Cause | Fix |
 |-------|-------|-----|
-| `HTTP request failed with status 400`, contains `context length`, `maximum context`, `max_tokens`, or `prompt is too long` | Prompt + completion budget exceeds the upstream model's *operational* `max_seq_len`, which is often **smaller than the on-chain registered value** — the live Ritual gateway currently serves `zai-org/GLM-4.7-FP8` at **64K = 65,536 tokens** even though the on-chain registration is 128K. The executor does **not** preflight token counts; this only surfaces from the upstream endpoint. | Reduce prompt size, lower `max_completion_tokens`, summarize tool/conversation history before sending, or move to a different model. Treat the deployed `--max-model-len` as your real cap; assume 64K for hosted GLM until you've measured larger. **`max_completion_tokens` will not protect you** — it caps output only. |
+| `HTTP request failed with status 400`, contains `context length`, `maximum context`, `max_tokens`, or `prompt is too long` | Prompt + completion budget exceeds the model's registered `max_seq_len` — read it from `getModel(name)`. The executor does **not** preflight token counts; this only surfaces from the upstream endpoint. | Reduce prompt size, lower `max_completion_tokens`, or summarize tool/conversation history before sending. **`max_completion_tokens` will not protect you** — it caps output only. |
 | `insufficient wallet balance` | RitualWallet has not been funded sufficiently for executor + commitment + inclusion fees | Deposit more via `ritualWallet.deposit()`. See `ritual-dapp-wallet`. |
 | `Request expired: emission block X > (commit block + TTL)` | TTL too low, commitment expired before executor processed | Increase TTL (300–500) |
-| `Model 'X' is not available. Available models: [...]` | Model name not registered on the chosen executor | Pin model to `zai-org/GLM-4.7-FP8` for current production, or pick a different executor that supports your model |
+| `Model 'X' is not available. Available models: [...]` | Model name not registered on the chosen executor | Pin model to `deepseek-ai/DeepSeek-V4-Flash-0731` for current production, or pick a different executor that supports your model |
 | Model name not in `ModelPricingRegistry` | Tx is rejected at RPC validation before being mined | Use only registered models |
-| Tx hash broadcast but no receipt/settlement output | Builder/pool sad path (skip/drop) | Retry with GLM only, real executor, adequate TTL/deposit; then inspect next tx |
+| Tx hash broadcast but no receipt/settlement output | Builder/pool sad path (skip/drop) | Retry with the registry model only, real executor, adequate TTL/deposit; then inspect next tx |
 | `Failed to parse response JSON` | Upstream returned a non-JSON HTTP body | Pin to a healthy executor; check executor logs |
 | `GCS preflight failed` | Bad GCS credentials — checked before inference | Verify `service_account_json` and `bucket` in encrypted secrets |
 | Tx drops when `encryptedSecrets` is non-empty | Decrypted secrets payload shape mismatch | Use string-valued secrets; for `GCS_CREDS`, the value must be a JSON string blob |
 | `GCS convo history upload failed` | Upload error after inference completed | Check bucket permissions and network connectivity |
-| Tx revert | ABI encoding mismatch or address(0) executor | Verify 30-field ABI layout; use a real registered executor address |
-| RPC `-32602 invalid async payload: ... ethabi decode failed: Invalid data` | Chain pre-validates async precompile inputs at submission time by ABI-decoding into the canonical `LLMCallRequest`. The tx never enters the mempool — `eth_getTransactionByHash` returns null. Almost always a field-count mismatch. | Encode all 30 fields including `pii_enabled` (28) and `convo_history` (29). For `convo_history` semantics (including the no-history case), see `ritual-dapp-da`. Field layout in Section 1. |
+| Tx revert | ABI encoding mismatch or address(0) executor | Verify 32-field ABI layout; use a real registered executor address |
+| RPC `-32602 invalid async payload: ... ethabi decode failed: Invalid data` | Chain pre-validates async precompile inputs at submission time by ABI-decoding into the canonical `LLMCallRequest`. The tx never enters the mempool — `eth_getTransactionByHash` returns null. Almost always a field-count mismatch. | Encode all 32 fields including `secret_owners` (2), `pii_enabled` (30) and `convo_history` (31). For `convo_history` semantics (including the no-history case), see `ritual-dapp-da`. Field layout in Section 1. |
 | `has_error=false` but `completion_data` content doesn't parse as expected JSON | Model deviated from the schema you supplied via `response_format` | Treat structured output as best-effort; wrap your decode in try/except and fall back to retry-or-abort. The executor does not locally validate the model's output against your schema. |
-| Empty `content` with `usage.completion_tokens` equal to `max_completion_tokens` and `finish_reason` of `"length"` | Reasoning-budget exhaustion. GLM-4.7-FP8 is a reasoning model with a hardcoded `<think>...</think>` chain-of-thought; with a small `max_completion_tokens` cap, the model burns the entire budget reasoning and never emits final-content tokens. The empty bytes on chain accurately reflect what vLLM returned. The on-chain `ChatMessage` ABI does not carry `reasoning_content`, so reasoning text is dropped at the encoding boundary even when present upstream. | Raise `max_completion_tokens` to at least 4096 (the recommended baseline for this model). Discriminator: re-run at 4096; if `content` populates and `finish_reason` flips to `stop`, the cause is confirmed. |
+| Empty `content` with `usage.completion_tokens` equal to `max_completion_tokens` and `finish_reason` of `"length"` | Reasoning-budget exhaustion. In reasoning mode the model emits a `<think>...</think>` chain-of-thought; with a small `max_completion_tokens` cap, the model burns the entire budget reasoning and never emits final-content tokens. The empty bytes on chain accurately reflect what vLLM returned. The on-chain `ChatMessage` ABI does not carry `reasoning_content`, so reasoning text is dropped at the encoding boundary even when present upstream. | Raise `max_completion_tokens` to at least 4096 (the recommended baseline for this model). Discriminator: re-run at 4096; if `content` populates and `finish_reason` flips to `stop`, the cause is confirmed. |
 | No `PrecompileCalled` in logs | Commitment phase, not settlement | Wait for the settlement tx |
 | `sender locked` | Pending async tx for this address | Wait for current tx to settle. One pending async call per address. |
 | `encrypted_secrets required when pii_enabled=true` | PII without secrets | Encrypt PII prompt into secrets with executor's public key |
@@ -1536,23 +1582,24 @@ The error string returned in `error_message` is **freeform** — there is no str
 | Item | Value |
 |------|-------|
 | Precompile | `0x0000000000000000000000000000000000000802` |
-| RitualWallet | `0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948` |
-| TEEServiceRegistry | `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` |
-| ModelPricingRegistry | `0x7A85F48b971ceBb75491b61abe279728F4c4384f` |
-| Chain ID | 1979 |
+| RitualWallet | `0xF04076756d8129Baec46Dc0F1c526Baec490C393` |
+| TEEServiceRegistry | `0xf4495DC72143D44A93AB0ecE4d6D63a216b27839` |
+| ModelPricingRegistry | `0xd190Aa03c401ef5CEcE00927b522974c0f330b97` |
+| Chain ID | 784 |
 | Gas limit | 3,000,000 (actual ~60K; inference is off-chain) |
 | TTL | 300 blocks (~105s at ~350ms block-time baseline) |
 | Temperature | ×1000 (700 = 0.7) |
 | Null sentinel | -1 (optional int fields) |
-| Live model | `zai-org/GLM-4.7-FP8` (64K context) |
+| Live model | `deepseek-ai/DeepSeek-V4-Flash-0731` (1M context) |
 | Stream auth | `Authorization: Bearer {sig}` + `X-Timestamp` → `/v1/stream/{txHash}` |
-| EIP-712 domain | `{ name: 'Ritual Streaming Service', version: '1', chainId: 1979 }` |
+| EIP-712 domain | `{ name: 'Ritual Streaming Service', version: '1', chainId: 784 }` |
 | Message format | OpenAI chat (JSON-encoded) |
 | Stream signature expiry | 5 minutes (60s future tolerance) |
 | Convo history DA | StorageRef `(platform, path, key_ref)` — supports `gcs` (default), `hf`, `pinata`. Stored as plaintext JSONL. See `ritual-dapp-da`. |
 | GCS convo history | Default for production agents: `('gcs', path, key_ref)` with credentials in `encryptedSecrets` |
 | ECIES nonce length (`eciesjs`) | `ECIES_CONFIG.symmetricNonceLength = 12` |
 | Encryption/secrets | See `ritual-dapp-secrets` for ECIES encryption and secret handling |
+| Arbitrary OpenAI-compatible HTTP | RITHTTP1 in `ritual-dapp-http`: DA-backed JSON, held responses, selected SSE, jq projection/fan-out |
 
 ---
 
@@ -1563,6 +1610,6 @@ Use this after your baseline inference flow is stable. Keep both `toolsData` and
 ```typescript
 const toolsData = '0x' as Hex;
 const toolChoiceData = '0x' as Hex;
-// Pass these in the appropriate positions of the 30-field ABI tuple.
+// Pass these in the appropriate positions of the 32-field ABI tuple.
 // See Section 1 for the full field layout.
 ```

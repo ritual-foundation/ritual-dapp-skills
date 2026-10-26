@@ -1,13 +1,13 @@
 ---
 name: ritual-dapp-block-time
-description: Block-time estimation and block-to-time conversion guidance for Ritual dApps. Use when setting TTL, lock durations, scheduler frequency, or polling windows.
+description: Block-time estimation and block-to-time conversion guidance for Ritual dApps. Use when setting TTL, scheduler frequency, or polling windows.
 ---
 
 # Ritual Block-Time Guidance
 
 ## Baseline (Conservative)
 
-Use a conservative planning baseline of **~350ms per block** when you do not have fresh measurements from your target deployment.
+Use a conservative planning baseline of **~350ms per block** when you do not have fresh measurements.
 
 - `1 block ~= 0.35s`
 - `100 blocks ~= 35s`
@@ -48,6 +48,8 @@ PY
 
 If your measured value is materially different from 350ms, use the measured value in formulas below.
 
+Sanity-check the magnitude before trusting the estimate. Block, receipt, log, and `eth_simulateV1` timestamps are Unix **seconds**, as is contract-visible `block.timestamp`. An "avg" in the hundreds of seconds means you are misreading units.
+
 ## Conversion Formulas
 
 ```text
@@ -66,6 +68,5 @@ Examples at `blockTimeSeconds = 0.35`:
 Apply these conversions consistently in:
 
 - `ttl` / `maxPollBlock` windows
-- RitualWallet lock durations
 - Scheduler `frequency` and interval tables
 - polling and timeout guidance in long-running workflows

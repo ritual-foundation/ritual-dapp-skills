@@ -13,28 +13,28 @@ Source resolution priority:
 
 Usage:
     # Pull all registry contracts
-    python3 scripts/pull_contracts.py
+    uv run --with requests python3 scripts/pull_contracts.py
 
     # Pull a specific registry entry
-    python3 scripts/pull_contracts.py --name TweetRegistry
+    uv run --with requests python3 scripts/pull_contracts.py --name TweetRegistry
 
     # Pull any contract by address (ad-hoc, no registry entry needed)
-    python3 scripts/pull_contracts.py --address 0x1234...
+    uv run --with requests python3 scripts/pull_contracts.py --address 0x1234...
 
     # Pull by address and save to registry for future use
-    python3 scripts/pull_contracts.py --address 0x1234... --register MyContract
+    uv run --with requests python3 scripts/pull_contracts.py --address 0x1234... --register MyContract
 
     # Custom output directory
-    python3 scripts/pull_contracts.py --output-dir /tmp/contracts
+    uv run --with requests python3 scripts/pull_contracts.py --output-dir /tmp/contracts
 
     # Faster (skip 4byte.directory lookup)
-    python3 scripts/pull_contracts.py --skip-4byte
+    uv run --with requests python3 scripts/pull_contracts.py --skip-4byte
 
     # Use a specific RPC endpoint
-    python3 scripts/pull_contracts.py --rpc https://rpc.ritualfoundation.org
+    uv run --with requests python3 scripts/pull_contracts.py --rpc https://rpc.ritualfoundation.org
 
     # Pull contracts deployed at a specific block (discovers via eth_getBlockByNumber)
-    python3 scripts/pull_contracts.py --block 2215742
+    uv run --with requests python3 scripts/pull_contracts.py --block 2215742
 """
 
 from __future__ import annotations
@@ -353,7 +353,7 @@ def pull_one(
 def load_registry() -> dict:
     if REGISTRY_PATH.exists():
         return json.loads(REGISTRY_PATH.read_text())
-    return {"chain_id": 1979, "rpc_endpoints": [DEFAULT_RPC], "explorer_api": EXPLORER_API, "contracts": []}
+    return {"chain_id": 784, "rpc_endpoints": [DEFAULT_RPC], "explorer_api": EXPLORER_API, "contracts": []}
 
 
 def save_registry(reg: dict):
@@ -479,7 +479,7 @@ Examples:
 
     # Write summary
     summary = {
-        "chain_id": 1979,
+        "chain_id": 784,
         "pull_count": len(results),
         "contracts": results,
     }

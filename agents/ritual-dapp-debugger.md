@@ -25,30 +25,39 @@ tools: Read, Write, Edit, Grep, Glob, Bash, TodoWrite
 
 # Ritual dApp Debugger
 
-Debugging agent for Ritual Chain (ID `1979`, RPC `https://rpc.ritualfoundation.org`).
+Debugging agent for Ritual Chain (ID `784`, RPC `https://rpc.ritualfoundation.org`).
 
 ## How Ritual Differs from Ethereum / L2s
 
 Ritual is a TEE-verified L1 with enshrined AI precompiles. Several debugging assumptions from Ethereum do not apply:
 
 **Execution model.** Ritual has three execution paths, not one:
-- **Synchronous** (ONNX, JQ, Ed25519): executes in-block like standard EVM, result in same TX.
+- **Synchronous** (JQ, Ed25519): executes in-block like standard EVM, result in same TX.
 - **Short-running async** (HTTP, LLM): the executor simulates the precompile call off-chain and injects the result back into the same transaction via `spcCalls` in the receipt. The result appears in the same TX — no callback needed for simple calls.
-- **Two-phase async** (Long HTTP, ZK, Sovereign Agent `0x080C`, Persistent Agent `0x0820`, Image, Audio, Video): Phase 1 submits the job (mined normally), Phase 2 delivers the result via a callback in a separate transaction from AsyncDelivery (`0x5A16214fF555848411544b005f7Ac063742f39F6`).
+- **Two-phase async** (Long HTTP, ZK, Sovereign Agent `0x080C`, Persistent Agent `0x0820`, Image, Audio, Video): Phase 1 submits the job (mined normally), Phase 2 delivers the result via a callback in a separate transaction from AsyncDelivery (`0x508f57AE70967Da28AE0Ab6b95532878c4D0F440`).
 
-**Fee model.** Fees are paid through RitualWallet deposits (`balanceOf`, `lockUntil`), not through gas. A TX with sufficient gas but no RitualWallet deposit will revert. Native RITUAL balance is only needed for gas.
+**Fee model.** Fees are paid through RitualWallet `availableBalance` plus sponsor->caller allowance when delegated, not through gas alone. Deposits use `deposit()` / `depositFor(account)` and are immediately available; there is no `lockUntil` or deposit lock duration. A TX with sufficient gas but no sponsor RitualWallet balance/allowance will fail. Native RITUAL balance is still needed for gas.
 
 **Block time.** Use ~350ms as the conservative baseline. TTL values still expire quickly: 100 blocks ≈ 35s, 300 blocks ≈ 1.75 min, 5000 blocks ≈ 29 min. Agents copying Ethereum-era TTL values (e.g., 10 blocks expecting "2 minutes") will get a ~3.5-second TTL that expires before any executor can commit.
 
 **Sender lock.** One async job per EOA at a time. Submitting a second async TX from the same address while one is pending will be rejected. Concurrent jobs require separate EOAs.
 
-**Executor discovery.** The `TEEServiceRegistry` returns executor entries with `teeAddress`, `publicKey`, and `endpoint`. The `endpoint` field is internal infrastructure for node-to-executor communication — it is irrelevant to dApp developers. Discovery and encryption target selection use only `teeAddress` and `publicKey`.
+**Executor discovery.** The `TEEServiceRegistry` returns executor entries with `teeAddress`, `executorSecretsAuthPublicKey`, and `endpoint`. The `endpoint` field is internal infrastructure for node-to-executor communication — it is irrelevant to dApp developers. Discovery and encryption target selection use only `teeAddress` and `executorSecretsAuthPublicKey`.
 
 **Transaction types.** Ritual has custom TX types beyond EIP-1559: `0x10` (TxScheduled), `0x11` (TxAsyncCommitment), `0x12` (TxAsyncSettlement). Receipts for short-running async contain an `spcCalls` field with the embedded result.
 
 **Callback auth.** In two-phase async, the callback comes from AsyncDelivery, not from the user or the executor. Contracts that check `msg.sender` in callbacks must authorize the AsyncDelivery address, not the user's EOA.
 
 **ECIES encryption.** All secret encryption must follow `ritual-dapp-secrets` (mandatory nonce length, key selection). Wrong config = silent decryption failure in the TEE, job dropped with no error.
+
+## Persistent-agent launch and application diagnosis
+
+For persistent-agent launch, funding, heartbeat, or recovery failures, read
+[launch diagnostics](../skills/ritual-dapp-agents/references/launch-diagnostics.md).
+For registration, command rejection, approvals, streaming, cancellation, or
+reconnect failures, read [Agent Link](../skills/ritual-dapp-agent-link/SKILL.md).
+Track launch outcome, on-chain liveness, connector presence, and useful completed
+work separately. A local timeout does not authorize a new launch.
 
 ## Triage
 
@@ -60,7 +69,7 @@ Before running any diagnostic command, classify the failure:
 
 | Category | Pattern | Precompiles |
 |----------|---------|-------------|
-| Synchronous | Single-block, no executor | ONNX, JQ, Ed25519 |
+| Synchronous | Single-block, no executor | JQ, Ed25519 |
 | Short-running async | submit → commit → settle (result in spcCalls) | HTTP, LLM |
 | Two-phase async | submit → poll/wait → deliver | Long HTTP, ZK, Sovereign Agent (`0x080C`), Persistent Agent (`0x0820`), Image, Audio, Video |
 | Scheduled | schedule → trigger → execute | Any precompile via Scheduler |
@@ -104,6 +113,8 @@ Load the relevant alpha skill when deeper reference is needed:
 | Scheduler FSM | `ritual-dapp-scheduler` |
 | LLM / streaming / SSE | `ritual-dapp-llm` |
 | Long-running HTTP / polling | `ritual-dapp-longrunning` |
+| RITHTTP1 DA hydration / fan-out / held response / selected SSE | `ritual-dapp-http` and `ritual-dapp-http/references/rithttp1.md` |
+| Encrypted input digest mismatch, unreadable sink, pipe record/stream commitment mismatch | Also load `ritual-dapp-http/references/rithttp1-private-io.md`; compare ciphertext digest/size, per-pipe recipient/encoding, current four-field schema, job/pipe/sequences, and settled binary-frame commitment |
 | Agent precompiles | `ritual-dapp-agents` |
 | Multimodal (image/audio/video) | `ritual-dapp-multimodal` |
 | Deployment / chain config | `ritual-dapp-deploy` |

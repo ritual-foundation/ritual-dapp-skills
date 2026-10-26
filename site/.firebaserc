@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "pt-1-493616"
+  },
+  "targets": {
+    "pt-1-493616": {
+      "hosting": {
+        "skills": [
+          "pt-1-493616"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}

@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ritual-dapp-skills — Knowledge Graph</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Playfair+Display:wght@400;700;900&display=swap');
+
+  :root {
+    --bg: #06060a;
+    --surface: #0c0c14;
+    --border: #1a1a28;
+    --text: #c8c8d4;
+    --muted: #555568;
+    --green: #4ade80;
+    --pink: #f472b6;
+    --blue: #60a5fa;
+    --gold: #fbbf24;
+    --purple: #c084fc;
+    --orange: #fb923c;
+    --cyan: #22d3ee;
+    --slate: #94a3b8;
+    --lime: #a3e635;
+    --red: #f87171;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  #header {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 100;
+    padding: 20px 28px 12px;
+    background: linear-gradient(180deg, var(--bg) 50%, transparent);
+    pointer-events: none;
+  }
+  #header h1 {
+    font-family: 'Playfair Display', serif;
+    font-size: 26px;
+    font-weight: 900;
+    color: var(--green);
+    letter-spacing: -0.5px;
+    pointer-events: auto;
+  }
+  #header .subtitle {
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 3px;
+    letter-spacing: 0.5px;
+  }
+
+  svg { width: 100%; height: 100%; cursor: grab; }
+  svg:active { cursor: grabbing; }
+
+  .link { fill: none; stroke-opacity: 0.2; }
+
+  .node-circle {
+    stroke-width: 1.5;
+    cursor: pointer;
+    transition: r 0.15s ease, fill-opacity 0.15s ease;
+  }
+
+  .node-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 8px;
+    fill: var(--muted);
+    pointer-events: none;
+    text-anchor: middle;
+    font-weight: 300;
+  }
+
+  #tooltip {
+    position: fixed;
+    pointer-events: none;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 18px;
+    max-width: 420px;
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--text);
+    z-index: 200;
+    opacity: 0;
+    transition: opacity 0.12s;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.7);
+  }
+  #tooltip .tt-name { font-size: 14px; font-weight: 700; color: #fff; margin-bottom: 2px; }
+  #tooltip .tt-class { font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 6px; display: inline-block; padding: 1px 6px; border-radius: 3px; }
+  #tooltip .tt-desc { color: #999; font-size: 10px; line-height: 1.5; }
+  #tooltip .tt-meta { margin-top: 8px; color: #666; font-size: 9px; border-top: 1px solid var(--border); padding-top: 6px; white-space: pre-wrap; }
+
+  #panel {
+    position: fixed;
+    top: 80px; right: 16px;
+    z-index: 100;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 18px;
+    font-size: 9px;
+    width: 200px;
+  }
+  #panel h3 { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 8px; }
+  .filter-btn {
+    display: inline-block;
+    padding: 3px 8px;
+    margin: 2px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: #777;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .filter-btn:hover { border-color: #444; color: #aaa; }
+  .filter-btn.active { border-color: currentColor; background: rgba(255,255,255,0.04); }
+
+  #legend {
+    position: fixed;
+    bottom: 16px; right: 16px;
+    z-index: 100;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 18px;
+    font-size: 9px;
+  }
+  #legend h3 { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 8px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; color: #777; }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+  #stats {
+    position: fixed;
+    bottom: 16px; left: 16px;
+    z-index: 100;
+    font-size: 9px;
+    color: #333;
+  }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>ritual-dapp-skills</h1>
+  <div class="subtitle">Knowledge graph &middot; branch: not/a-fix-at-all &middot; 25 skills &middot; 2 agents &middot; 8 meta-protocols &middot; 15 precompiles</div>
+</div>
+
+<div id="tooltip">
+  <div class="tt-name"></div>
+  <div class="tt-class"></div>
+  <div class="tt-desc"></div>
+  <div class="tt-meta"></div>
+</div>
+
+<div id="panel">
+  <h3>Filter Layers</h3>
+  <div id="filters"></div>
+</div>
+
+<div id="legend">
+  <h3>Layers</h3>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--purple)"></div>Agents</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--lime)"></div>Meta / Omega</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>Architecture</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--pink)"></div>Features</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--blue)"></div>Full-Stack</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--gold)"></div>Contracts</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div>System</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--cyan)"></div>Precompiles</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--slate)"></div>Infrastructure</div>
+</div>
+
+<div id="stats"></div>
+
+<svg id="graph"></svg>
+
+<script type="module">
+import * as d3 from 'https://esm.sh/d3@7';
+
+const C = {
+  agent:'#c084fc', meta:'#a3e635', archRef:'#4ade80', feature:'#f472b6',
+  fullstack:'#60a5fa', contracts:'#fbbf24', system:'#fb923c',
+  precompile:'#22d3ee', infra:'#94a3b8'
+};
+
+const nodes = [
+  {id:'builder',label:'dApp Builder',group:'agent',r:26,desc:'End-to-end build orchestrator. 7 phases: intake → architecture → contracts → frontend → backend → integration → testing → post-build verification. Loads 3-6 skills per project. Automatically invokes debugger after deployment.'},
+  {id:'debugger',label:'dApp Debugger',group:'agent',r:22,desc:'Diagnostic agent. MECE triage tree (5 categories, 16 sub-categories). Pipeline: triage → smoke tests → quick-match 10 known root causes → systematic 6-check diagnosis → common issues lookup. Auto-activates on empty frontend, reverts, wallet errors.'},
+
+  {id:'bootstrap',label:'Bootstrap',group:'meta',r:20,desc:'Meta-kernel. 9 behavioral rules as background middleware: Track Cost, Distrust Priors, Lazy Elicitation, Interleave Build+Debug, Circuit Breaker, Search Before Asking, Ask at Forks, Anti-Slop, Verify Non-Interactively.'},
+  {id:'front-door',label:'Front Door',group:'meta',r:18,desc:'Human entry point. Intent classifier: debug > build > learn > specific-feature > lost. Workspace detection for returning devs. Routes to builder, debugger, or individual skills.'},
+  {id:'elicitation',label:'Lazy Elicitation',group:'meta',r:14,desc:'v3 JIT question generation. Parses user message, identifies top-K unresolved dimensions from 12-dimension universe, generates 0-5 contextual questions. >200 words = infer all.'},
+  {id:'orchestrator',label:'Build/Debug Interleave',group:'meta',r:14,desc:'4 principles: Atomic Verify, Monotonic Progress, Phase-Aware Depth, Context-Preserving Handoffs. α→β and β→α serialization contracts.'},
+  {id:'circuit-breaker',label:'Circuit Breaker',group:'meta',r:13,desc:'Trajectory divergence detection. Weighted progress markers (chain=1, deploy=3, settle=5, E2E=8). Stall thresholds 3-6 turns. Immediate break on error oscillation or frustration.'},
+  {id:'non-interactive',label:'Search Before Asking',group:'meta',r:12,desc:'Resolution hierarchy: skill search → chain query → code inspection → docs → inference. Self-test before every question. Turn-based budget with adaptive behavior.'},
+  {id:'human-in-loop',label:'Ask at Forks',group:'meta',r:12,desc:'Fork test for mid-session decisions. 6 canonical fork points. Pull budget = unresolved forks. Correctness forks always fire. Preference forks respect budget.'},
+  {id:'verification',label:'Verification Protocol',group:'meta',r:16,desc:'Per-skill checks (T1-T4 tiers), 8 cross-skill integration checks, unified 12-step E2E journey. Regression protocol after every fix. "If all 12 steps pass, there are no gaps."'},
+
+  {id:'overview',label:'Overview',group:'archRef',r:20,desc:'Chain architecture. 3 execution models (sync, SPC async, two-phase). 9-state async lifecycle. TEE trust model. System contracts. Prior-correction: 8 Ethereum assumptions WRONG on Ritual.'},
+  {id:'precompiles',label:'Precompiles ABI',group:'archRef',r:18,desc:'Complete ABI for 15 precompiles. Input/output encoding with field counts. Solidity + viem examples. Grouped: sync (JQ, P-256), SPC (HTTP, LLM, DKMS), two-phase (Long HTTP, ZK, Persistent/Sovereign agents, Multimodal).'},
+  {id:'deploy',label:'Deploy',group:'archRef',r:14,desc:'Chain ID 784, RITUAL, EIP-1559 only. Foundry/Hardhat configs. System addresses. Deployment scripts. Explorer verification.'},
+  {id:'design',label:'Design System',group:'archRef',r:14,desc:'Dark-mode terminal aesthetic. Izoard/Barlow/JetBrains Mono. Green=trust, pink=AI, lime=data, gold=value. 9-state lifecycle components. WCAG 2.1 AA.'},
+
+  {id:'http',label:'HTTP',group:'feature',r:17,desc:'0x0801. Async SPC — result in same TX. 11-field ABI. {{SECRET}} templates. JQ post-processing. One SPC per TX. Methods: GET=1, POST=2, PUT=3, DELETE=4, PATCH=5.'},
+  {id:'llm',label:'LLM',group:'feature',r:17,desc:'0x0802. 30-field ABI. OpenAI-compatible chat. Tool calling. Structured output. SSE streaming via EIP-712. Temp/topP ×1000. Private LLM via ECIES.'},
+  {id:'agents-skill',label:'Agents',group:'feature',r:16,desc:'Persistent Agent (0x0820), Sovereign Agent (0x080C). Two-phase submit→callback. Tools: web_search, code_execution. Storage references for persistent state.'},
+  {id:'longrunning',label:'Long-Running HTTP',group:'feature',r:15,desc:'0x0805. Submit→poll→deliver. Minutes-to-hours. pollIntervalBlocks + maxPollBlock. taskIdMarker. Scheduler integration for recurring long jobs.'},
+  {id:'multimodal',label:'Multimodal',group:'feature',r:16,desc:'Image (0x0818), Audio (0x0819), Video (0x081A). Two-phase async. Encrypted storage credentials. Output: URI + content hash.'},
+  {id:'scheduler',label:'Scheduler',group:'feature',r:15,desc:'System contract 0x35C7. FSM: SCHEDULED→EXECUTING→COMPLETED. Execution index via 0xfa7e. Predicates. Frequency-as-predicate. Funds are checked just-in-time per execution; keep optional headroom for numCalls.'},
+  {id:'secrets',label:'Secrets',group:'feature',r:15,desc:'ECIES to executor pubkey (eciesjs). {{SECRET}} substitution. Private outputs via userPublicKey. SecretsACL (0x1A8b) for delegation. Contract-owned vs EOA-owned.'},
+  {id:'x402',label:'X402 Payments',group:'feature',r:13,desc:'Micropayments for paid APIs via HTTP precompile. ECIES-encrypted credentials. Budget management. Flows through 0x0801.'},
+  {id:'passkey',label:'Passkey',group:'feature',r:14,desc:'TxPasskey (0x77) + SECP256R1 (0x0100). P-256 WebAuthn. Low-s normalization. Address = keccak256(x||y) — NO 0x04 prefix. Recovery patterns.'},
+
+  {id:'contracts',label:'Contracts',group:'contracts',r:18,desc:'Consumer patterns: sync, SPC decoding, two-phase callbacks. Auth: require(msg.sender == AsyncDelivery). Fee locking. Events for every state transition. Custom errors.'},
+  {id:'wallet',label:'RitualWallet',group:'contracts',r:16,desc:'Fee management (0x223D). deposit→reserve escrow→settle or refund→withdraw. Per-job sponsor escrow and bounded expiry cleanup. Must fund BEFORE async calls.'},
+
+  {id:'frontend',label:'Frontend',group:'fullstack',r:18,desc:'Next.js + wagmi + Zustand. 9-state TX machine. spcCalls from RitualReceipt. SSE streaming. useSendTransaction (NOT writeContractAsync) for async precompiles.'},
+  {id:'backend',label:'Backend',group:'fullstack',r:15,desc:'Event indexer + APIs. Fastify + Drizzle + BullMQ + PostgreSQL. Watches AsyncJobTracker events. Checkpoint persistence. Sender lock serialization.'},
+  {id:'testing',label:'Testing',group:'fullstack',r:14,desc:'Foundry unit/fuzz/fork. vm.mockCall for precompiles. Vitest frontend. Playwright E2E. Mock executor responses.'},
+
+  {id:'sys-wallet',label:'RitualWallet 0x223D',group:'system',r:10,desc:'Fee deposits and escrow reservation. 0xF04076756d8129Baec46Dc0F1c526Baec490C393'},
+  {id:'sys-jobtrack',label:'AsyncJobTracker 0x9Ffd',group:'system',r:10,desc:'Job lifecycle tracking. 0xf00385449fD961925A0B125F5f30b29B682D4bFb'},
+  {id:'sys-tee',label:'TEEServiceRegistry 0xF5e3',group:'system',r:10,desc:'Executor registration + capability lookup. 0xf4495DC72143D44A93AB0ecE4d6D63a216b27839'},
+  {id:'sys-scheduler',label:'Scheduler 0x35C7',group:'system',r:9,desc:'Time-based scheduled calls. 0x4E0abeE2233D73E66382b45244F7459B34E1490E'},
+  {id:'sys-secrets',label:'SecretsACL 0x1A8b',group:'system',r:9,desc:'Delegated secret sharing. 0x0cEae62e2082829226eF5821Bb662483Db17A71F'},
+
+  {id:'pc-http',label:'0x0801 HTTP',group:'precompile',r:8,desc:'Async SPC. External HTTP in TEE. 11-field input.'},
+  {id:'pc-llm',label:'0x0802 LLM',group:'precompile',r:8,desc:'Async SPC. LLM inference. 30-field input.'},
+  {id:'pc-jq',label:'0x0803 JQ',group:'precompile',r:6,desc:'Synchronous. JSON query/transformation.'},
+  {id:'pc-longhttp',label:'0x0805 Long HTTP',group:'precompile',r:7,desc:'Two-phase. Long-running HTTP with polling.'},
+  {id:'pc-zk',label:'0x0806 ZK',group:'precompile',r:7,desc:'Two-phase. ZK proof generation.'},
+  {id:'pc-cli',label:'0x080C Sovereign',group:'precompile',r:6,desc:'Two-phase. Sovereign agent execution.'},
+  {id:'pc-image',label:'0x0818 Image',group:'precompile',r:7,desc:'Two-phase. AI image generation.'},
+  {id:'pc-audio',label:'0x0819 Audio',group:'precompile',r:6,desc:'Two-phase. AI audio generation.'},
+  {id:'pc-video',label:'0x081A Video',group:'precompile',r:6,desc:'Two-phase. AI video generation.'},
+  {id:'pc-persistent',label:'0x0820 Persistent',group:'precompile',r:7,desc:'Two-phase. Stateful agent with memory.'},
+  {id:'pc-dkms',label:'0x081B DKMS',group:'precompile',r:6,desc:'Async SPC. Key management.'},
+  {id:'pc-p256',label:'0x0100 P-256',group:'precompile',r:6,desc:'Synchronous. WebAuthn signature verification.'},
+
+  {id:'tee-executor',label:'TEE Executor',group:'infra',r:14,desc:'Off-chain TEE (AWS Nitro / Intel SGX). Runs computation in enclave. Signs with attestation key. Registered in TEEServiceRegistry.'},
+  {id:'async-delivery',label:'AsyncDelivery 0xEc2d',group:'infra',r:11,desc:'Callback delivery proxy. msg.sender for ALL callbacks. 0x508f57AE70967Da28AE0Ab6b95532878c4D0F440'},
+  {id:'ritual-chain',label:'Ritual Chain 784',group:'infra',r:16,desc:'L1 with enshrined AI/ML precompiles. RITUAL (18 decimals). ~350ms conservative baseline. EIP-1559 only. TX types: 0x10 (scheduled), 0x11 (commitment), 0x12 (settlement).'},
+];
+
+const links = [
+  {source:'builder',target:'overview',type:'orchestrates'},
+  {source:'builder',target:'contracts',type:'orchestrates'},
+  {source:'builder',target:'frontend',type:'orchestrates'},
+  {source:'builder',target:'backend',type:'orchestrates'},
+  {source:'builder',target:'testing',type:'orchestrates'},
+  {source:'builder',target:'deploy',type:'orchestrates'},
+  {source:'builder',target:'design',type:'orchestrates'},
+  {source:'builder',target:'wallet',type:'orchestrates'},
+  {source:'builder',target:'debugger',type:'invokes'},
+  {source:'builder',target:'bootstrap',type:'loads'},
+  {source:'builder',target:'elicitation',type:'loads'},
+  {source:'builder',target:'verification',type:'loads'},
+  {source:'debugger',target:'overview',type:'references'},
+  {source:'debugger',target:'contracts',type:'references'},
+  {source:'debugger',target:'testing',type:'references'},
+  {source:'debugger',target:'bootstrap',type:'loads'},
+  {source:'front-door',target:'builder',type:'routes'},
+  {source:'front-door',target:'debugger',type:'routes'},
+  {source:'front-door',target:'overview',type:'routes'},
+  {source:'bootstrap',target:'elicitation',type:'activates'},
+  {source:'bootstrap',target:'orchestrator',type:'activates'},
+  {source:'bootstrap',target:'circuit-breaker',type:'activates'},
+  {source:'bootstrap',target:'non-interactive',type:'activates'},
+  {source:'bootstrap',target:'human-in-loop',type:'activates'},
+  {source:'bootstrap',target:'verification',type:'activates'},
+  {source:'orchestrator',target:'circuit-breaker',type:'escalates'},
+  {source:'non-interactive',target:'human-in-loop',type:'defers'},
+  {source:'overview',target:'sys-wallet',type:'defines'},
+  {source:'overview',target:'sys-jobtrack',type:'defines'},
+  {source:'overview',target:'sys-tee',type:'defines'},
+  {source:'overview',target:'sys-scheduler',type:'defines'},
+  {source:'overview',target:'sys-secrets',type:'defines'},
+  {source:'overview',target:'ritual-chain',type:'defines'},
+  {source:'overview',target:'tee-executor',type:'defines'},
+  {source:'precompiles',target:'pc-http',type:'defines'},
+  {source:'precompiles',target:'pc-llm',type:'defines'},
+  {source:'precompiles',target:'pc-jq',type:'defines'},
+  {source:'precompiles',target:'pc-longhttp',type:'defines'},
+  {source:'precompiles',target:'pc-zk',type:'defines'},
+  {source:'precompiles',target:'pc-cli',type:'defines'},
+  {source:'precompiles',target:'pc-image',type:'defines'},
+  {source:'precompiles',target:'pc-audio',type:'defines'},
+  {source:'precompiles',target:'pc-video',type:'defines'},
+  {source:'precompiles',target:'pc-persistent',type:'defines'},
+  {source:'precompiles',target:'pc-dkms',type:'defines'},
+  {source:'precompiles',target:'pc-p256',type:'defines'},
+  {source:'http',target:'pc-http',type:'uses'},
+  {source:'http',target:'pc-jq',type:'uses'},
+  {source:'llm',target:'pc-llm',type:'uses'},
+  {source:'agents-skill',target:'pc-persistent',type:'uses'},
+  {source:'agents-skill',target:'pc-cli',type:'uses'},
+  {source:'longrunning',target:'pc-longhttp',type:'uses'},
+  {source:'multimodal',target:'pc-image',type:'uses'},
+  {source:'multimodal',target:'pc-audio',type:'uses'},
+  {source:'multimodal',target:'pc-video',type:'uses'},
+  {source:'passkey',target:'pc-p256',type:'uses'},
+  {source:'http',target:'secrets',type:'depends'},
+  {source:'llm',target:'secrets',type:'depends'},
+  {source:'agents-skill',target:'secrets',type:'depends'},
+  {source:'longrunning',target:'secrets',type:'depends'},
+  {source:'longrunning',target:'http',type:'depends'},
+  {source:'multimodal',target:'secrets',type:'depends'},
+  {source:'x402',target:'http',type:'depends'},
+  {source:'x402',target:'secrets',type:'depends'},
+  {source:'scheduler',target:'sys-scheduler',type:'uses'},
+  {source:'contracts',target:'wallet',type:'depends'},
+  {source:'contracts',target:'precompiles',type:'depends'},
+  {source:'contracts',target:'async-delivery',type:'uses'},
+  {source:'wallet',target:'sys-wallet',type:'uses'},
+  {source:'frontend',target:'contracts',type:'depends'},
+  {source:'frontend',target:'wallet',type:'depends'},
+  {source:'frontend',target:'design',type:'depends'},
+  {source:'frontend',target:'sys-jobtrack',type:'watches'},
+  {source:'backend',target:'sys-jobtrack',type:'watches'},
+  {source:'backend',target:'contracts',type:'depends'},
+  {source:'tee-executor',target:'sys-tee',type:'registers'},
+  {source:'tee-executor',target:'ritual-chain',type:'serves'},
+  {source:'secrets',target:'tee-executor',type:'encrypts-to'},
+  {source:'secrets',target:'sys-secrets',type:'uses'},
+  {source:'async-delivery',target:'contracts',type:'callbacks'},
+  {source:'pc-http',target:'tee-executor',type:'executed-by'},
+  {source:'pc-llm',target:'tee-executor',type:'executed-by'},
+  {source:'pc-persistent',target:'tee-executor',type:'executed-by'},
+  {source:'pc-cli',target:'tee-executor',type:'executed-by'},
+  {source:'pc-image',target:'tee-executor',type:'executed-by'},
+  {source:'pc-longhttp',target:'tee-executor',type:'executed-by'},
+];
+
+const LINK_COLORS = {
+  orchestrates:'#c084fc', invokes:'#f87171', loads:'#a3e635',
+  references:'#94a3b8', routes:'#fbbf24', activates:'#a3e635',
+  escalates:'#f87171', defers:'#94a3b8', defines:'#1e293b',
+  uses:'#4ade80', depends:'#f472b6', watches:'#60a5fa',
+  registers:'#fb923c', serves:'#94a3b8', 'encrypts-to':'#fbbf24',
+  callbacks:'#22d3ee', 'executed-by':'#22d3ee',
+};
+
+const LINK_DASH = { depends:'4,3', escalates:'2,2', defers:'4,3' };
+
+const groupColor = g => C[g] || '#666';
+const width = window.innerWidth;
+const height = window.innerHeight;
+
+const svg = d3.select('#graph').attr('viewBox', [0, 0, width, height]);
+const defs = svg.append('defs');
+defs.append('marker').attr('id','arrow').attr('viewBox','0 -3 6 6')
+  .attr('refX',20).attr('refY',0).attr('markerWidth',4).attr('markerHeight',4)
+  .attr('orient','auto').append('path').attr('d','M0,-3L6,0L0,3').attr('fill','#333');
+
+const g = svg.append('g');
+const zoomBehavior = d3.zoom().scaleExtent([0.2, 5]).on('zoom', e => g.attr('transform', e.transform));
+svg.call(zoomBehavior);
+svg.call(zoomBehavior.transform, d3.zoomIdentity.translate(width*0.08, height*0.03).scale(0.82));
+
+const simulation = d3.forceSimulation(nodes)
+  .force('link', d3.forceLink(links).id(d=>d.id).distance(d => {
+    if(d.type==='defines') return 50;
+    if(d.type==='orchestrates'||d.type==='activates') return 110;
+    if(d.type==='executed-by') return 70;
+    return 85;
+  }).strength(d => d.type==='defines'?0.5:d.type==='activates'?0.3:0.15))
+  .force('charge', d3.forceManyBody().strength(d => -d.r * 22))
+  .force('center', d3.forceCenter(width/2, height/2))
+  .force('collision', d3.forceCollide().radius(d => d.r + 6))
+  .force('x', d3.forceX(width/2).strength(0.025))
+  .force('y', d3.forceY(height/2).strength(0.025));
+
+const link = g.append('g').selectAll('line').data(links).join('line')
+  .attr('class','link')
+  .attr('stroke', d => LINK_COLORS[d.type]||'#222')
+  .attr('stroke-width', d => d.type==='orchestrates'||d.type==='invokes'?1.5:d.type==='defines'?0.4:0.8)
+  .attr('stroke-dasharray', d => LINK_DASH[d.type]||null)
+  .attr('marker-end', d => ['orchestrates','invokes','callbacks','routes','activates'].includes(d.type)?'url(#arrow)':null);
+
+const nodeG = g.append('g').selectAll('g').data(nodes).join('g')
+  .call(d3.drag()
+    .on('start',(e,d)=>{if(!e.active)simulation.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y;})
+    .on('drag',(e,d)=>{d.fx=e.x;d.fy=e.y;})
+    .on('end',(e,d)=>{if(!e.active)simulation.alphaTarget(0);d.fx=null;d.fy=null;}));
+
+nodeG.append('circle').attr('class','node-circle')
+  .attr('r', d=>d.r)
+  .attr('fill', d=>groupColor(d.group))
+  .attr('fill-opacity', 0.12)
+  .attr('stroke', d=>groupColor(d.group))
+  .on('mouseover', (e,d) => {
+    const tt = document.getElementById('tooltip');
+    tt.querySelector('.tt-name').textContent = d.label;
+    const cls = tt.querySelector('.tt-class');
+    cls.textContent = d.group;
+    cls.style.color = groupColor(d.group);
+    cls.style.background = groupColor(d.group)+'18';
+    tt.querySelector('.tt-desc').textContent = d.desc;
+    const conns = links.filter(l=>(l.source.id||l.source)===d.id||(l.target.id||l.target)===d.id);
+    const out = conns.filter(l=>(l.source.id||l.source)===d.id).map(l=>`→ ${l.type} → ${l.target.label||l.target}`);
+    const inc = conns.filter(l=>(l.target.id||l.target)===d.id).map(l=>`← ${l.type} ← ${l.source.label||l.source}`);
+    tt.querySelector('.tt-meta').textContent = [...out,...inc].join('\n');
+    tt.style.opacity = 1;
+    tt.style.left = Math.min(e.clientX+16, width-440)+'px';
+    tt.style.top = Math.min(e.clientY-10, height-250)+'px';
+    d3.select(e.target).transition().duration(100).attr('r',d.r*1.3).attr('fill-opacity',0.3);
+    link.attr('stroke-opacity', l=>(l.source.id||l.source)===d.id||(l.target.id||l.target)===d.id?0.85:0.04);
+    nodeG.selectAll('.node-label').attr('fill', n => {
+      const connected = conns.some(l=>(l.source.id||l.source)===n.id||(l.target.id||l.target)===n.id);
+      return connected||n.id===d.id?'#ddd':'#333';
+    });
+  })
+  .on('mousemove', e => {
+    const tt = document.getElementById('tooltip');
+    tt.style.left = Math.min(e.clientX+16, width-440)+'px';
+    tt.style.top = Math.min(e.clientY-10, height-250)+'px';
+  })
+  .on('mouseout', (e,d) => {
+    document.getElementById('tooltip').style.opacity = 0;
+    d3.select(e.target).transition().duration(100).attr('r',d.r).attr('fill-opacity',0.12);
+    link.attr('stroke-opacity', 0.2);
+    nodeG.selectAll('.node-label').attr('fill', '#555568');
+  });
+
+nodeG.append('text').attr('class','node-label').attr('dy', d=>d.r+11).text(d=>d.label);
+
+simulation.on('tick', () => {
+  link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+  nodeG.attr('transform', d=>`translate(${d.x},${d.y})`);
+});
+
+const groups = [...new Set(nodes.map(n=>n.group))];
+const filtersDiv = document.getElementById('filters');
+const activeGroups = new Set(groups);
+groups.forEach(gr => {
+  const btn = document.createElement('button');
+  btn.className = 'filter-btn active';
+  btn.textContent = gr;
+  btn.style.color = C[gr];
+  btn.onclick = () => {
+    if(activeGroups.has(gr)){activeGroups.delete(gr);btn.classList.remove('active');}
+    else{activeGroups.add(gr);btn.classList.add('active');}
+    nodeG.attr('opacity', d=>activeGroups.has(d.group)?1:0.06);
+    link.attr('opacity', d=>activeGroups.has(d.source.group)&&activeGroups.has(d.target.group)?1:0.03);
+  };
+  filtersDiv.appendChild(btn);
+});
+
+document.getElementById('stats').textContent = `${nodes.length} nodes · ${links.length} edges · ${groups.length} layers`;
+</script>
+</body>
+</html>

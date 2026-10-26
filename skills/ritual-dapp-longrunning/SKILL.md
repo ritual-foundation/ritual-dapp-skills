@@ -1,19 +1,30 @@
 ---
 name: ritual-dapp-longrunning
-description: Long-running HTTP precompile (0x0805) patterns for Ritual dApps. Use when building dApps with submit-poll-deliver workflows, background API jobs, multi-minute external tasks, JQ-based result extraction, or long-running (2-phase) async delivery.
+description: Long-running HTTP precompile (0x0805) patterns for Ritual dApps. Use for submit-poll-deliver APIs, single HTTP responses held for minutes or hours, DA-backed bodies, output routing, SSE, and Phase 2 delivery.
 ---
 
 # Long-Running HTTP Patterns
 
-The Long-Running HTTP precompile (`0x0805`) enables on-chain requests to external APIs that take minutes or hours to complete. Unlike the standard HTTP precompile (`0x0801`) which settles in a single short-running async cycle (seconds), Long-Running HTTP uses a 2-phase submit-poll-deliver pattern with configurable JQ extraction queries.
+The Long-Running HTTP precompile (`0x0805`) enables on-chain requests to external APIs that take minutes or hours to complete. It has two executor completion modes while retaining one 38-field outer ABI: legacy submit-poll-deliver for task-ID APIs, and RITHTTP1 held-response mode for one persistent upstream request.
 
-> **Execution Model: Long-running (2-phase) async.** Phase 1 submits the initial HTTP request and returns a `taskId` (settled on-chain like a normal short-running async call). Phase 2 is a separate delivery transaction: the executor polls the external API off-chain, extracts the result via JQ, and delivers it to your contract via `AsyncDelivery`. Both phases require a funded `RitualWallet` — see `ritual-dapp-wallet` for deposit flows.
+> **Execution Model: Long-running (2-phase) async.** In legacy mode, Phase 1 submits the initial HTTP request and returns a `taskId`; the executor polls and later delivers Phase 2. With RITHTTP1 `AWAIT_RESPONSE`, Phase 1 settles before the executor issues one cancellable upstream request, and Phase 2 delivers its cached `RITOUT1` result. Delivery retries never repeat the upstream call or uploads. Both modes require a funded `RitualWallet` — see `ritual-dapp-wallet`.
 >
-> **When to use 0x0805 vs 0x0801:** Use Long-Running HTTP when the external API has a submit-then-poll pattern, expected response time exceeds ~30 seconds, or the result comes from a different endpoint than the submission. Use standard HTTP (`0x0801`, see `ritual-dapp-http`) when the API responds within seconds in a single request/response cycle.
+> **When to use 0x0805 vs 0x0801:** Use `0x0805` for a submit-then-poll API or a single request that may stay open beyond the short-running window. Use `0x0801` when one response arrives within seconds. Set RITHTTP1 `AWAIT_RESPONSE` only for the single-held-request case.
 >
-> **Constraints:** Max encoded input size is 10 KB. The `AsyncJobTracker` contract enforces a max Phase 2 deadline offset of 70,000 blocks. The caller's `RitualWallet` must have sufficient deposited RITUAL to cover executor fees and delivery gas costs; unfunded wallets are rejected during async payload validation. Wallet lock duration is also validated: `lockUntil(sender)` must be at least `commit_block + ttl`.
+> **Constraints:** Max encoded input size is 10 KB (`MAX_ASYNC_INPUT_SIZE_BYTES`, inclusive). Executor payloads are bounded the same way on the way back: long-running HTTP and ZK Phase 2 delivery payloads are capped at 5 KiB (`HTTP_CALL_MAX_OUTPUT_BYTES`), FHE / Image / Audio / Video Phase 2 deliveries at 10 KiB of canonical delivery bytes (artifact-size metadata is not what is measured), single-phase HTTP and LLM outputs at 50 KiB (`*_PHASE1_MAX_OUTPUT_BYTES`), DKMS at 1 KiB — an over-limit settlement is a `SettlementConstraintViolation` that invalidates the proposed block. The `AsyncJobTracker` contract enforces a max Phase 2 deadline offset of 70,000 blocks. The async payment sponsor's `RitualWallet` must have sufficient `availableBalance` to cover the required reserve; under-funded sponsors are rejected during async payload validation with `InsufficientBalance`. For long-running HTTP the reserve is `http_executor_fee(input_len, HTTP_CALL_MAX_OUTPUT_BYTES)` (Phase 1) `+ FEE_PER_POLL_BLOCK_WEI * (ttl + maxPollBlock) + http_executor_fee(0, HTTP_CALL_MAX_OUTPUT_BYTES)` (worst-case Phase 2 polling + payload) plus the Phase 2 callback cost. `FEE_PER_POLL_BLOCK_WEI` is `1_000_000_000_000` wei (0.000001 RITUAL/block; chain constant — confirm against the deployed async-fees configuration), so a higher `ttl`/`maxPollBlock` raises the up-front reserve linearly. When the payment sponsor is not the caller, the validator additionally requires `allowance[sponsor][caller]` to be at least that reserve, otherwise the tx is rejected with `Insufficient wallet allowance`.
 
-## How It Works
+## Choose the completion mode
+
+| Upstream shape | Body | Completion configuration |
+|---|---|---|
+| Returns a task ID, then exposes status/result endpoints | Legacy body or RITHTTP1 without `AWAIT_RESPONSE` | Configure task ID, poll, status, and result fields normally |
+| Keeps one HTTP request open until the final response | RITHTTP1 with `AWAIT_RESPONSE` | Poll/result fields are encoded placeholders; `maxPollBlock` is the deadline |
+| Emits SSE for the duration | RITHTTP1 with `AWAIT_RESPONSE \| STREAM_RESPONSE` | Upstream JSON must set its own `stream:true`; selectors process each data payload; a STREAM pipe emits selected records |
+| Emits private SSE with durable collected output | RITHTTP1 with `AWAIT_RESPONSE \| STREAM_RESPONSE` | Explicit STREAM and DA pipes each select/encode/encrypt independently; callback commits their separate hashes/counts |
+
+For every RITHTTP1 long request, set `resultJsonPath` to `.`. Set legacy `piiEnabled=false` and outer `outputStorageRef=("","","")`; the inner envelope owns filtering and storage routing. Read [`../ritual-dapp-http/references/rithttp1.md`](../ritual-dapp-http/references/rithttp1.md) for the base codec and [`../ritual-dapp-http/references/rithttp1-private-io.md`](../ritual-dapp-http/references/rithttp1-private-io.md) for encrypted inputs, output records, separate stream/DA commitments, and settlement checks.
+
+## How legacy task-ID polling works
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌───────────────┐     ┌──────────────┐
@@ -70,7 +81,7 @@ The Long-Running HTTP precompile (`0x0805`) enables on-chain requests to externa
 
 - **One `0x0805` call per transaction:** The precompile enforces a single long-running HTTP call during fresh simulation.
 - **Sender async lock in mempool:** While one async transaction is pending for a sender, additional async transactions from the same sender can be rejected with `sender locked due to existing async transaction in pool`.
-- **Wallet lock monotonicity:** `RitualWallet.deposit(lockDuration)` only extends `lockUntil` (it never shortens it). For development, prefer long lock windows so `lockUntil >= commit_block + ttl` remains true at settlement.
+- **Keep the sponsor's wallet funded:** `RitualWallet.deposit()` (and `depositFor(account)`) credit `availableBalance` immediately — there is no time lock. For development, keep the payment sponsor's `availableBalance` (and, for sponsored/delegated calls, the `allowance[sponsor][caller]`) comfortably above the reserved fees so the commitment can reserve them.
 
 ---
 
@@ -79,11 +90,11 @@ The Long-Running HTTP precompile (`0x0805`) enables on-chain requests to externa
 This helper-contract pattern shows the full lifecycle using raw viem:
 
 ```typescript
-import { defineChain, createWalletClient, http, toFunctionSelector, encodeAbiParameters, parseAbiParameters } from 'viem';
+import { toHex, defineChain, createWalletClient, http, toFunctionSelector, encodeAbiParameters, parseAbiParameters } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
@@ -99,17 +110,19 @@ const callbackSelector = toFunctionSelector(
 );
 
 const LONG_HTTP_ABI = parseAbiParameters([
-  'address, bytes[], uint256, bytes[], bytes,',             // base executor fields
+  'address, address, address[], bytes[], uint256, bytes[], bytes,',  // base executor fields (executor, sponsor, secret_owners, ...)
   'uint64, uint64, string,',                                // polling config
   'address, bytes4, uint256, uint256, uint256, uint256,',   // delivery config
   'string, uint8, string[], string[], bytes, string,',      // initial HTTP request
   'string, uint8, string[], string[], bytes, string,',      // poll request
   'string, uint8, string[], string[], bytes, string,',      // result request
-  'uint256, uint8, bool',                                   // DKMS + PII
+  'uint256, uint8, bool, (string,string,string)',          // DKMS + PII + output_storage_ref
 ].join(''));
 
 const encoded = encodeAbiParameters(LONG_HTTP_ABI, [
   '0x...executorAddress',                        // TEE executor (from TEEServiceRegistry)
+  account.address,                              // sponsor — RitualWallet account backing payment
+  [],                                           // secret_owners — one owner per encrypted secret (parallel to encryptedSecrets)
   [], 200n, [], '0x',                           // base fields
 
   // Polling configuration
@@ -123,22 +136,25 @@ const encoded = encodeAbiParameters(LONG_HTTP_ABI, [
   'https://api.example.com/research',
   2,                                            // POST
   ['Content-Type'], ['application/json'],       // headers
-  new TextEncoder().encode(JSON.stringify({ query: 'AI trends 2026' })),
+  toHex(new TextEncoder().encode(JSON.stringify({ query: 'AI trends 2026' }))),
   '.task_id',                                   // taskIdJsonPath
 
   // Poll request
   'https://api.example.com/status/{{TASK_ID}}',
   1,                                            // GET
   [], [],                                       // no extra headers
-  new Uint8Array(0),                            // no body
+  '0x',                            // no body
   '.status == "completed"',                     // statusJsonPath
 
   // Result request (empty = use poll response)
-  '', 0, [], [], new Uint8Array(0),
+  '', 0, [], [], '0x',
   '.result',                                    // resultJsonPath
 
   // DKMS + PII
   0n, 0, false,
+
+  // output_storage_ref — ['','',''] = deliver inline (use ['gcs','path','CREDS'] for DA-backed output)
+  ['', '', ''],
 ]);
 
 const hash = await walletClient.sendTransaction({
@@ -152,16 +168,18 @@ const hash = await walletClient.sendTransaction({
 
 ## 2. ABI Reference
 
-The Long-Running HTTP request has 35 ABI fields organized into sections:
+The Long-Running HTTP request has 38 ABI fields organized into sections (a 7-field base — `secretOwners` added at index 2 — plus a trailing `outputStorageRef` tuple after `piiEnabled`):
 
 ### Base Executor Fields
 
 ```
-executor           address   — TEE executor address
-encryptedSecrets   bytes[]   — ECIES-encrypted secrets (API keys via SECRET_NAME string replacement)
-ttl                uint256   — Time-to-live in blocks
-secretSignatures   bytes[]   — Signatures over encrypted secrets
-userPublicKey      bytes     — User's public key for encrypted outputs
+executor           address    — TEE executor address
+sponsor            address    — Address sponsoring payment for this async job (escrow source)
+secretOwners       address[]  — Explicit owner per encrypted blob (parallel to encryptedSecrets/secretSignatures; same length, all empty together when no secrets)
+encryptedSecrets   bytes[]    — ECIES-encrypted secrets (API keys via SECRET_NAME string replacement)
+ttl                uint256    — Time-to-live in blocks
+secretSignatures   bytes[]    — Owner signatures over the domain-separated secret-authorization payload (not over the raw encrypted secrets)
+userPublicKey      bytes      — User's public key for encrypted outputs
 ```
 
 ### Polling Configuration
@@ -219,10 +237,13 @@ resultJsonPath       string    — JQ expression to extract the result from the 
 ### Advanced Options
 
 ```
-dkmsKeyIndex   uint256  — DKMS key index for encrypted delivery (0 = disabled)
-dkmsKeyFormat  uint8    — Key format (0 = disabled, 1 = Eth)
-piiEnabled     bool     — enable secret string replacement (SECRET) and PII redaction
+dkmsKeyIndex     uint256                   — DKMS key index for encrypted delivery (0 = disabled)
+dkmsKeyFormat    uint8                     — Key format (0 = disabled, 1 = Eth)
+piiEnabled       bool                      — enable secret string replacement (SECRET) and PII redaction
+outputStorageRef (string,string,string)   — StorageRef for storing the ABI-encoded Phase 2 response in DA (all-empty = deliver inline)
 ```
+
+> **Secret authorization binding (0x0805):** When you supply `encryptedSecrets`, each `secretSignatures[i]` must be an owner signature over a domain-separated authorization payload — `RITUAL_SECRET_AUTHORIZATION_V1 || uint16(len(useContext)) || useContext || uint256(chainId) || executor || secretOwners[i] || keccak256(encryptedSecrets[i])` — with `useContext = "precompile:0x0000000000000000000000000000000000000805"`. The signer must be `secretOwners[i]` (not the caller/delegate), and the payload's per-precompile `useContext` prevents a signature for one precompile from being replayed on another.
 
 ---
 
@@ -263,7 +284,9 @@ maxPollBlock: 70_000n, // ~6.8 hour timeout (chain max)
 
 A **relative offset** (in blocks) from the Phase 1 settlement block. The executor internally computes the deadline as `settledBlock + maxPollBlock`. If the current block exceeds this deadline, the job is considered timed out and no delivery is made.
 
-`maxPollBlock` must be `> ttl` and `<= 70_000` for two-phase precompiles on current chain rules.
+`maxPollBlock` (the Phase 2 deadline offset) must be non-zero and `<= 70_000` (`MAX_PHASE2_DEADLINE_OFFSET`) for two-phase precompiles on current chain rules. There is no offset-vs-`ttl` constraint — `maxPollBlock` MAY be less than `ttl`. A zero offset is rejected at RPC submission with `Phase 2 deadline offset must be non-zero` (the long-running-HTTP fee helper independently rejects a zero offset with `Long-running HTTP max_poll_block offset must be non-zero`, and also rejects `ttl + maxPollBlock` u64 overflow).
+
+`maxPollBlock` also drives the up-front `RitualWallet` reserve: the commitment pre-reserves `FEE_PER_POLL_BLOCK_WEI * (ttl + maxPollBlock)` (0.000001 RITUAL/block) plus a worst-case payload fee on top of the Phase 1 HTTP fee, so a large `maxPollBlock` raises the required `availableBalance` linearly.
 
 Calculate it as:
 
@@ -382,7 +405,9 @@ pragma solidity ^0.8.20;
 contract LongRunningHTTPConsumer {
     address public constant LONG_RUNNING_HTTP_PRECOMPILE = address(0x0805);
     // AsyncDelivery proxy — msg.sender for all async callbacks
-    address constant ASYNC_DELIVERY_SENDER = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+    address constant ASYNC_DELIVERY_SENDER = 0x508f57AE70967Da28AE0Ab6b95532878c4D0F440;
+
+    address constant TX_HASH_PRECOMPILE = address(0x0830);
 
     struct JobResult {
         uint16 statusCode;
@@ -392,14 +417,16 @@ contract LongRunningHTTPConsumer {
     }
 
     mapping(bytes32 => JobResult) public results;
+    mapping(bytes32 => bool) public pendingJobs;
 
-    event JobSubmitted(string taskId, uint256 blockNumber);
+    event JobSubmitted(bytes32 indexed jobId, string taskId, uint256 blockNumber);
     event JobCompleted(bytes32 indexed jobId, uint16 statusCode, uint256 dataLength);
     event JobFailed(bytes32 indexed jobId, string reason);
 
     /// @notice Submit a long-running HTTP job
     /// @param encodedRequest ABI-encoded LongRunningHTTPCallRequest
     function initiateJob(bytes calldata encodedRequest) external payable {
+        bytes32 jobId = _trackCurrentJob();
         (bool ok, bytes memory rawOutput) = LONG_RUNNING_HTTP_PRECOMPILE.call(
             encodedRequest
         );
@@ -408,7 +435,7 @@ contract LongRunningHTTPConsumer {
         // Async precompiles return (bytes simmedInput, bytes actualOutput)
         (, bytes memory actualOutput) = abi.decode(rawOutput, (bytes, bytes));
         string memory taskId = abi.decode(actualOutput, (string));
-        emit JobSubmitted(taskId, block.number);
+        emit JobSubmitted(jobId, taskId, block.number);
     }
 
     /// @notice Callback from AsyncDelivery when the job completes
@@ -417,8 +444,16 @@ contract LongRunningHTTPConsumer {
     ///      Your callback must accept BOTH parameters: (bytes32 jobId, bytes result).
     function onLongRunningResult(bytes32 jobId, bytes calldata result) external {
         require(msg.sender == ASYNC_DELIVERY_SENDER, "unauthorized callback");
+        require(pendingJobs[jobId], "unknown or fulfilled job");
+        delete pendingJobs[jobId];
 
-        // Result is an HTTPCallResponse: (statusCode, headerKeys, headerValues, body, errorMessage)
+        // When outputStorageRef is empty (inline, the default), result is an HTTPCallResponse:
+        // (statusCode, headerKeys, headerValues, body, errorMessage).
+        // When outputStorageRef is set, result is instead the shared DA result envelope
+        // (bool has_error, string output_uri, bytes32 output_content_hash, uint64 output_size_bytes, string error_message);
+        // the ABI-encoded HTTPCallResponse is stored off-chain at output_uri (ECIES-encrypted to
+        // your user_public_key). Fetch and verify the stored object, ABI-unpack its single bytes
+        // ciphertext value, then ECIES-decrypt and decode HTTPCallResponse off-chain.
         (uint16 statusCode, , , bytes memory body, string memory errorMessage) =
             abi.decode(result, (uint16, string[], string[], bytes, string));
 
@@ -447,8 +482,18 @@ contract LongRunningHTTPConsumer {
         return results[jobId];
     }
 
+    function _trackCurrentJob() internal returns (bytes32 jobId) {
+        (bool ok, bytes memory output) = TX_HASH_PRECOMPILE.staticcall("");
+        require(ok && output.length == 32, "tx hash unavailable");
+        jobId = abi.decode(output, (bytes32));
+        require(!pendingJobs[jobId], "job already pending");
+        pendingJobs[jobId] = true;
+    }
+
 }
 ```
+
+`encodedRequest` must target `address(this)` with `this.onLongRunningResult.selector`. Add application-specific authorization to submission when processing results affects privileged state.
 
 ### Specialized Consumer: AI Research Assistant
 
@@ -487,7 +532,7 @@ contract AIResearchConsumer is LongRunningHTTPConsumer {
     }
 
     function _processResult(bytes32 jobId, bytes memory body) internal override {
-        string memory summary = abi.decode(body, (string));
+        string memory summary = string(body);
         // jobId comes from AsyncDelivery callback and is not derivable from taskId.
         // Persist by callback jobId and correlate taskId off-chain via events if needed.
         research[jobId].query = "";
@@ -558,6 +603,7 @@ export function useAsyncJob({
   consumerAbi,
 }: UseAsyncJobOptions) {
   const [state, setState] = useState<AsyncJobState>(INITIAL_STATE);
+  const jobIdRef = useRef<Hex | null>(null);
   const publicClient = usePublicClient();
   const { data: walletClient } = useWalletClient();
   const { data: blockNumber } = useBlockNumber({ watch: true });
@@ -602,12 +648,15 @@ export function useAsyncJob({
     async onLogs(logs) {
       for (const log of logs) {
         const args = (log as unknown as { args: { jobId: `0x${string}` } }).args;
+        if (args.jobId?.toLowerCase() !== jobIdRef.current?.toLowerCase()) continue;
+        if (!jobIdRef.current) continue;
         const result = await publicClient!.readContract({
           address: consumerAddress,
           abi: consumerAbi,
           functionName: 'getResult',
           args: [args.jobId],
         });
+        if (args.jobId.toLowerCase() !== jobIdRef.current?.toLowerCase()) continue;
         setState((prev) => ({
           ...prev,
           status: 'completed',
@@ -625,7 +674,8 @@ export function useAsyncJob({
     eventName: 'JobFailed',
     onLogs(logs) {
       for (const log of logs) {
-        const args = (log as unknown as { args: Record<string, unknown> }).args;
+        const args = (log as unknown as { args: { jobId: Hex; reason: string } }).args;
+        if (!jobIdRef.current || args.jobId.toLowerCase() !== jobIdRef.current.toLowerCase()) continue;
         setState((prev) => ({
           ...prev,
           status: 'failed',
@@ -640,6 +690,7 @@ export function useAsyncJob({
       encodedRequest: Hex,
       maxPollBlock: bigint,
     ) => {
+      jobIdRef.current = null;
       if (!walletClient || !publicClient) {
         setState((prev) => ({
           ...prev,
@@ -658,6 +709,7 @@ export function useAsyncJob({
           functionName: 'initiateJob',
           args: [encodedRequest],
         });
+        jobIdRef.current = txHash; // callback jobId is the submitted origin hash
 
         // On some Ritual async flows, the origin tx hash may not expose a direct receipt.
         // If this call times out, resolve via AsyncJobTracker JobAdded (jobId == origin tx hash),
@@ -677,7 +729,8 @@ export function useAsyncJob({
 
         const currentBlock = await publicClient.getBlockNumber();
 
-        setState((prev) => ({
+        if (jobIdRef.current !== txHash) return;
+        setState((prev) => prev.status === 'completed' || prev.status === 'failed' ? prev : ({
           ...prev,
           status: 'pending',
           submittedBlock: currentBlock,
@@ -696,6 +749,7 @@ export function useAsyncJob({
   );
 
   const reset = useCallback(() => {
+    jobIdRef.current = null;
     setState(INITIAL_STATE);
   }, []);
 
@@ -721,7 +775,7 @@ export function useAsyncJob({
 
 ```tsx
 import { useState } from 'react';
-import { encodeAbiParameters, toFunctionSelector } from 'viem';
+import { toHex, encodeAbiParameters, toFunctionSelector } from 'viem';
 import { useAsyncJob } from './hooks/useAsyncJob';
 import { RESEARCH_CONSUMER_ABI } from './abi/researchConsumer';
 import { LONG_HTTP_ABI } from './abi/longRunningHttp'; // See Section 1 for definition
@@ -748,21 +802,22 @@ function ResearchAssistant() {
     const MAX_POLL_BLOCK = 500n;
 
     const encoded = encodeAbiParameters(LONG_HTTP_ABI, [
-      '0x...executor', [], 200n, [], '0x',
+      '0x...executor', '0x...sponsor', [], [], 200n, [], '0x',
       5n, MAX_POLL_BLOCK, '{{TASK_ID}}',
       '0x...ResearchConsumer',
       toFunctionSelector('onLongRunningResult(bytes32,bytes)'),
       300_000n, 1_000_000_000n, 100_000_000n, 0n,
       'https://api.research-service.com/analyze',
       2, ['Content-Type'], ['application/json'],
-      new TextEncoder().encode(JSON.stringify({ query })),
+      toHex(new TextEncoder().encode(JSON.stringify({ query }))),
       '.task_id',
       'https://api.research-service.com/status/{{TASK_ID}}',
-      1, [], [], new Uint8Array(0),
+      1, [], [], '0x',
       '.status == "completed"',
-      '', 0, [], [], new Uint8Array(0),
+      '', 0, [], [], '0x',
       '.result.summary',
       0n, 0, false,
+      ['', '', ''],
     ]);
 
     await submitJob(encoded, MAX_POLL_BLOCK);
@@ -806,7 +861,7 @@ function ResearchAssistant() {
         </div>
       )}
 
-      {status === 'completed' && result && (
+      {status === 'completed' && result !== null && (
         <div className="result-section">
           <h3>Research Complete</h3>
           <div className="result-content">{String(result)}</div>
@@ -839,17 +894,38 @@ function ResearchAssistant() {
 
 The Scheduler contract can trigger long-running jobs on a recurring basis — e.g., a scheduled job kicks off a long-running AI generation task daily. See `ritual-dapp-scheduler` for the full Scheduler API.
 
+> **Allowance gotcha:** An approval sized only to the schedule itself (residency fee + numCalls × max execution cost) leaves no allowance headroom for the long-running HTTP wallet reserve the builder checks when the callback fires — `allowance[<sponsor in the 0x0805 input>][<consumer contract>]` — and the schedule is evicted with a wallet-reserve cleanup (`ScheduledAsyncCleanupReason::WalletReserve`). Approve `MAX_ALLOWANCE` for the consumer contract.
+
 ### Scheduled Long-Running Job Contract
 
 ```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-contract ScheduledResearchConsumer {
+interface IScheduler {
+    function schedule(
+        bytes memory data,
+        uint32 gasLimit,
+        uint32 startBlock,
+        uint32 numCalls,
+        uint32 frequency,
+        uint32 ttl,
+        uint256 maxFeePerGas,
+        uint256 maxPriorityFeePerGas,
+        uint256 value,
+        address sponsor
+    ) external returns (uint256 callId);
+}
+
+interface IScheduledCallback {
+    function onScheduledExecution(uint256 executionIndex, bytes calldata payload) external payable;
+}
+
+contract ScheduledResearchConsumer is IScheduledCallback {
     address public constant LONG_RUNNING_HTTP_PRECOMPILE = address(0x0805);
-    address public constant SCHEDULER = 0x56e776BAE2DD60664b69Bd5F865F1180ffB7D58B;
+    address public constant SCHEDULER = 0x4E0abeE2233D73E66382b45244F7459B34E1490E;
     // AsyncDelivery proxy — msg.sender for all async callbacks
-    address constant ASYNC_DELIVERY_SENDER = 0x5A16214fF555848411544b005f7Ac063742f39F6;
+    address constant ASYNC_DELIVERY_SENDER = 0x508f57AE70967Da28AE0Ab6b95532878c4D0F440;
 
     address public owner;
     bytes public encodedRequest;
@@ -868,11 +944,38 @@ contract ScheduledResearchConsumer {
         encodedRequest = _encodedRequest;
     }
 
-    function executeScheduledJob() external {
+    function scheduleRecurring(
+        uint32 startBlock,
+        uint32 numCalls,
+        uint32 frequency,
+        uint32 ttl,
+        uint256 maxFeePerGas,
+        uint256 maxPriorityFeePerGas,
+        uint256 value,
+        address sponsor
+    ) external returns (uint256 callId) {
+        require(msg.sender == owner, "Only owner");
+        bytes memory data = "";   // empty payload — delivered verbatim to onScheduledExecution
+        return IScheduler(SCHEDULER).schedule(
+            data,
+            500_000,
+            startBlock,
+            numCalls,
+            frequency,
+            ttl,
+            maxFeePerGas,
+            maxPriorityFeePerGas,
+            value,
+            sponsor
+        );
+    }
+
+    function onScheduledExecution(uint256 executionIndex, bytes calldata) external payable override {
         require(
             msg.sender == SCHEDULER || msg.sender == owner,
             "Only scheduler or owner"
         );
+        executionIndex; // may be used by production code for run-specific behavior
 
         (bool ok, bytes memory rawOutput) = LONG_RUNNING_HTTP_PRECOMPILE.call(
             encodedRequest
@@ -893,7 +996,7 @@ contract ScheduledResearchConsumer {
             abi.decode(result, (uint16, string[], string[], bytes, string));
 
         if (statusCode >= 200 && statusCode < 300 && bytes(errorMessage).length == 0) {
-            latestResult = abi.decode(body, (string));
+            latestResult = string(body);
             emit ScheduledJobCompleted(block.number, latestResult);
         }
     }
@@ -903,44 +1006,54 @@ contract ScheduledResearchConsumer {
 ### Setting Up the Schedule (TypeScript)
 
 ```typescript
-import { createWalletClient, http, defineChain, toFunctionSelector } from 'viem';
+import { createPublicClient, createWalletClient, http, defineChain } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
 const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: { default: { http: [process.env.RITUAL_RPC_URL!] } },
 });
 
 const account = privateKeyToAccount(process.env.PRIVATE_KEY! as `0x${string}`);
+const publicClient = createPublicClient({ chain: ritualChain, transport: http() });
 const walletClient = createWalletClient({ account, chain: ritualChain, transport: http() });
 
-const SCHEDULER = '0x56e776BAE2DD60664b69Bd5F865F1180ffB7D58B' as const;
+const consumer = '0x...ScheduledResearchConsumer' as const;
+const currentBlock = await publicClient.getBlockNumber();
+const gasPrice = await publicClient.getGasPrice();
 
-// Schedule the job to run every 24 hours (~246_858 blocks at ~0.35s/block)
+// Schedule through the consumer contract. The Scheduler always calls back msg.sender,
+// so EOAs should not call Scheduler.schedule directly.
 await walletClient.writeContract({
-  address: SCHEDULER,
+  address: consumer,
   abi: [{
-    name: 'schedule',
+    name: 'scheduleRecurring',
     type: 'function',
     stateMutability: 'nonpayable',
     inputs: [
-      { name: 'target', type: 'address' },
-      { name: 'selector', type: 'bytes4' },
-      { name: 'intervalBlocks', type: 'uint256' },
-      { name: 'maxExecutions', type: 'uint256' },
-      { name: 'gasLimit', type: 'uint256' },
+      { name: 'startBlock', type: 'uint32' },
+      { name: 'numCalls', type: 'uint32' },
+      { name: 'frequency', type: 'uint32' },
+      { name: 'ttl', type: 'uint32' },
+      { name: 'maxFeePerGas', type: 'uint256' },
+      { name: 'maxPriorityFeePerGas', type: 'uint256' },
+      { name: 'value', type: 'uint256' },
+      { name: 'sponsor', type: 'address' },
     ],
-    outputs: [],
+    outputs: [{ type: 'uint256' }],
   }] as const,
-  functionName: 'schedule',
+  functionName: 'scheduleRecurring',
   args: [
-    '0x...ScheduledResearchConsumer',
-    toFunctionSelector('executeScheduledJob()'),
-    246_858n,  // ~24 hours at ~0.35s/block
-    0n,        // unlimited
-    500_000n,
+    Number(currentBlock) + 246_858,
+    24,          // numCalls; use <= 256 per Scheduler cap
+    246_858,     // frequency: ~24 hours at ~0.35s/block
+    500,         // ttl
+    gasPrice,
+    0n,
+    0n,
+    consumer,    // sponsor; if using another sponsor, approve this consumer as caller
   ],
 });
 ```
@@ -952,12 +1065,12 @@ await walletClient.writeContract({
 Most real-world APIs require authentication. Use encrypted secrets with the `SECRET_NAME` string replacement pattern:
 
 ```typescript
-import { createPublicClient, http, encodeAbiParameters } from 'viem';
+import { toHex, createPublicClient, http, encodeAbiParameters } from 'viem';
 import { encrypt } from 'eciesjs';
 
 // ritualChain and publicClient setup — same as Section 1
 
-const TEE_SERVICE_REGISTRY = '0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F' as const;
+const TEE_SERVICE_REGISTRY = '0xf4495DC72143D44A93AB0ecE4d6D63a216b27839' as const;
 const CAPABILITY_HTTP = 0;
 
 // Find an executor and get its public key
@@ -976,9 +1089,9 @@ const services = await publicClient.readContract({
           { name: 'paymentAddress', type: 'address' },
           { name: 'teeAddress', type: 'address' },
           { name: 'teeType', type: 'uint8' },
-          { name: 'publicKey', type: 'bytes' },
+          { name: 'executorSecretsAuthPublicKey', type: 'bytes' },
           { name: 'endpoint', type: 'string' },
-          { name: 'certPubKeyHash', type: 'bytes32' },
+          { name: 'mTlsSpkiHash', type: 'bytes32' },
           { name: 'capability', type: 'uint8' },
         ]},
         { name: 'isValid', type: 'bool' },
@@ -991,14 +1104,23 @@ const services = await publicClient.readContract({
 });
 const executor = services[0];
 
-// Encrypt API key with executor's public key using ECIES
-const secretJson = JSON.stringify({ API_KEY: process.env.RESEARCH_API_KEY! });
+// Encrypt API key with executor's public key using ECIES.
+// The plaintext is an owner-bound envelope { version, secret_owner, secrets }
+// (canonical JSON: sorted keys, no spaces). The executor verifies the envelope's
+// secret_owner matches the explicit secretOwners[i] you pass in the request.
+const secretOwner = account.address; // who authorizes this secret blob (signs secretSignatures[i])
+const secretJson = JSON.stringify({
+  version: 1,
+  secret_owner: secretOwner,
+  secrets: { API_KEY: process.env.RESEARCH_API_KEY! },
+});
 const encryptedSecrets = [
-  `0x${encrypt(executor.node.publicKey.slice(2), Buffer.from(secretJson)).toString('hex')}` as `0x${string}`,
+  `0x${Buffer.from(encrypt(executor.node.executorSecretsAuthPublicKey.slice(2), Buffer.from(secretJson))).toString('hex')}` as `0x${string}`,
 ];
+const secretOwners = [secretOwner]; // parallel to encryptedSecrets (same length)
 
 const encoded = encodeAbiParameters(LONG_HTTP_ABI, [
-  executor.node.teeAddress, encryptedSecrets, 200n, [], '0x',
+  executor.node.teeAddress, sponsorAddress, secretOwners, encryptedSecrets, 200n, [], '0x',
 
   // Polling
   5n, 500n, '{{TASK_ID}}',
@@ -1010,20 +1132,21 @@ const encoded = encodeAbiParameters(LONG_HTTP_ABI, [
   // Initial HTTP request — API_KEY is substituted by executor at runtime
   'https://api.premium-research.com/jobs',
   1, ['Content-Type', 'Authorization'], ['application/json', 'Bearer API_KEY'],
-  new TextEncoder().encode(JSON.stringify({ query: 'AI trends' })),
+  toHex(new TextEncoder().encode(JSON.stringify({ query: 'AI trends' }))),
   '.job_id',
 
   // Poll request
   'https://api.premium-research.com/jobs/{{TASK_ID}}/status',
   1, ['Authorization'], ['Bearer {{API_KEY}}'],
-  new Uint8Array(0),
+  '0x',
   '.done == true',
 
   // Result (use poll response)
-  '', 0, [], [], new Uint8Array(0),
+  '', 0, [], [], '0x',
   '.result',
 
   0n, 0, false,
+  ['', '', ''],
 ]);
 ```
 
@@ -1038,7 +1161,8 @@ The executor decrypts the secrets inside the TEE and replaces `API_KEY` with the
 | Failure | What Happens | What to Do |
 |---------|-------------|------------|
 | **RitualWallet unfunded** | Async payload validation rejects the transaction before job creation | Ensure sender's RitualWallet is funded before submission. See `ritual-dapp-wallet`. |
-| **Insufficient lock duration** | Async payload validation rejects before job creation (`Insufficient lock duration`) | Ensure `RitualWallet.lockUntil(sender) >= commit_block + ttl`; extend lock with a larger `deposit(lockDuration)`. |
+| **Insufficient balance / allowance** | Async payload validation rejects before job creation (`InsufficientBalance`, or `Insufficient wallet allowance` when the sponsor is not the caller) | Top up the sponsor's `RitualWallet` `availableBalance` to cover the required reserve. For sponsored/delegated calls, ensure the sponsor has `approve`d the caller for at least the reserve (`allowance[sponsor][caller]`). |
+| **Zero delivery gasLimit** | `AsyncJobTracker` admission reverts `require(gasLimit > 0, "delivery gasLimit is zero")` for every two-phase family that carries delivery fields — long-running HTTP, ZK, FHE, Image, Audio, Video (single-phase HTTP/LLM/DKMS have no delivery fields) | Set `deliveryGasLimit > 0` (agent envelopes express no-callback via `callbackEnabled=false` instead). |
 | **Sender locked by existing async tx** | Pool rejects additional async tx from same sender while one is pending | Use separate EOAs for concurrent async jobs, or wait until the pending async tx settles. |
 | **Origin tx receipt not found** | Some async flows expose only the commitment tx receipt (`type=0x11`); `eth_getTransactionReceipt(originTxHash)` may timeout/null | Resolve via `AsyncJobTracker` `JobAdded` (`jobId == originTxHash`) and read the commitment tx receipt fields (`originalTx` / `originTx`). |
 | **Multiple `0x0805` calls in one tx** | Precompile rejects additional long-running calls in the same transaction | Split each long-running HTTP request into its own transaction. |
@@ -1047,7 +1171,7 @@ The executor decrypts the secrets inside the TEE and replaces `API_KEY` with the
 | **JQ query returns null/empty** | Task ID, status check, or result extraction produces nothing | Verify JQ queries locally with `curl ... \| jq '<query>'` before on-chain submission. |
 | **Poll URL returns errors** | Executor retries up to 3 times for transient failures, then drops the job | No delivery is made. Frontend should handle the timeout case. |
 | **API rate-limits during polling** | Non-retryable failure — job is dropped immediately | Set `pollIntervalBlocks` high enough to respect API rate limits. |
-| **Delivery callback reverts** | `AsyncDelivery` emits `DeliveryFailed` event — result is lost | Increase `deliveryGasLimit`, simplify callback logic, verify `deliverySelector` matches exactly. Monitor `DeliveryFailed` events. |
+| **Delivery callback reverts** | `AsyncDelivery` emits `Delivered(jobId, sponsor, target, success=false, ...)` and refunds the reverted callback value to the escrow sponsor — result is lost | Increase `deliveryGasLimit`, simplify callback logic, verify `deliverySelector` matches exactly. Monitor `Delivered(success=false)` (and `AsyncJobTracker.ResultDelivered(success=false)`). |
 | **Executor goes down mid-polling** | Job is orphaned — no other executor picks it up | No automatic recovery. Resubmit. |
 | **Secret decryption fails in TEE** | Executor can't decrypt `encryptedSecrets` — job fails silently | Ensure you encrypt with the correct executor's public key from `TEEServiceRegistry`. |
 
@@ -1058,7 +1182,7 @@ If the submit transaction appears successful but no callback arrives:
 1. Check the async lifecycle events in order:
    - `AsyncJobTracker.JobAdded` (job entered tracker)
    - `AsyncDelivery.Settled` + `AsyncJobTracker.Phase1Settled` (Phase 1 settled — see footgun warning below)
-   - `AsyncDelivery.Delivered` / `AsyncDelivery.DeliveryFailed` and `AsyncJobTracker.ResultDelivered` (Phase 2 outcome)
+   - `AsyncDelivery.Delivered` (with `success` flag) and `AsyncJobTracker.ResultDelivered` (Phase 2 outcome)
 2. If `eth_getTransactionReceipt(originTxHash)` is null, resolve via `JobAdded` (topic[2] = origin tx hash/job id) and inspect the commitment receipt (`originalTx` / `originTx` fields).
 3. If you see `JobRemoved(... completed=false)` without Phase 2 delivery events, treat it as a dropped/orphaned async job and resubmit after fixing root cause (poll endpoint, selector/gas, executor availability, or credentials).
 4. Re-validate callback signature + selector pairing:
@@ -1071,29 +1195,29 @@ This is the single most common confusing failure mode. Before debugging, interna
 
 > `Phase1Settled` is emitted from `AsyncJobTracker.markPhase1Settled` **after** `AsyncDelivery.settle` has paid Phase 1 fees and armed the Phase 2 deadline. It means the executor **committed to starting** the off-chain job, NOT that the job has finished. The actual work (LLM calls, agent ReAct iterations, image generation, polling an external API, etc.) runs **after** this event. Phase 2 lands later via `ResultDelivered` + `Delivered`.
 
-If `Phase1Settled` is on chain but you never see `ResultDelivered` for the same `jobId`, walk through these in order. The first three cover the colleague-reported root causes; the rest cover the rest of the failure surface.
+If `Phase1Settled` is on chain but you never see `ResultDelivered` for the same `jobId`, walk through these in order. The first three are the most common root causes; the rest cover the rest of the failure surface.
 
-**1. RitualWallet underfunded for Phase 2** (most common cause).
-Phase 2 separately debits two things from the user's RitualWallet: the executor work fee, then the callback gas+value. Phase 1 only covers Phase 1 fees, so a wallet with just enough for Phase 1 will Phase1Settle and then fail Phase 2:
+**1. RitualWallet escrow under-reserved for Phase 2** (most common cause).
+Phase 2 pays both the executor work fee and the callback gas+value out of the per-job escrow (keyed by `jobId`) via `RITUAL_WALLET.settle(...)`, then `refundGas` returns unused gas/value to the escrow sponsor. The commitment reserves a worst-case amount up front; if the escrow is under-reserved the `settle`/`refund` path reverts rather than emitting a `*Failed` event:
 
 | Symptom | Root cause | Where it shows up |
 |---------|-----------|-------------------|
-| `Phase1Settled` then `AsyncDelivery.DeliveryFailed(jobId, user, "insufficient funds for executor")` | `RitualWallet.payExecutor` returned false | Job lingers until cleanup, then `JobRemoved(completed=false)`. |
-| `Phase1Settled` then `DeliveryFailed(jobId, user, "insufficient funds for callback gas + value")` then `ResultDelivered(jobId, ..., success=false)` | `RitualWallet.deductExecutionFees` returned 0 | `AsyncJobTracker.markDelivered(..., success=false)` |
-| `Phase1Settled` then nothing for a very long time, no `DeliveryFailed` | Executor cancelled the job (see #2) | Off-chain |
+| `Phase1Settled` then `Delivered(jobId, sponsor, target, success=false, ...)` with no executor payout | `RITUAL_WALLET.settle(jobId, ...)` reverted `SettlementExceedsReserve` (escrow under-reserved for the executor fee) | Job lingers until cleanup, then `JobRemoved(completed=false)`. |
+| `Phase1Settled` then `Delivered(jobId, sponsor, target, success=false, ...)` then `ResultDelivered(jobId, ..., success=false)` | Callback gas+value (paid as a `Payment` entry inside `RITUAL_WALLET.settle`) exceeded the escrow reserve — `SettlementExceedsReserve` | `AsyncDelivery.sol` + `AsyncJobTracker.markDelivered(..., success=false)` |
+| `Phase1Settled` then nothing for a very long time, no `Delivered` event | Executor cancelled the job (see #2) | Off-chain |
 
-Fix: top up RitualWallet to cover the *expected* Phase 2 cost for your precompile, **with headroom**. For sovereign agent calls budget at least `~1 RITUAL` per intended run (a moderately deep agent run with several iterations + a few tool calls + a generous callback gas cap can land in the **0.5 - 1 RITUAL** range; one user reported 0.86 RITUAL for a single sovereign call). For long HTTP, budget your `deliveryGasLimit * deliveryMaxFeePerGas + deliveryValue + executor work fee` per call. See `ritual-dapp-wallet` for the cost breakdown and the underlying per-iteration / per-tool-call constants.
+Fix: top up RitualWallet to cover the *expected* Phase 2 cost for your precompile, **with headroom**. For sovereign agent calls the Phase 2 executor fee is deterministic — `calculate_agent_fees_phase2(output_len)` = max-work lockup (`SOVEREIGN_AGENT_MAX_ITERATIONS` = 50 × `SOVEREIGN_AGENT_ITERATION_FEE_WEI` + `SOVEREIGN_AGENT_MAX_TOOL_CALLS` = 500 × `SOVEREIGN_AGENT_TOOL_CALL_FEE_WEI` ≈ 0.121 RIT) + `http_output_byte_fee(output_len)` (output capped at `SOVEREIGN_AGENT_OUTPUT_SIZE_BYTES` = 10 KiB); the actual iteration / tool-call counts do not change the charge. The wallet reserve checked at commitment is the Phase 1 settlement fee `SOVEREIGN_AGENT_PHASE1_SETTLEMENT_FEE_WEI` (0.018 RIT) + that max-work lockup + `http_output_byte_fee(SOVEREIGN_AGENT_OUTPUT_SIZE_BYTES)` (the output-byte fee at the 10 KiB cap), so budget that sum plus the callback gas cap (a generous `callbackGasLimit × callbackMaxFeePerGas` is usually the dominant term). For long HTTP, the commitment pre-reserves `FEE_PER_POLL_BLOCK_WEI * (ttl + maxPollBlock)` plus a worst-case payload fee on top of the Phase 1 HTTP fee, so budget `Phase-1 http fee + FEE_PER_POLL_BLOCK_WEI * (ttl + maxPollBlock) + worst-case payload fee + deliveryGasLimit * deliveryMaxFeePerGas + deliveryValue + executor work fee` per call. See `ritual-dapp-wallet` for the cost breakdown; the fixed sovereign lockup caps are `SOVEREIGN_AGENT_MAX_ITERATIONS = 50` and `SOVEREIGN_AGENT_MAX_TOOL_CALLS = 500`, combined by `agent_escrow_lockup` inside `calculate_agent_fees_phase2`.
 
-**2. Sovereign agent (or other timed long-runner) hit `maxPollBlock`** (silent — no on-chain failure event).
-The sovereign executor cancels the job context when `currentBlock > settledBlock + maxPollBlock` and **does not call `deliverResult`**. Same pattern for long HTTP polling. Symptom: `Phase1Settled` exists, no `ResultDelivered`, eventually `JobRemoved(completed=false)` from cleanup once the bucket expires.
+**2. Sovereign agent (or other timed long-runner) hit its Phase-2 deadline** (silent — no on-chain failure event).
+For sovereign agents (0x080C) the deadline is the envelope's `phase2Ttl` (AgentAsyncEnvelope field 3). The sovereign executor cancels the job context when `currentBlock > settledBlock + phase2Ttl` and **does not call `deliverResult`**. Same pattern for long HTTP polling, where the field is still `maxPollBlock`. Symptom: `Phase1Settled` exists, no `ResultDelivered`, eventually `JobRemoved(completed=false)` from cleanup once the bucket expires.
 
-Fix: increase `maxPollBlock` on resubmit. For agents that run many ReAct iterations, the default `10000` blocks (~58 min at ~350 ms/block) can be tight. For agents that wait for slow tool calls, bump it.
+Fix: increase `phase2Ttl` (agents) / `maxPollBlock` (long HTTP) on resubmit. For agents that run many ReAct iterations, the `6000` blocks (~35 min at ~350 ms/block) used by the `ritual-dapp-agents` examples can be tight. For agents that wait for slow tool calls, bump it.
 
 **3. Upstream LLM / model context-window overflow inside the agent loop**.
 If your sovereign-agent prompt + accumulated tool/context grows past the **operational** context window of whichever LLM the harness inside the agent talks to, that inner LLM call fails. Different harnesses recover differently:
 - **Claude Code (`cliType=0`)**: usually returns an error to the agent loop, which may abort.
 - **ZeroClaw (`cliType=6`)**: depends on the underlying provider; observed cases where the agent terminates with no graceful Phase 2 result, *or* writes the upstream LLM's freeform reasoning/error text into the harness's `text` output instead of the structured JSON your consumer contract expects (see `ritual-dapp-agents` for the defensive-decode pattern).
-- **GLM via the Ritual gateway** (`LLM_PROVIDER=ritual`): the on-chain `max_seq_length` for `zai-org/GLM-4.7-FP8` is registered at 128K, **but the live Ritual gateway currently caps the deployed endpoint at 64K = 65,536 tokens**. Practical context inside an agent loop fills faster than expected because of repeated tool-call replays, so 64K is hit much sooner than the 128K nominal would suggest. Assume **64K** as the real budget for hosted GLM unless you have measured larger.
+- **Ritual-hosted models** (`LLM_PROVIDER=ritual`): read the model's registered `max_seq_length` from `ModelPricingRegistry.getModel(name)`. Practical context inside an agent loop fills faster than expected because of repeated tool-call replays — budget for replay growth.
 
 The executor does **not** preflight token counts; oversized prompts surface as upstream HTTP errors that the harness may or may not turn into a graceful Phase 2.
 
@@ -1119,18 +1243,21 @@ cast call $ASYNC_JOB_TRACKER "isPhase1Settled(bytes32)(bool)" $JOB_ID --rpc-url 
 # Is the job still tracked?
 cast call $ASYNC_JOB_TRACKER "getJob(bytes32)" $JOB_ID --rpc-url $RPC
 
-# Did AsyncDelivery emit a SettlementFailed or DeliveryFailed for this job?
+# Did AsyncDelivery settle/deliver this job? (SettlementFailed/DeliveryFailed events were removed)
 cast logs --address $ASYNC_DELIVERY \
-  'SettlementFailed(bytes32,address,string)' \
-  'DeliveryFailed(bytes32,address,string)' \
+  'Settled(bytes32,address,bool)' \
+  'Delivered(bytes32,address,address,bool,uint256,uint256,uint256)' \
   --from-block <commitBlock> --rpc-url $RPC | grep -i $JOB_ID
+# A failed Phase 2 shows up as Delivered(..., success=false) / AsyncJobTracker.ResultDelivered(success=false).
 
-# What does the user's RitualWallet hold right now?
-cast call $RITUAL_WALLET "balanceOf(address)(uint256)" $USER --rpc-url $RPC
-cast call $RITUAL_WALLET "lockUntilOf(address)(uint256)" $USER --rpc-url $RPC
+# What does the sponsor's RitualWallet hold right now?
+# For an in-flight long-running job the worst-case fee sits in reservedBalance, so true holdings
+# are available + reserved — querying only availableBalance makes a healthy account look drained mid-job.
+cast call $RITUAL_WALLET "availableBalance(address)(uint256)" $SPONSOR --rpc-url $RPC
+cast call $RITUAL_WALLET "reservedBalance(address)(uint256)" $SPONSOR --rpc-url $RPC
 ```
 
-If `isPhase1Settled = true` but no `ResultDelivered` and no `DeliveryFailed`: you are in case #2 (executor cancelled silently). If you see a `DeliveryFailed`: it's case #1 (insufficient funds) or #4 (callback revert). If neither and balance is healthy: it's case #3 (LLM/agent error inside the harness) or #5 (secrets / wrong executor) — pull the executor logs.
+If `isPhase1Settled = true` but no `ResultDelivered` and no `Delivered` event: you are in case #2 (executor cancelled silently). If you see a `Delivered(..., success=false)` / `ResultDelivered(success=false)`: it's case #1 (escrow under-reserved) or #4 (callback revert). If neither and balance is healthy: it's case #3 (LLM/agent error inside the harness) or #5 (secrets / wrong executor) — pull the executor logs.
 
 ### Resolve Commitment Tx From Async Origin Hash (RPC-Only)
 
@@ -1223,37 +1350,42 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 import { encrypt } from 'eciesjs';  // for secret encryption
 
-// Executor selection: read from TEEServiceRegistry (0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F)
+// Executor selection: read from TEEServiceRegistry (0xf4495DC72143D44A93AB0ecE4d6D63a216b27839)
 // Request encoding: encodeAbiParameters with LONG_HTTP_ABI (see Section 1)
 // Phase 1 raw output: (bytes simmedInput, bytes actualOutput) — unwrap before decoding
 // Phase 1 task ID: decodeAbiParameters(parseAbiParameters('string'), actualOutput)
-// Phase 2 callback result: (uint16, string[], string[], bytes, string) — HTTPCallResponse format
+// Phase 2 callback result (inline / outputStorageRef empty): (uint16, string[], string[], bytes, string) — HTTPCallResponse format
+// Phase 2 callback result (outputStorageRef set): (bool, string, bytes32, uint64, string) — DA result envelope (fetch+verify+ABI-unpack ciphertext+ECIES-decrypt off-chain)
 // DKMS key format: 0 = disabled, 1 = Eth
 ```
 
 ### Common Patterns at a Glance
 
 ```typescript
+import { toHex } from 'viem';
+
 // Pattern 1: Simple poll-and-deliver (using LONG_HTTP_ABI from Section 1)
 const simple = encodeAbiParameters(LONG_HTTP_ABI, [
-  executor, [], 200n, [], '0x',
+  executor, sponsor, [], [], 200n, [], '0x',
   25n, 4_500n, '{{TASK_ID}}',
   consumer, selector, 200_000n, 1_000_000_000n, 100_000_000n, 0n,
   'https://api.example.com/start', 2, [], [],            // 2 = POST
-  new TextEncoder().encode(JSON.stringify({ query })), '.task_id',
-  'https://api.example.com/status/{{TASK_ID}}', 1, [], [], new Uint8Array(0),  // 1 = GET
+  toHex(new TextEncoder().encode(JSON.stringify({ query }))), '.task_id',
+  'https://api.example.com/status/{{TASK_ID}}', 1, [], [], '0x',  // 1 = GET
   '.done == true',
-  '', 0, [], [], new Uint8Array(0), '.result',
+  '', 0, [], [], '0x', '.result',
   0n, 0, false,
+  ['', '', ''],
 ]);
 
 // Pattern 2: Separate result endpoint — set resultUrl field:
 //   'https://api.example.com/result/{{TASK_ID}}', 1, [], [], new Uint8Array(0), '.output',
 
-// Pattern 3: Authenticated with secrets — encrypt with ECIES:
+// Pattern 3: Authenticated with secrets — encrypt an owner-bound envelope with ECIES:
 //   import { encrypt } from 'eciesjs';
-//   const encrypted = encrypt(executorPubKey.slice(2), Buffer.from(JSON.stringify({ KEY: apiKey })));
-//   Pass encrypted in encryptedSecrets field, use 'KEY' in headers.
+//   const envelope = JSON.stringify({ version: 1, secret_owner: owner, secrets: { KEY: apiKey } });
+//   const encrypted = encrypt(executorPubKey.slice(2), Buffer.from(envelope));
+//   Pass encrypted in encryptedSecrets, the matching owner in secretOwners (parallel), use 'KEY' in headers.
 
 // Pattern 4: Long-running with generous timeout:
 //   pollIntervalBlocks: 171n,    // poll every ~60s at ~0.35s/block

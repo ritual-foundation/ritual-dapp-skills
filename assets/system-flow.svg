@@ -16,7 +16,7 @@
   <text x="450" y="36" text-anchor="middle" font-family="system-ui,sans-serif" font-size="11" fill="#555" letter-spacing="0.2em" font-weight="500">SYSTEM ARCHITECTURE</text>
 
   <!-- Human Entry Box -->
-  <rect x="30" y="56" width="410" height="250" rx="8" fill="none" stroke="#333" stroke-width="1"/>
+  <rect x="30" y="56" width="410" height="220" rx="8" fill="none" stroke="#333" stroke-width="1"/>
   <text x="50" y="78" font-family="system-ui,sans-serif" font-size="10" fill="#666" letter-spacing="0.15em" font-weight="600">HUMAN ENTRY</text>
 
   <!-- Human node -->
@@ -52,7 +52,7 @@
   <text x="300" y="225" font-family="system-ui,sans-serif" font-size="8" fill="#888" opacity="0.7">learn</text>
 
   <!-- Agent Entry Box -->
-  <rect x="460" y="56" width="410" height="250" rx="8" fill="none" stroke="#333" stroke-width="1"/>
+  <rect x="460" y="56" width="410" height="220" rx="8" fill="none" stroke="#333" stroke-width="1"/>
   <text x="480" y="78" font-family="system-ui,sans-serif" font-size="10" fill="#666" letter-spacing="0.15em" font-weight="600">AGENT ENTRY</text>
 
   <!-- Bootstrap node -->
@@ -119,18 +119,18 @@
   <text x="50" y="510" font-family="system-ui,sans-serif" font-size="8" fill="#444" font-style="italic">loaded conditionally based on user goal -> 3-6 per project</text>
 
   <!-- Inspiration (for lost/ambiguous users) -->
-  <rect x="270" y="266" width="100" height="32" rx="5" fill="#1A1008" stroke="#FF6600" stroke-width="0.8"/>
-  <text x="320" y="280" text-anchor="middle" font-family="monospace" font-size="8" fill="#FF6600">inspiration</text>
-  <text x="320" y="292" text-anchor="middle" font-family="system-ui,sans-serif" font-size="7" fill="#996633" font-style="italic">live trend search</text>
+  <rect x="270" y="268" width="100" height="26" rx="5" fill="#1A1008" stroke="#FF6600" stroke-width="0.8"/>
+  <text x="320" y="285" text-anchor="middle" font-family="monospace" font-size="8" fill="#FF6600">inspiration</text>
+  <text x="320" y="296" text-anchor="middle" font-family="system-ui,sans-serif" font-size="7" fill="#996633" font-style="italic">live trend search</text>
 
   <!-- Projection (between front door and builder) -->
-  <rect x="40" y="266" width="100" height="32" rx="5" fill="#1A1008" stroke="#FF6600" stroke-width="0.8"/>
-  <text x="90" y="280" text-anchor="middle" font-family="monospace" font-size="8" fill="#FF6600">projection</text>
-  <text x="90" y="292" text-anchor="middle" font-family="system-ui,sans-serif" font-size="7" fill="#996633" font-style="italic">idea → Ritual spec</text>
+  <rect x="40" y="268" width="100" height="26" rx="5" fill="#1A1008" stroke="#FF6600" stroke-width="0.8"/>
+  <text x="90" y="285" text-anchor="middle" font-family="monospace" font-size="8" fill="#FF6600">projection</text>
+  <text x="90" y="296" text-anchor="middle" font-family="system-ui,sans-serif" font-size="7" fill="#996633" font-style="italic">idea → Ritual spec</text>
 
   <!-- Arrow from builder through projection to alpha -->
-  <line x1="90" y1="260" x2="90" y2="266" stroke="#BFFF00" stroke-width="1" opacity="0.4"/>
-  <line x1="90" y1="298" x2="90" y2="310" stroke="#BFFF00" stroke-width="1" opacity="0.4"/>
+  <line x1="90" y1="260" x2="90" y2="268" stroke="#BFFF00" stroke-width="1" opacity="0.4"/>
+  <line x1="90" y1="294" x2="90" y2="310" stroke="#BFFF00" stroke-width="1" opacity="0.4"/>
   <polygon points="86,308 90,316 94,308" fill="#BFFF00" opacity="0.4"/>
 
   <!-- Beta Debug Box -->
@@ -167,5 +167,5 @@
   <polygon points="556,308 560,316 564,308" fill="#FF3B3B" opacity="0.4"/>
 
   <!-- Footer -->
-  <text x="450" y="600" text-anchor="middle" font-family="system-ui,sans-serif" font-size="9" fill="#333">RITUAL CHAIN · 1979 · ~350ms blocks (conservative baseline) · TEE-verified execution</text>
+  <text x="450" y="600" text-anchor="middle" font-family="system-ui,sans-serif" font-size="9" fill="#333">RITUAL CHAIN · 784 · ~350ms blocks (conservative baseline) · TEE-verified execution</text>
 </svg>

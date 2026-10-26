@@ -1,0 +1,6 @@
+[profile.default]
+src = "."
+out = "out"
+solc_version = "0.8.28"
+optimizer = true
+via_ir = true

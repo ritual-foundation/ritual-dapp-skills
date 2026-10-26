@@ -69,9 +69,9 @@ For checks with deterministic fixes, the protocol specifies the exact transforma
 
 | # | Check | Tier | Confidence | Command | Auto-Fix |
 |---|-------|------|-----------|---------|----------|
-| 3 | Callback auth | T1 | MEDIUM | For each `function on*Result` in *.sol, check that the function body contains `ASYNC_DELIVERY` or `0x5A16` | Insert `require(msg.sender == 0x5A16214fF555848411544b005f7Ac063742f39F6)` as first line of callback |
+| 3 | Callback auth | T1 | MEDIUM | Resolve AsyncDelivery from the selected deployment configuration. For each `function on*Result` in *.sol, check that the function authenticates `msg.sender` against that configured address. | Wire an immutable/configured `ASYNC_DELIVERY` address and require `msg.sender == ASYNC_DELIVERY` |
 | 4 | Precompile addresses | T1 | MEDIUM | Extract all `address(0x08...)` values, compare against canonical: HTTP=0x0801, LLM=0x0802, Sovereign Agent=0x080C, Image=0x0818, Audio=0x0819, Video=0x081A, LongHTTP=0x0805, ZK=0x0806, Persistent=0x0820, DKMS=0x081B | Replace with canonical address |
-| 5 | ABI + DA field shape (if LLM/multimodal/agents) | T1 | MEDIUM | Count `abi.encode` parameters in LLM precompile call — must be 30 (5 base + 25 LLM including convoHistory). For DA fields, verify StorageRef tuple `(string,string,string)` and reject stale patterns like `storageType` / `encryptedStoragePayment`. | Consult `ritual-dapp-precompiles` and `ritual-dapp-da` |
+| 5 | ABI + DA field shape (if LLM/multimodal/agents) | T1 | MEDIUM | Count `abi.encode` parameters in LLM precompile call — must be 32 (7 base — executor, sponsor, secretOwners, encryptedSecrets, ttl, secretSignatures, userPublicKey — + 25 LLM including convoHistory). For DA fields, verify StorageRef tuple `(string,string,string)` and reject stale patterns like `storageType` / `encryptedStoragePayment`. | Consult `ritual-dapp-precompiles` and `ritual-dapp-da` |
 | 6 | Static analysis | T1 | MEDIUM | `slither . --filter-paths "lib/" 2>&1 \| grep -E "High\|Medium"` (if Slither installed) | Review findings |
 | 7 | Unit tests | T1 | HIGH | `forge test -vv 2>&1` | Fix failing tests |
 | 8 | Deployment simulation | T2 | HIGH | `forge script script/Deploy.s.sol --fork-url $RITUAL_RPC_URL -vv` | Fix deployment script |
@@ -97,9 +97,9 @@ For checks with deterministic fixes, the protocol specifies the exact transforma
 | 3 | No writeContractAsync for async precompiles | T1 | MEDIUM | Files containing both `writeContractAsync`/`useWriteContract` AND precompile references (`0x080`, `HTTP_PRECOMPILE`, `LLM_PRECOMPILE`) | Replace with `useSendTransaction` + `encodeFunctionData` |
 | 4 | spcCalls handling for short-running async precompiles | T1 | MEDIUM | Files that call `waitForTransactionReceipt` in short-running async context must access `spcCalls` | Add `(receipt as RitualReceipt).spcCalls` |
 | 5 | All 9 async states handled | T1 | MEDIUM | Grep for each: SUBMITTING, PENDING_COMMITMENT, COMMITTED, EXECUTOR_PROCESSING, RESULT_READY, PENDING_SETTLEMENT, SETTLED, FAILED, EXPIRED | Add missing state handlers |
-| 6 | Chain ID 1979 | T1 | HIGH | `grep -r 'id:.*1979\|chainId.*1979' src/ lib/` | Change to 1979 |
-| 7 | Sender lock check | T1 | LOW | Files with submit buttons should reference `hasPendingJobForSender` or `useSenderLock` | Add sender lock check |
-| 8 | RitualWallet deposit gate | T1 | LOW | Files with async submit should check `balanceOf` before enabling | Add deposit gate |
+| 6 | Configured chain ID | T1 | HIGH | Load `RITUAL_CHAIN_ID` from the selected deployment manifest/profile, then verify every `id`/`chainId` in `src/` and `lib/` equals it | Replace stale literals with the configured chain ID; do not fall back to the snapshot in prose |
+| 7 | Sender lock check | T1 | LOW | Files with submit buttons should reference `hasPendingJobForTxOrigin` or `useSenderLock` | Add sender lock check |
+| 8 | RitualWallet deposit gate | T1 | LOW | Files with async submit should check `availableBalance` before enabling | Add deposit gate |
 | 9 | Accessibility: focus states | T1 | MEDIUM | Count files with `<button`/`<input` vs files with `focus-visible` | Add `focus-visible:ring-2 focus-visible:ring-ritual-green/50` |
 | 10 | Browser smoke test | T4 | HIGH | `npx playwright test --grep smoke` — page loads, no console errors | Fix render issues |
 | 11 | Accessibility audit | T4 | MEDIUM | `npx playwright test --grep accessibility` or axe-core | Fix a11y violations |
@@ -120,7 +120,7 @@ For checks with deterministic fixes, the protocol specifies the exact transforma
 
 | # | Check | Tier | Confidence | Command | Auto-Fix |
 |---|-------|------|-----------|---------|----------|
-| 2 | AsyncJobTracker address | T1 | HIGH | Grep for `C069FFCa0389f44eCA2C626e55491b0ab045AEF5` | Replace with correct address |
+| 2 | AsyncJobTracker address | T1 | HIGH | Resolve the configured address, then require non-empty `eth_getCode` and a compatible read-only ABI call | Fix the deployment configuration; do not fall back to a prose snapshot |
 | 3 | Event names | T1 | HIGH | Grep for JobAdded, Phase1Settled, ResultDelivered, JobRemoved | Add missing event watchers |
 | 4 | Canonical lifecycle status names | T1 | MEDIUM | Grep for SUBMITTING, PENDING_COMMITMENT, COMMITTED, etc. | Replace custom names with canonical ones |
 | 5 | spcCalls extraction for short-running async precompiles | T1 | MEDIUM | If code references 0x0801/0x0802/0x081B, must also reference `spcCalls` | Add spcCalls extraction logic |
@@ -141,15 +141,15 @@ For checks with deterministic fixes, the protocol specifies the exact transforma
 | # | Check | Tier | Confidence | Command | Auto-Fix |
 |---|-------|------|-----------|---------|----------|
 | 1 | RPC connectivity | T2 | HIGH | `cast block-number --rpc-url $RITUAL_RPC_URL` | Check RPC URL |
-| 2 | Chain ID | T2 | HIGH | `cast chain-id --rpc-url $RITUAL_RPC_URL` — must be 1979 | Fix RPC URL (wrong chain) |
+| 2 | Chain ID | T2 | HIGH | `test "$(cast chain-id --rpc-url "$RITUAL_RPC_URL")" = "$RITUAL_CHAIN_ID"` where `RITUAL_CHAIN_ID` came from the selected deployment manifest/profile | Fix the RPC URL or selected deployment configuration |
 | 3 | Deployed bytecode | T3 | HIGH | `cast code $ADDR --rpc-url $RITUAL_RPC_URL` — must not be `0x` per deployed address | Redeploy |
-| 4 | System contracts accessible | T3 | HIGH | `cast call 0x532F...3948 "balanceOf(address)(uint256)" 0x0...0 --rpc-url $RITUAL_RPC_URL` | RPC issue — system contracts are always deployed |
+| 4 | System contracts accessible | T3 | HIGH | Resolve each address from the selected deployment configuration, require non-empty `cast code`, then make a compatible read-only ABI call; for example `cast call "$RITUAL_WALLET_ADDRESS" "availableBalance(address)(uint256)" 0x0...0 --rpc-url "$RITUAL_RPC_URL"` | Fix the RPC URL or deployment configuration; never substitute a prose snapshot |
 
 **Independent checks (after blocking pass):**
 
 | # | Check | Tier | Confidence | Command | Auto-Fix |
 |---|-------|------|-----------|---------|----------|
-| 5 | Contract source verified | T3 | HIGH | `forge verify-contract --chain 1979 --watch --verifier custom --verifier-url "$RITUAL_VERIFIER_URL" --verifier-api-key unused $ADDR src/Contract.sol:Contract` — must end with `Pass - Verified` | Re-run with correct compiler settings from foundry.toml |
+| 5 | Contract source verified | T3 | HIGH | `forge verify-contract --chain "$RITUAL_CHAIN_ID" --watch --verifier custom --verifier-url "$RITUAL_VERIFIER_URL" --verifier-api-key unused "$ADDR" src/Contract.sol:Contract` — must end with `Pass - Verified` | Re-run with the selected deployment's chain ID and the compiler settings from foundry.toml |
 
 **Pass condition:** Checks 1-4 must pass (at the appropriate tier). Check 5 should pass — if verification fails, the contract still works but source is not browsable on the explorer.
 
@@ -159,9 +159,9 @@ For checks with deterministic fixes, the protocol specifies the exact transforma
 
 | # | Check | Tier | Confidence | Command | Auto-Fix |
 |---|-------|------|-----------|---------|----------|
-| 1 | Balance > 0 | T3 | HIGH | `cast call 0x532F...3948 "balanceOf(address)(uint256)" $USER --rpc-url $RITUAL_RPC_URL` | Prompt deposit |
-| 2 | Lock duration adequate | T3 | MEDIUM | `cast call 0x532F...3948 "lockUntil(address)(uint256)" $USER` — must be > current block + expected TTL | Re-deposit with longer lock |
-| 3 | Fee sufficiency | T3 | MEDIUM | Compare balance against: HTTP=2.5e12+byte_fees, LLM=5e12+token_fees per planned call | Deposit more RITUAL |
+| 1 | Balance > 0 | T3 | HIGH | `cast call "$RITUAL_WALLET_ADDRESS" "availableBalance(address)(uint256)" "$USER" --rpc-url "$RITUAL_RPC_URL"` using the configured RitualWallet address | Prompt deposit |
+| 2 | Available balance covers fees | T3 | MEDIUM | Query `availableBalance` on `$RITUAL_WALLET_ADDRESS` — it must cover the required reserve; for sponsored callers, its `allowance(sponsor,caller)` must also cover the reserve | Deposit more / approve caller |
+| 3 | Fee sufficiency | T3 | MEDIUM | Compare balance against: HTTP=1e16 (0.01 RIT) + 0.35 gwei/byte in+out, LLM=per-model rate card from ModelPricingRegistry (llmBaseFeeWei + per-token rates; escrow estimate floors at 1e16, error fee 1e16) per planned call — snapshot values; read live rates from the registry | Deposit more RITUAL |
 
 **Pass condition:** Check 1 must pass. Checks 2-3 are warnings.
 
@@ -171,12 +171,15 @@ For checks with deterministic fixes, the protocol specifies the exact transforma
 
 | # | Check | Tier | Confidence | Command | Auto-Fix |
 |---|-------|------|-----------|---------|----------|
-| 1 | Model exists in registry | T2 | HIGH | `cast call 0x7A85...4f "modelExists(string)(bool)" "$MODEL" --rpc-url $RITUAL_RPC_URL` | Use a registered model (query `getAllModels()`) |
-| 2 | ABI field count = 30 | T1 | MEDIUM | Count type parameters in LLM encoding block (must be 30 including convoHistory tuple) | Consult precompiles skill for correct fields |
+| 1 | Model exists in registry | T2 | HIGH | `cast call "$MODEL_PRICING_REGISTRY_ADDRESS" "modelExists(string)(bool)" "$MODEL" --rpc-url "$RITUAL_RPC_URL"` using the configured registry address | Use a registered model (query `getAllModels()`) |
+| 2 | ABI field count = 32 | T1 | MEDIUM | Count type parameters in LLM encoding block (must be 32 = 7 base including sponsor and secretOwners + 25 LLM including convoHistory tuple) | Consult precompiles skill for correct fields |
 | 3 | Float scaling ×1000 | T1 | LOW | Grep for temperature/topP values — warn if decimal found | Multiply by 1000 |
-| 4 | Executor availability | T2 | HIGH | `cast call 0x9644...Bf47F "getServicesByCapability(uint8,bool)" 1 true --rpc-url $RITUAL_RPC_URL` | Wait or use different capability |
+| 4 | Executor availability | T2 | HIGH | `cast call "$TEE_SERVICE_REGISTRY_ADDRESS" "getServicesByCapability(uint8,bool)" 1 true --rpc-url "$RITUAL_RPC_URL"` using the configured registry address | Wait or use different capability |
+| 5 | Empty completion handled | T1 | MEDIUM | Inspect consumers that decode choices/message content: zero choices or empty/whitespace-only answer content must take an explicit error or retry path before parsing, storing a result, or issuing a verdict. If the application strips `<think>…</think>` reasoning, check the remaining answer. | Add a blank-answer guard after extraction; preserve the failure state instead of treating blank output as success. For tools-only responses, validate the expected tool calls separately. |
 
-**Pass condition:** Checks 1 and 4 must pass (at T2). Check 2 is medium. Check 3 is low.
+**Pass condition:** Checks 1 and 4 must pass (at T2). Checks 2 and 5 are medium. Check 3 is low.
+
+> **Why check 5:** A successful LLM envelope (`has_error=false`) does not guarantee a usable answer. Reasoning-budget exhaustion can leave empty `content` with `finish_reason: "length"`; see `ritual-dapp-llm`, "Reasoning-budget exhaustion". Exercise zero choices, empty and whitespace-only answers, reasoning-only output when stripped by the application, and a normal nonempty answer. Do not let a parser's default value turn a missing answer into a verdict.
 
 ---
 
@@ -184,9 +187,9 @@ For checks with deterministic fixes, the protocol specifies the exact transforma
 
 | # | Check | Tier | Confidence | Command | Auto-Fix |
 |---|-------|------|-----------|---------|----------|
-| 1 | ABI field count = 13 (including dkmsKeyIndex, dkmsKeyFormat, piiEnabled) | T1 | MEDIUM | Count type parameters in HTTP encoding | Add missing `{ type: 'uint256' }`, `{ type: 'uint8' }`, `{ type: 'bool' }` for dkmsKeyIndex, dkmsKeyFormat, piiEnabled |
+| 1 | ABI field count = 16 (including secretOwners, dkmsKeyIndex, dkmsKeyFormat, piiEnabled, outputStorageRef) | T1 | MEDIUM | Count type parameters in HTTP encoding | Add missing `{ type: 'address[]' }` for secretOwners at index 2, `{ type: 'uint256' }`, `{ type: 'uint8' }`, `{ type: 'bool' }` for dkmsKeyIndex, dkmsKeyFormat, piiEnabled, and `{ type: 'tuple', components: [string, string, string] }` for outputStorageRef appended last |
 | 2 | Method code mapping | T1 | MEDIUM | Verify GET→1, POST→2, PUT→3, DELETE→4, PATCH→5 | Fix mapping |
-| 3 | piiEnabled + secret templates consistency | T1 | HIGH | If `{{SECRET}}` templates found, piiEnabled must be true | Set piiEnabled to true |
+| 3 | Secret substitution independent of PII redaction | T1 | HIGH | If secret placeholders are used, require non-empty `encryptedSecrets` and matching literal keys in the envelope's `secrets` object; `piiEnabled` does not enable substitution | Supply authorized encrypted secrets using `ritual-dapp-secrets`; set `piiEnabled=true` only when PII redaction is requested |
 | 4 | Executor availability | T2 | HIGH | `cast call TEEServiceRegistry.getServicesByCapability(0, true)` | Wait or check RPC |
 
 **Pass condition:** Checks 1, 3, 4 must pass.
@@ -224,8 +227,8 @@ For checks with deterministic fixes, the protocol specifies the exact transforma
 | # | Check | Tier | Confidence | Command | Auto-Fix |
 |---|-------|------|-----------|---------|----------|
 | 1 | eciesjs present | T1 | HIGH | Grep in source and package.json | `npm install eciesjs` |
-| 2 | Template syntax {{CAPS}} | T1 | MEDIUM | Grep for `{{[A-Z_]+}}` patterns | Fix template format |
-| 3 | piiEnabled = true when templates used | T1 | HIGH | If templates found, piiEnabled must be true | Set to true |
+| 2 | Secret template keys match envelope | T1 | MEDIUM | Verify request placeholders exactly match literal keys in the envelope's inner `secrets` object; `{{...}}` wrappers are optional | Make request placeholders and encrypted secret keys match exactly |
+| 3 | Authorized encrypted secrets; independent PII redaction | T1 | HIGH | Require non-empty `encryptedSecrets` for substitution, owner-bound envelopes, and an owner signature per blob over the domain-separated authorization payload. If delegated, verify access for the immediate precompile caller. `piiEnabled` controls optional PII redaction independently | Follow `ritual-dapp-secrets` for encryption, owner signatures, and grants; keep `piiEnabled=false` unless PII redaction is requested |
 | 4 | No plaintext secrets | T1 | HIGH | Grep for `sk-`, `sk_live`, private key hex patterns | Move to encrypted secrets |
 
 **Pass condition:** All must pass.
@@ -258,7 +261,7 @@ These share the long-running async delivery pattern. Merged checks:
 | 5 | ECIES encryption for payment credentials | T1 | HIGH | X402 | Grep for eciesjs + encrypt |
 | 6 | HTTP precompile used (X402 flows through HTTP) | T1 | HIGH | X402 | Grep for 0x0801 |
 | 7 | Executor availability for capability | T2 | HIGH | Multimodal (7/8/9), Scheduler (depends on target) | cast call TEEServiceRegistry |
-| 8 | Lock duration covers interval × maxExecutions | T1 | MEDIUM | Scheduler | Compute and compare |
+| 8 | Available balance covers one max-cost scheduled execution at creation (and `allowance(sponsor, caller)` when sponsored); use `numCalls` only for recommended run headroom | T1 | MEDIUM | Scheduler | Compute and compare |
 
 ---
 
@@ -332,13 +335,13 @@ Step 1 ──assert──► Step 2 ──assert──► Step 3 ──assert─
 
 **Action:** Query the RPC endpoint.
 **Assert:** `cast block-number --rpc-url $RITUAL_RPC_URL` returns a positive integer.
-**Assert:** `cast chain-id --rpc-url $RITUAL_RPC_URL` returns `1979`.
+**Assert:** `cast chain-id --rpc-url "$RITUAL_RPC_URL"` equals `RITUAL_CHAIN_ID` from the selected deployment manifest/profile.
 **Fail means:** Wrong RPC URL, network unreachable, or wrong chain. Nothing else will work.
 
 ```bash
 BLOCK=$(cast block-number --rpc-url $RITUAL_RPC_URL 2>/dev/null)
-CHAIN=$(cast chain-id --rpc-url $RITUAL_RPC_URL 2>/dev/null)
-[ -n "$BLOCK" ] && [ "$CHAIN" = "1979" ] || exit 1
+CHAIN=$(cast chain-id --rpc-url "$RITUAL_RPC_URL" 2>/dev/null)
+[ -n "$BLOCK" ] && [ -n "${RITUAL_CHAIN_ID:-}" ] && [ "$CHAIN" = "$RITUAL_CHAIN_ID" ] || exit 1
 ```
 
 ---
@@ -347,16 +350,13 @@ CHAIN=$(cast chain-id --rpc-url $RITUAL_RPC_URL 2>/dev/null)
 
 **Action:** Check the test EOA's native RITUAL balance and RitualWallet deposit.
 **Assert:** Native balance > 0 (can pay gas).
-**Assert:** `RitualWallet.balanceOf(testEOA)` > 0 (can pay executor fees).
-**Assert:** `RitualWallet.lockUntil(testEOA)` > current block + 5000 (lock covers operations).
+**Assert:** `RitualWallet.availableBalance(testEOA)` > 0 (can pay executor fees).
 **Fail means:** The user can't submit any async transaction. Must deposit first.
 
 ```bash
 NATIVE_BAL=$(cast balance $TEST_EOA --rpc-url $RITUAL_RPC_URL)
-WALLET_BAL=$(cast call $RITUAL_WALLET "balanceOf(address)(uint256)" $TEST_EOA --rpc-url $RITUAL_RPC_URL)
-LOCK_UNTIL=$(cast call $RITUAL_WALLET "lockUntil(address)(uint256)" $TEST_EOA --rpc-url $RITUAL_RPC_URL)
-CURRENT_BLOCK=$(cast block-number --rpc-url $RITUAL_RPC_URL)
-[ "$NATIVE_BAL" != "0" ] && [ "$WALLET_BAL" != "0" ] && [ "$LOCK_UNTIL" -gt "$((CURRENT_BLOCK + 5000))" ] || exit 2
+WALLET_BAL=$(cast call $RITUAL_WALLET "availableBalance(address)(uint256)" $TEST_EOA --rpc-url $RITUAL_RPC_URL)
+[ "$NATIVE_BAL" != "0" ] && [ "$WALLET_BAL" != "0" ] || exit 2
 ```
 
 ---
@@ -394,11 +394,11 @@ cast call $CONTRACT_ADDRESS "owner()(address)" --rpc-url $RITUAL_RPC_URL 2>/dev/
 #### Step 5: Sender Not Locked
 
 **Action:** Check that the test EOA does NOT have a pending async job.
-**Assert:** `AsyncJobTracker.hasPendingJobForSender(testEOA)` returns `false`.
+**Assert:** `AsyncJobTracker.hasPendingJobForTxOrigin(testEOA)` returns `false`.
 **Fail means:** A previous test or operation left a pending job. Wait for settlement or use a different EOA.
 
 ```bash
-IS_LOCKED=$(cast call $ASYNC_JOB_TRACKER "hasPendingJobForSender(address)(bool)" $TEST_EOA --rpc-url $RITUAL_RPC_URL)
+IS_LOCKED=$(cast call $ASYNC_JOB_TRACKER "hasPendingJobForTxOrigin(address)(bool)" $TEST_EOA --rpc-url $RITUAL_RPC_URL)
 [ "$IS_LOCKED" = "false" ] || exit 5
 ```
 
@@ -409,7 +409,7 @@ IS_LOCKED=$(cast call $ASYNC_JOB_TRACKER "hasPendingJobForSender(address)(bool)"
 **Action:** Encode the precompile request (using the exact parameters the dApp would use) and run `eth_call` against the precompile address.
 **Assert for short-running async precompiles (HTTP, LLM):** `eth_call` returns non-empty data (the simulation envelope). Note: `actualOutput` may be `0x` in simulation — this is expected. The simulation envelope itself being non-empty is the pass condition.
 **Assert for long-running async precompiles (Sovereign Agent, Image):** `eth_call` returns non-empty data.
-**Assert for synchronous precompiles (ONNX, JQ, SECP256R1):** `eth_call` returns the actual result.
+**Assert for synchronous precompiles (JQ, SECP256R1):** `eth_call` returns the actual result.
 **Fail means:** ABI encoding is wrong, precompile address is wrong, or executor address is invalid.
 
 ```bash
@@ -563,7 +563,7 @@ These conditions must hold at EVERY step, not just at the end:
 
 | Invariant | Checked At | What It Means |
 |-----------|-----------|---------------|
-| Chain ID = 1979 | Steps 1, 6, 7 | Every RPC call targets the correct chain |
+| Chain ID equals the selected deployment's `RITUAL_CHAIN_ID` | Steps 1, 6, 7 | Every RPC call targets the configured chain |
 | Sender not locked | Steps 5, 7 | Only one async job per EOA at a time |
 | All addresses checksum-valid | Steps 4, 6, 7, 10 | No truncated or malformed addresses |
 | Gas limit explicit (never estimated for async) | Step 7 | Async precompile gas estimation fails — always set explicitly |
@@ -614,7 +614,7 @@ If all 12 steps pass:
 - The user can see the result in the browser (Step 11)
 - The backend has indexed the result (Step 12)
 
-**There are no gaps.** Every data flow — from user wallet to chain to executor to receipt to contract state to frontend display to backend index — has been verified. The application works end-to-end. The probability of a user encountering a failure that this protocol did not catch is bounded by: (a) non-deterministic executor behavior, or (b) race conditions in high-throughput block production (use `ritual-dapp-block-time` to estimate current block cadence on your target deployment).
+**There are no gaps.** Every data flow — from user wallet to chain to executor to receipt to contract state to frontend display to backend index — has been verified. The application works end-to-end. The probability of a user encountering a failure that this protocol did not catch is bounded by: (a) non-deterministic executor behavior, or (b) race conditions in high-throughput block production (use `ritual-dapp-block-time` to estimate current block cadence).
 
 ---
 

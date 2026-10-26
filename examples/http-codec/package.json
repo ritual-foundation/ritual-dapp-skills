@@ -1,0 +1,13 @@
+{
+  "name": "ritual-documented-http-codec-tests",
+  "private": true,
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

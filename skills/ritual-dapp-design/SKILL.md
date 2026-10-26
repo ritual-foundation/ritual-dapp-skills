@@ -31,7 +31,7 @@ Design tokens and visual direction for Ritual Chain dApp frontends. Dark-mode-fi
 
 - Izoard is a licensed font. If you don't have it, substitute Archivo Black from Google Fonts.
 - `gray-500` text on `bg-ritual-elevated` fails WCAG AA (3.7:1 ratio). Use `gray-400` minimum.
-- The 9-state lifecycle covers all async precompiles, but synchronous precompiles (ONNX, Ed25519, JQ) don't have lifecycle states — they return in the same block.
+- The 9-state lifecycle covers all async precompiles, but synchronous precompiles (Ed25519, JQ) don't have lifecycle states — they return in the same block.
 
 ---
 
@@ -90,7 +90,7 @@ Design tokens and visual direction for Ritual Chain dApp frontends. Dark-mode-fi
 1. **Green = trust.** Use `accent-green` for anything verified, successful, or connected.
 2. **Pink = AI.** Any precompile output, agent action, or generated content gets pink accents.
 3. **Lime = data.** Highlighted numbers, key metrics, and interactive data points.
-4. **Gold = caution.** Pending operations, fee warnings, lock durations.
+4. **Gold = caution.** Pending operations, fee warnings, reserved balances.
 5. Avoid pure white `#FFFFFF` for backgrounds. Maximum is `gray-100` for text.
 6. Prefer green over blue for primary actions. Blue is best reserved for link affordances.
 
@@ -229,7 +229,6 @@ Each precompile type has a geometric icon. Green = data operations, pink = AI/in
 
 | Type | Address | Icon | Color |
 |------|---------|------|-------|
-| ONNX | `0x0800` | `⬡` | green |
 | HTTP | `0x0801` | `⇄` | green |
 | LLM | `0x0802` | `◇` | pink |
 | JQ | `0x0803` | `{}` | green |
@@ -377,7 +376,7 @@ Green and red are the primary success/error pair. For red-green colorblind users
 | Display font | Izoard (licensed) / Archivo Black (open-source) |
 | Body font | Barlow (free) |
 | Mono font | JetBrains Mono (free) |
-| Chain ID | 1979 |
+| Chain ID | 784 |
 | Scheduler system sender | `0x000...fa7e` (type `0x10`) |
 | Button style | Transparent + colored border + glow on hover |
 | Max rounding | `rounded-xl` — mix with sharper corners |

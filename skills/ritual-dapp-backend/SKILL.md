@@ -5,6 +5,10 @@ description: Backend services for Ritual dApps. Use when building event indexers
 
 # Backend Services — Ritual dApp Patterns
 
+For persistent Hermes chat and controls, read [Agent Link](../ritual-dapp-agent-link/SKILL.md). It specifies application-hosted HTTP/WebSocket endpoints, durable event ingestion, scoped turn state, text snapshots, approvals, and cancellation.
+
+For a runnable service, use [examples/backend-indexer](../../examples/backend-indexer/README.md): it includes a durable SQLite adapter, event decoding/upserts, atomic checkpoint/backfill, receipt reconciliation, HTTP API and restart/reorg tests. The snippets below explain the pieces; the complete example supplies the application wiring.
+
 ## Overview
 
 Ritual dApps with async precompiles need backend services to track job state, index on-chain events, and serve results to frontends. The async lifecycle means a user's transaction is committed in one block and settled blocks later — your backend bridges that gap.
@@ -49,7 +53,7 @@ Before writing any code, understand the constraints that make a Ritual backend d
 
 ### Conservative 350ms Block-Time Baseline
 
-Use ~350ms as a conservative planning baseline for backend thresholds. Confirm live cadence on your target deployment with `ritual-dapp-block-time`.
+Use ~350ms as a conservative planning baseline for backend thresholds. Confirm live cadence with `ritual-dapp-block-time`.
 
 | Concern | Implication |
 |---------|------------|
@@ -68,13 +72,13 @@ const senderLocks = new Map<string, Promise<void>>();
 
 async function submitWithSenderLock(sender: string, submitFn: () => Promise<void>) {
   const prev = senderLocks.get(sender) ?? Promise.resolve();
-  const next = prev.then(submitFn).catch(() => {});
-  senderLocks.set(sender, next);
+  const next = prev.then(submitFn);
+  senderLocks.set(sender, next.catch(() => {}));
   await next;
 }
 ```
 
-Before submitting, check sender lock status using `IAsyncJobTracker.hasPendingJobForSender` (see `ritual-dapp-contracts` for the full interface).
+Before submitting, check sender lock status using `IAsyncJobTracker.hasPendingJobForTxOrigin` (see `ritual-dapp-contracts` for the full interface).
 
 ### Short-running async vs long-running async — Different Data Retrieval Paths
 
@@ -82,6 +86,8 @@ Your backend must route result extraction based on execution model. See the prec
 
 - **Short-running async** (HTTP 0x0801, LLM 0x0802): Result is in the transaction receipt's `spcCalls` field. See section 2 below.
 - **Long-running async** (Long HTTP, Image, Audio, Video, ZK, Persistent Agent, Sovereign Agent): Result arrives via callback to your consumer contract. Watch for your contract's result events.
+
+For HTTP, result location and result codec are separate decisions. Legacy short HTTP can return an inline response or a DA envelope; RITHTTP1 short HTTP returns `RITOUT1` in `spcCalls`, while Long HTTP returns it in the authenticated Phase 2 callback. Persist at least `{ codec: "rithttp1", private: boolean, stream: boolean }` with each job so the backend never guesses from output bytes. Persist the original ordered output configuration too. For streaming, treat frames as provisional until canonical settlement proves the STREAM length-prefixed binary-frame hash, selected-byte total and item count, and the client verifies job/pipe/encoding/sequence bindings. Independently verify collected DA bytes against that DA pipe's result; their hash is not the STREAM hash. A stream/DA failure must not discard a successful authenticated usage pipe. See the [base](../ritual-dapp-http/references/rithttp1.md) and [private-I/O](../ritual-dapp-http/references/rithttp1-private-io.md) references.
 
 ### Canonical 9-State Job Lifecycle
 
@@ -112,11 +118,11 @@ Map chain events to status transitions (event signatures are in `IAsyncJobTracke
 | `ResultDelivered` event (`success=false`) | → `FAILED` |
 | `JobRemoved(completed=true)` event | confirm `SETTLED` (short-running async — no `Phase1Settled` is emitted for these) |
 | `JobRemoved(completed=false)` from cleanup | → `EXPIRED` |
-| `AsyncDelivery.SettlementFailed` | → `FAILED` (RitualWallet insufficient for Phase 1) |
-| `AsyncDelivery.DeliveryFailed` | → `FAILED` (RitualWallet insufficient for executor or callback gas+value) |
-| Block exceeds `commitBlock + ttl` (long-running: `markPhase1Settled` extends to `commitBlock + maxPollBlock`) | → `EXPIRED` once the next cleanup pass removes the row |
+| `AsyncDelivery.Delivered(success=false)` | → `FAILED` (settlement drew from the per-job escrow but the callback reverted) |
+| Settlement TX reverts with `SettlementExceedsReserve` | → `FAILED` (settlement debit — payments + refund — exceeds the per-job escrow's reserved amount; no `*Failed` event is emitted. Recipient payouts are pull-based: `_settle` credits each recipient's available balance and emits `EscrowPaymentCredited`, so a reverting payee cannot brick settlement) |
+| Before Phase 1 settlement: block exceeds `commitBlock + ttl`; after Phase 1 settlement: block exceeds the settlement block plus the Phase 2 offset | → `EXPIRED` once cleanup emits `JobRemoved(completed=false)` |
 
-> **`Phase1Settled` does not mean the job result is ready.** For long-running async (Long HTTP, Sovereign Agent, Persistent Agent, Image / Audio / Video, ZK, FHE) it means the executor's settlement TX paid Phase 1 fees and armed the Phase 2 deadline; the off-chain work runs *after* this event. For short-running async (HTTP, LLM, ONNX, JQ, DKMS) `Phase1Settled` is **never emitted** — the result lands in the receipt's `spcCalls` and `JobRemoved(completed=true)` fires.
+> **`Phase1Settled` does not mean the job result is ready.** For long-running async (Long HTTP, Sovereign Agent, Persistent Agent, Image / Audio / Video, ZK, FHE) it means the executor's settlement TX paid Phase 1 fees and armed the Phase 2 deadline; the off-chain work runs *after* this event. For short-running async (HTTP, LLM, JQ, DKMS) `Phase1Settled` is **never emitted** — the result lands in the receipt's `spcCalls` and `JobRemoved(completed=true)` fires.
 
 ---
 
@@ -145,12 +151,22 @@ async function extractSpcResult(txHash: Hex): Promise<{ input: Hex; output: Hex 
 Each precompile returns a different structure. Decode based on precompile address. The output ABI for each precompile is in `ritual-dapp-contracts` (see "Short-Running Async Output Envelope").
 
 ```typescript
+import { hexToBytes, parseAbiParameters } from 'viem';
 async function decodeJobResult(job: { precompile: number; txHash: string }) {
   const spc = await extractSpcResult(job.txHash as Hex);
   if (!spc) return null;
 
   switch (job.precompile) {
     case 0x0801: {
+      // First branch on the originating request codec. RITHTTP1 output begins
+      // with ASCII "RITOUT1". Encoding 4 contractOutput decodes to an ordered
+      // PipeResult[]; inspect each success, encoding and commitment. See ritual-dapp-http/references/rithttp1.md.
+      // NOTE: This decodes the INLINE HTTPCallResponse only. If the originating
+      // request set a non-empty output_storage_ref, spc.output is instead the DA
+      // result envelope: (bool has_error, string output_uri, bytes32
+      // output_content_hash, uint64 output_size_bytes, string error_message). In
+      // that case the actual payload is fetched from output_uri (an ECIES-encrypted,
+      // ABI-encoded HTTPCallResponse) — see ritual-dapp-http / ritual-dapp-da.
       const [statusCode, headerKeys, headerValues, body, errorMessage] =
         decodeAbiParameters(
           [
@@ -166,7 +182,7 @@ async function decodeJobResult(job: { precompile: number; txHash: string }) {
         type: 'http',
         statusCode,
         headers: Object.fromEntries(headerKeys.map((k, i) => [k, headerValues[i]])),
-        body: new TextDecoder().decode(body as Uint8Array),
+        body: new TextDecoder().decode(hexToBytes(body)),
         error: errorMessage || null,
       };
     }
@@ -184,10 +200,20 @@ async function decodeJobResult(job: { precompile: number; txHash: string }) {
         parseAbiParameters('string, string, uint256, string, string, string, uint256, bytes[], bytes'),
         completionData as Hex,
       );
-      const [promptTokens, completionTokens, totalTokens] = decodeAbiParameters(
-        parseAbiParameters('uint256, uint256, uint256'),
-        usageData as Hex,
-      );
+      // Usage blob is (prompt, completion, total[, cached]). The 4th word
+      // (cached_tokens, from usage.prompt_tokens_details.cached_tokens) is
+      // the subset of `prompt` tokens served from the prefix cache, not an
+      // additive count -- consensus clamps it to <= prompt. A 3-word blob
+      // (no cached word) decodes as cached = 0.
+      const usageHex = usageData as Hex;
+      const hasCachedWord = usageHex.length >= 2 + 256; // >= 128 bytes
+      const [promptTokens, completionTokens, totalTokens, cachedTokens = 0n] =
+        decodeAbiParameters(
+          parseAbiParameters(
+            hasCachedWord ? 'uint256, uint256, uint256, uint256' : 'uint256, uint256, uint256',
+          ),
+          usageHex,
+        );
       let content: string | null = null;
       if ((choicesData as any[]).length > 0) {
         const [, , messageData] = decodeAbiParameters(
@@ -204,7 +230,12 @@ async function decodeJobResult(job: { precompile: number; txHash: string }) {
         type: 'llm',
         content,
         model,
-        usage: { promptTokens, completionTokens, totalTokens },
+        usage: {
+          promptTokens: promptTokens.toString(),
+          completionTokens: completionTokens.toString(),
+          totalTokens: totalTokens.toString(),
+          cachedTokens: cachedTokens.toString(),
+        },
         error: null,
       };
     }
@@ -221,7 +252,7 @@ When your event watcher detects settlement, immediately extract and store the de
 
 ```typescript
 async function onJobSettled(jobId: string, txHash: string, precompile: number) {
-  const isShortRunningAsync = [0x0801, 0x0802].includes(precompile);
+  const isShortRunningAsync = [0x0801, 0x0802, 0x081b].includes(precompile);
 
   if (isShortRunningAsync) {
     const decoded = await decodeJobResult({ precompile, txHash });
@@ -251,7 +282,7 @@ Watches the chain for `AsyncJobTracker` events and persists them. Use the event 
 import { createPublicClient, http, defineChain, type Address } from 'viem';
 
 export const ritualChain = defineChain({
-  id: 1979,
+  id: 784,
   name: 'Ritual',
   nativeCurrency: { name: 'RITUAL', symbol: 'RITUAL', decimals: 18 },
   rpcUrls: {
@@ -259,17 +290,17 @@ export const ritualChain = defineChain({
   },
 });
 
-const ASYNC_JOB_TRACKER: Address = '0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5';
+const ASYNC_JOB_TRACKER: Address = '0xf00385449fD961925A0B125F5f30b29B682D4bFb';
 ```
 
 Wire `publicClient.watchEvent` for each of the four tracker events (`JobAdded`, `Phase1Settled`, `ResultDelivered`, `JobRemoved`). On each event:
 
 | Event | Action |
 |-------|--------|
-| `JobAdded` | Upsert job with `status: PENDING_COMMITMENT`, store `sender` (from `senderAddress` field), `precompile`, `commitBlock`, `ttl`, `txHash` |
+| `JobAdded` | Upsert job with `status: PENDING_COMMITMENT`, store `caller` (from `callerAddress` field) and `txOrigin` (immediate EVM caller vs. transaction origin — both are emitted), `precompile`, `commitBlock`, `ttl`, `txHash` |
 | `Phase1Settled` | Update to `status: COMMITTED`, store `executor` |
 | `ResultDelivered` | If `success=true`, call `onJobSettled`. If `success=false`, set `status: FAILED` |
-| `JobRemoved` | Confirm `status: SETTLED` (if `completed=true`) |
+| `JobRemoved` | Confirm `status: SETTLED` if `completed=true`; set `status: EXPIRED` if `completed=false` |
 
 Use `upsertJob` (not insert) so replayed events from reorgs or backfills don't create duplicates.
 
@@ -277,28 +308,8 @@ Use `upsertJob` (not insert) so replayed events from reorgs or backfills don't c
 
 On startup, backfill events from the last checkpoint before starting live watchers. This eliminates gaps in coverage.
 
-```typescript
-async function backfillEvents(db: Database, fromBlock: bigint) {
-  const currentBlock = await publicClient.getBlockNumber();
-  const CHUNK_SIZE = 5000n;
+The included `Indexer.sync()` performs bounded backfill, decodes all four tracker events, upserts jobs, reads short-running settlement receipts, and commits events/results/checkpoint atomically. Its implementation is in [indexer.ts](../../examples/backend-indexer/indexer.ts), backed by [database.ts](../../examples/backend-indexer/database.ts). The server provisions both, backfills before serving, then polls from the saved checkpoint so there is no backfill-to-watcher gap. A missing receipt leaves the entire chunk uncommitted for retry.
 
-  for (let start = fromBlock; start <= currentBlock; start += CHUNK_SIZE) {
-    const end = start + CHUNK_SIZE - 1n > currentBlock ? currentBlock : start + CHUNK_SIZE - 1n;
-
-    const logs = await publicClient.getLogs({
-      address: ASYNC_JOB_TRACKER,
-      fromBlock: start,
-      toBlock: end,
-    });
-
-    for (const log of logs) {
-      // Decode based on topic[0] and upsert
-    }
-
-    await db.setCheckpoint('lastIndexedBlock', end.toString());
-  }
-}
-```
 
 ---
 
@@ -308,8 +319,8 @@ Polls `AsyncJobTracker.getJob` for jobs where events alone aren't sufficient (e.
 
 Key semantics for the monitor:
 
-- **Expiry detection:** The `Job` struct has `commitBlock` and `ttl` but no `expiryBlock` field. Compute expiry as `commitBlock + ttl` and compare against the current block number.
-- **Settlement detection for short-running async jobs:** When a short-running async job (HTTP, LLM) settles, it is **removed** from the tracker. A `getJob` call will revert with "not found". Catch this revert and treat it as settled (cross-check against your `ResultDelivered` event log).
+- **Expiry detection:** Before Phase 1 settles, compare the current block with `commitBlock + ttl`. After `phase1Settled=true`, the tracker has replaced that deadline with the Phase 2 deadline; the original TTL no longer determines expiry. Reconcile Phase 2 expiry from confirmed cleanup events or the application's recorded Phase 2 deadline.
+- **Removed jobs:** `getJob` reverts with "not found" after either settlement or expiry cleanup. Absence alone does not establish success. Reconcile `JobRemoved.completed` and `ResultDelivered` through the event indexer before setting a terminal state.
 - **Phase 1 detection for long-running async jobs:** The `phase1Settled` field is only meaningful for long-running async precompiles. It indicates Phase 1 is complete and the sender nonce lock is released, NOT that the final result has been delivered.
 
 ```typescript
@@ -330,7 +341,7 @@ async function monitorTick(db: Database) {
 
       const expiryBlock = BigInt(onChain.commitBlock) + BigInt(onChain.ttl);
 
-      if (currentBlock > expiryBlock) {
+      if (!onChain.phase1Settled && currentBlock > expiryBlock) {
         await db.updateJob(job.jobId, { status: 'EXPIRED' });
       } else if (
         onChain.executor !== '0x0000000000000000000000000000000000000000' &&
@@ -343,7 +354,9 @@ async function monitorTick(db: Database) {
       }
     } catch (err: any) {
       if (err.message?.includes('not found')) {
-        await db.updateJob(job.jobId, { status: 'SETTLED' });
+        // Removal can mean completion or expiry. The event indexer must resolve
+        // JobRemoved.completed / ResultDelivered before setting a terminal state.
+        continue;
       } else {
         console.error(`Error polling job ${job.jobId}:`, err);
       }
@@ -356,7 +369,7 @@ async function monitorTick(db: Database) {
 
 ## 5. Database Schema
 
-The Ritual-specific data model. Adapt to your ORM of choice.
+The following PostgreSQL schema is an adaptation target. The runnable reference uses its included SQLite adapter and schema instead; it does not require an unprovided ORM or `Database` implementation.
 
 ```sql
 CREATE TABLE jobs (
@@ -381,7 +394,7 @@ CREATE TABLE jobs (
     END
   ) STORED,
   execution_model TEXT GENERATED ALWAYS AS (
-    CASE WHEN precompile IN (2049, 2050) THEN 'Short-Running' ELSE 'Long-Running' END
+    CASE WHEN precompile IN (2049, 2050, 2075) THEN 'Short-Running' ELSE 'Long-Running' END
   ) STORED,
   status          TEXT NOT NULL DEFAULT 'SUBMITTING',
   result          JSONB,
@@ -469,10 +482,15 @@ app.get('/api/jobs/:jobId/stream', async (request, reply) => {
     reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
-  const current = await db.getJob(jobId);
-  if (current) sendEvent({ status: current.status, result: current.result });
-
   const TERMINAL = ['SETTLED', 'FAILED', 'EXPIRED'];
+  const current = await db.getJob(jobId);
+  if (current) {
+    sendEvent({ status: current.status, result: current.result });
+    if (TERMINAL.includes(current.status)) {
+      reply.raw.end();
+      return;
+    }
+  }
 
   const listener = (update: { jobId: string; status: string }) => {
     if (update.jobId === jobId) {
@@ -490,7 +508,7 @@ app.get('/api/jobs/:jobId/stream', async (request, reply) => {
 
 ## 7. Application Bootstrap
 
-The Ritual-specific boot sequence matters — order determines correctness:
+The complete [server.ts](../../examples/backend-indexer/server.ts) implements configuration validation, backfill, continuous polling, read-only API startup and graceful shutdown with public Bun/viem dependencies. See its README for exact inputs. The conceptual watcher-based alternative follows this order:
 
 1. **Backfill** events from last checkpoint BEFORE starting live watchers (no gap in event coverage)
 2. **Start live event watchers** (after backfill completes)
@@ -511,11 +529,11 @@ RITUAL_WS_URL=wss://rpc.ritualfoundation.org/ws
 
 | Item | Value |
 |------|-------|
-| AsyncJobTracker | `0xC069FFCa0389f44eCA2C626e55491b0ab045AEF5` |
-| TEEServiceRegistry | `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` |
-| RitualWallet | `0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948` |
-| AsyncDelivery | `0x5A16214fF555848411544b005f7Ac063742f39F6` |
-| Chain ID | 1979 |
+| AsyncJobTracker | `0xf00385449fD961925A0B125F5f30b29B682D4bFb` |
+| TEEServiceRegistry | `0xf4495DC72143D44A93AB0ecE4d6D63a216b27839` |
+| RitualWallet | `0xF04076756d8129Baec46Dc0F1c526Baec490C393` |
+| AsyncDelivery | `0x508f57AE70967Da28AE0Ab6b95532878c4D0F440` |
+| Chain ID | 784 |
 | Block time | ~350ms (conservative baseline) |
 | RPC (HTTP) | `https://rpc.ritualfoundation.org` |
 | RPC (WebSocket) | `wss://rpc.ritualfoundation.org/ws` |
@@ -528,8 +546,8 @@ RITUAL_WS_URL=wss://rpc.ritualfoundation.org/ws
 |-------|---------------|
 | `ritual-dapp-contracts` | All contract ABIs, event signatures (`IAsyncJobTracker`), precompile table, capability enum |
 | `ritual-dapp-frontend` | Client-side hooks, wallet integration, event watching from the browser |
-| `ritual-dapp-http` | HTTP precompile request/response ABI (canonical 13-field format), encoding patterns |
+| `ritual-dapp-http` | HTTP precompile request/response ABI (canonical 16-field format), encoding patterns |
 | `ritual-dapp-llm` | LLM precompile ABI, model selection, conversation history |
 | `ritual-dapp-testing` | Foundry unit/fork/fuzz tests, mock precompile patterns, debugging guide |
 | `ritual-dapp-longrunning` | Long-running async callback patterns, delivery configuration, agent/long-HTTP specifics |
-| `ritual-dapp-wallet` | Deposit flows, lock duration, balance management |
+| `ritual-dapp-wallet` | Deposit/approve flows, available & reserved balances |

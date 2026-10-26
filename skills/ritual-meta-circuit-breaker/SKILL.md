@@ -18,7 +18,7 @@ Each marker has a weight proportional to its difficulty and dependency depth. La
 | Marker | Weight | Verified By | Depends On |
 |--------|--------|------------|------------|
 | Chain connection | 1 | `getBlockNumber()` succeeds | — |
-| RitualWallet funded | 1 | `balanceOf(sender) > 0` | Chain connection |
+| RitualWallet funded | 1 | `availableBalance(sponsor) > 0` | Chain connection |
 | Contract compiled | 2 | Build succeeds | — |
 | Contract deployed | 3 | `cast code <address>` returns bytecode | Compiled |
 | Precompile simulates | 3 | `eth_call` returns non-empty | Deployed, funded |
