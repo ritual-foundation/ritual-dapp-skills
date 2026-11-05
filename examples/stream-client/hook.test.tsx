@@ -14,6 +14,8 @@ afterEach(()=>globalThis.fetch=oldFetch);
 for(const [label,frames,expected] of [
  ['truncated EOF','data: {"token":"partial"}\n\n','error'],
  ['terminal marker','data: {"token":"answer"}\n\ndata: [DONE]\n\n','done'],
+ ['compact token field','data:{"token":"answer"}\n\ndata: [DONE]\n\n','done'],
+ ['compact terminal marker','data: {"token":"answer"}\n\ndata:[DONE]\n\n','done'],
 ] as const){
  test('literal React streaming hook handles '+label,async()=>{
   globalThis.fetch=(async()=>new Response(new ReadableStream({start(c){c.enqueue(new TextEncoder().encode(frames));c.close();}}))) as typeof fetch;
@@ -36,9 +38,13 @@ const frontendOutput = new Bun.Transpiler({ loader: 'ts' }).transformSync(fronte
 const frontendHook = new Function('useState', 'useCallback', 'useRef', 'useWalletClient',
   frontendOutput + '\nreturn useStreamingLLM;')(useState, useCallback, useRef, () => ({ data: wallet }));
 
-for (const complete of [false, true]) {
-  test(`literal frontend stream hook ${complete ? 'completes explicitly' : 'rejects premature EOF'}`, async () => {
-    const frames = 'data: {"token":"answer"}\n\n' + (complete ? 'data: [DONE]\n\n' : '');
+for (const [label, frames, complete] of [
+  ['rejects premature EOF', 'data: {"token":"answer"}\n\n', false],
+  ['completes explicitly', 'data: {"token":"answer"}\n\ndata: [DONE]\n\n', true],
+  ['accepts a compact token field', 'data:{"token":"answer"}\n\ndata: [DONE]\n\n', true],
+  ['accepts a compact completion marker', 'data: {"token":"answer"}\n\ndata:[DONE]\n\n', true],
+] as const) {
+  test(`literal frontend stream hook ${label}`, async () => {
     globalThis.fetch = (async () => new Response(new ReadableStream({ start(controller) {
       controller.enqueue(new TextEncoder().encode(frames)); controller.close();
     } }))) as typeof fetch;
