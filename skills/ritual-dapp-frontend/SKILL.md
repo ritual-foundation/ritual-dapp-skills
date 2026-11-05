@@ -1144,8 +1144,8 @@ export function useStreamingLLM(streamingServiceUrl = "https://streaming.ritualf
         const lines = buffer.split("\n");
         buffer = lines.pop()!;
         for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const payload = line.slice(6);
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).replace(/^ /, "");
           if (payload === "[DONE]") { setState((s) => ({ ...s, status: "done" })); return; }
           const data = JSON.parse(payload);
           if (data.token) {

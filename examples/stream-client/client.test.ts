@@ -36,6 +36,19 @@ test('accepts explicit JSON completion', async () => {
   fixture(['data: {"token":"hello","done":true}\n\n']);
   expect(await new RitualStreamClient('https://stream.invalid').connect(hash, signature, 123n, () => {})).toBe('hello');
 });
+
+for (const [label, frames] of [
+  ['token field', 'data:{"token":"hello"}\n\ndata: [DONE]\n\n'],
+  ['completion marker', 'data: {"token":"hello"}\n\ndata:[DONE]\n\n'],
+] as const) {
+  test('accepts a compact SSE ' + label, async () => {
+    fixture([frames]);
+    const tokens: string[] = []; let completed = 0;
+    const result = await new RitualStreamClient('https://stream.invalid').connect(hash, signature, 123n,
+      (token: string) => tokens.push(token), () => completed++);
+    expect(result).toBe('hello'); expect(tokens).toEqual(['hello']); expect(completed).toBe(1);
+  });
+}
 test('rejects truncated stream instead of returning a completed partial answer', async () => {
   fixture(['data: {"token":"partial"}\n\n']); let completed = false;
   await expect(new RitualStreamClient('https://stream.invalid').connect(hash, signature, 123n, () => {}, () => { completed = true; }))

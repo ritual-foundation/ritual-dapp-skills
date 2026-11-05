@@ -826,8 +826,8 @@ class RitualStreamClient {
 
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const data = trimmed.slice(6);
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const data = trimmed.slice(5).replace(/^ /, '');
 
         if (data === '[DONE]') {
           onDone?.();
@@ -1320,8 +1320,8 @@ export function useStreamingLLM(options: UseStreamingLLMOptions) {
 
             for (const line of lines) {
               const trimmed = line.trim();
-              if (!trimmed || !trimmed.startsWith('data: ')) continue;
-              const data = trimmed.slice(6);
+              if (!trimmed || !trimmed.startsWith('data:')) continue;
+              const data = trimmed.slice(5).replace(/^ /, '');
 
               if (data === '[DONE]') {
                 setState((s) => ({ ...s, status: 'done' }));
